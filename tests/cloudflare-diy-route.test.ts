@@ -7,11 +7,15 @@ import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
 import tls from "node:tls";
-import { createHash, generateKeyPairSync, randomBytes, randomUUID, verify } from "node:crypto";
+import { createHash, generateKeyPairSync, randomBytes, randomUUID, sign, verify } from "node:crypto";
 import WebSocket from "ws";
 import { HubServer } from "../src/hub/server.js";
-import { parsePublicKey } from "../src/hub/auth.js";
+import { deviceProof, hashSecret, parsePublicKey } from "../src/hub/auth.js";
 import { HubCloudflareTunnel } from "../src/hub/cloudflare-tunnel.js";
+import { startHubControl } from "../src/hub/service.js";
+import { runHostCli } from "../src/host-cli/cli.js";
+import { signedDeviceAction } from "./helpers/device-actions.js";
+import { deviceFields, enrollTrusted, loginFor, testDevice } from "./helpers/pairing-invite.js";
 import { forgetPeerPin, peerPin } from "../src/hub/peer-tls.js";
 import { exchangeNetworkPeer } from "../src/hub/network-peer.js";
 import { exchangeBotMessage } from "../src/hub/bot-message-transport.js";
@@ -39,7 +43,13 @@ import {
   type SignedNetworkPeerRequest,
 } from "../src/client-protocol/private-network.js";
 import { edgeOriginSchema, verifyEdgeIdentity } from "../src/client-protocol/tls-identity.js";
-import { cloudflareCommands, HOST_CLOUDFLARE_PATH } from "../src/client-protocol/cloudflare.js";
+import {
+  cloudflareCommands,
+  cloudflareQuickActionProofText,
+  cloudflareUpdateProofText,
+  HOST_CLOUDFLARE_PATH,
+  HOST_CLOUDFLARE_QUICK_PATH,
+} from "../src/client-protocol/cloudflare.js";
 import type { BotPassport } from "../src/client-protocol/bot-messages.js";
 import { rememberRouteTrust, routeTrust } from "../client/src/route-trust.js";
 import { connectionPairingPayload } from "../client/src/pairing-link.js";
@@ -222,22 +232,34 @@ describe("DIY Cloudflare route schema & backward compatibility (#103)", () => {
   });
 });
 
-describe("Edge-terminated Hub Ed25519 identity proof & proxy isolation (#103 / #98)", () => {
-  it("rejects unauthorized origins and issues valid origin-bound proof for authorized Cloudflare origins", async () => {
+describe("Edge-terminated Hub Ed25519 identity proof, dedicated edge-proxy listener & DoS isolation (#103 / #98)", () => {
+  it("serves /api/edge-identity only on the dedicated non-privileged edge-proxy listener for authorized origins", async () => {
     const hub = await startHub();
     const otherHub = await startHub();
     const nonce = randomBytes(32).toString("base64url");
     const targetOrigin = "https://my-hub.example.com";
 
-    // Unauthorized origin is rejected even on loopback.
-    const denied = await fetch(`${hub.url}/api/edge-identity?nonce=${nonce}&origin=${encodeURIComponent(targetOrigin)}`);
+    // Dedicated edge-proxy listener is separate from hub.url / hub.instanceUrl and excluded from hub.urls.
+    expect(hub.edgeUrl).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/);
+    expect(hub.edgeUrl).not.toBe(hub.url);
+    expect(hub.edgeUrl).not.toBe(hub.instanceUrl);
+    expect(hub.urls).not.toContain(hub.edgeUrl);
+
+    // Unauthorized origin is rejected on edgeUrl.
+    const denied = await fetch(`${hub.edgeUrl}/api/edge-identity?nonce=${nonce}&origin=${encodeURIComponent(targetOrigin)}`);
     expect(denied.status).toBe(403);
     expect(await denied.json()).toEqual({ error: "edge_origin_not_allowed" });
 
     // Authorize origin in Hub Cloudflare config.
     await hub.cloudflare.update({ mode: "named", protocol: "http2", origins: [targetOrigin] });
 
-    const ok = await fetch(`${hub.url}/api/edge-identity?nonce=${nonce}&origin=${encodeURIComponent(targetOrigin)}`);
+    // Main loopback listener MUST refuse /api/edge-identity (fail-closed listener boundary).
+    const onMain = await fetch(`${hub.url}/api/edge-identity?nonce=${nonce}&origin=${encodeURIComponent(targetOrigin)}`);
+    expect(onMain.status).toBe(403);
+    expect(await onMain.json()).toEqual({ error: "edge_identity_loopback_only" });
+
+    // Dedicated edge-proxy listener issues valid origin-bound proof.
+    const ok = await fetch(`${hub.edgeUrl}/api/edge-identity?nonce=${nonce}&origin=${encodeURIComponent(targetOrigin)}`);
     expect(ok.status).toBe(200);
     const proof = await ok.json();
 
@@ -252,116 +274,316 @@ describe("Edge-terminated Hub Ed25519 identity proof & proxy isolation (#103 / #
     expect(() => verifyEdgeIdentity({ ...proof, signature: "A".repeat(86) + "==" }, { publicKey: hub.auth.publicKey, nonce, origin: targetOrigin }, verifySignature)).toThrow("tls_identity_mismatch");
   });
 
-  it("isolates proxied loopback traffic so spoofed X-Forwarded-For headers cannot bypass rate limits", async () => {
+  it("isolates /api/edge-identity rate limits per client IP and reserves known/authenticated device capacity against external DoS", async () => {
     const hub = await startHub();
     const targetOrigin = "https://rate-test.example.com";
     await hub.cloudflare.update({ mode: "named", protocol: "http2", origins: [targetOrigin] });
 
-    let limited = false;
-    for (let i = 0; i < 65; i++) {
-      const nonce = randomBytes(32).toString("base64url");
-      const res = await fetch(`${hub.url}/api/edge-identity?nonce=${nonce}&origin=${encodeURIComponent(targetOrigin)}`, {
+    const known = testDevice("cf_known_client");
+    await enrollTrusted(hub.auth, known);
+    const session = await loginFor(hub.auth, known);
+    const revoked = testDevice("cf_revoked_client");
+    await enrollTrusted(hub.auth, revoked);
+    await hub.auth.revoke(revoked.deviceId, "local-owner");
+
+    // 1. External attacker at 198.51.100.9 exhausts its own 60/5min bucket; spoofing X-Forwarded-For does not bypass it.
+    for (let i = 0; i < 60; i++) {
+      const res = await fetch(`${hub.edgeUrl}/api/edge-identity?nonce=${randomBytes(32).toString("base64url")}&origin=${encodeURIComponent(targetOrigin)}`, {
         headers: {
-          "CF-Ray": `ray-${i}`,
-          "CF-Connecting-IP": `203.0.113.${(i % 200) + 1}`,
-          "X-Forwarded-For": `198.51.100.${(i % 200) + 1}`,
+          "CF-Connecting-IP": "198.51.100.9",
+          "X-Forwarded-For": `203.0.113.${(i % 200) + 1}`,
         },
       });
-      if (res.status === 429) {
-        limited = true;
-        break;
-      }
       expect(res.status).toBe(200);
     }
-    expect(limited).toBe(true);
-  });
+    const attackerBlocked = await fetch(`${hub.edgeUrl}/api/edge-identity?nonce=${randomBytes(32).toString("base64url")}&origin=${encodeURIComponent(targetOrigin)}`, {
+      headers: { "CF-Connecting-IP": "198.51.100.9", "X-Forwarded-For": "192.0.2.99" },
+    });
+    expect(attackerBlocked.status).toBe(429);
 
-  it("blocks proxied loopback requests on all six loopback-only privileged endpoints while allowing direct loopback", async () => {
-    const hub = await startHub();
-    const wsBase = hub.url.replace(/^http/, "ws");
-    const proxyVariants: Array<{ label: string; headers: Record<string, string> }> = [
-      {
-        label: "cloudflare proxy headers",
-        headers: {
-          Host: "hub.example.com",
-          "CF-Ray": "8a1b2c3d4e5f6789-SJC",
-          "CF-Connecting-IP": "203.0.113.10",
-          "X-Forwarded-For": "203.0.113.10",
-        },
-      },
-      {
-        label: "Forwarded header only",
-        headers: { Forwarded: "for=203.0.113.10;proto=https" },
-      },
-      {
-        label: "non-loopback Host header only",
-        headers: { Host: "hub.example.com" },
-      },
-    ];
+    // 2. Legitimate native client on a different IP (203.0.113.42) is completely unaffected.
+    const otherClient = await fetch(`${hub.edgeUrl}/api/edge-identity?nonce=${randomBytes(32).toString("base64url")}&origin=${encodeURIComponent(targetOrigin)}`, {
+      headers: { "CF-Connecting-IP": "203.0.113.42" },
+    });
+    expect(otherClient.status).toBe(200);
 
-    // Direct loopback still opens local privileged WS channels.
-    expect(await tryOpenWs(`${wsBase}/screen/v1/target`)).toBe(true);
-    expect(await tryOpenWs(`${wsBase}/screen/v1/target-media`)).toBe(true);
-    expect(await tryOpenWs(`${wsBase}/instance`)).toBe(true);
+    // 3. Even on the EXACT same NAT IP as the attacker (or shared no-header bucket), a known/authenticated device still succeeds via reserved capacity.
+    const authOnSameIp = await fetch(`${hub.edgeUrl}/api/edge-identity?nonce=${randomBytes(32).toString("base64url")}&origin=${encodeURIComponent(targetOrigin)}`, {
+      headers: { "CF-Connecting-IP": "198.51.100.9", Authorization: `Bearer ${session.token}` },
+    });
+    expect(authOnSameIp.status).toBe(200);
 
-    for (const variant of proxyVariants) {
-      expect(await tryOpenWs(`${wsBase}/screen/v1/target`, variant.headers), `/screen/v1/target (${variant.label})`).toBe(false);
-      expect(await tryOpenWs(`${wsBase}/screen/v1/target-media`, variant.headers), `/screen/v1/target-media (${variant.label})`).toBe(false);
-      expect(await tryOpenWs(`${wsBase}/instance`, variant.headers), `/instance (${variant.label})`).toBe(false);
+    const knownIdOnSameIp = await fetch(`${hub.edgeUrl}/api/edge-identity?nonce=${randomBytes(32).toString("base64url")}&origin=${encodeURIComponent(targetOrigin)}&deviceId=${encodeURIComponent(known.deviceId)}`, {
+      headers: { "CF-Connecting-IP": "198.51.100.9" },
+    });
+    expect(knownIdOnSameIp.status).toBe(200);
 
-      // Node fetch forbids overriding the Host header, so use raw http.request to test Host spoofing accurately.
-      const sendHttp = (method: string, routePath: string, headers: Record<string, string>) =>
-        new Promise<{ status: number; body: unknown }>((resolve, reject) => {
-          const target = new URL(routePath, hub.url);
-          import("node:http").then(({ request }) => {
-            const req = request({
-              hostname: target.hostname,
-              port: target.port,
-              path: target.pathname,
-              method,
-              headers: { "Content-Type": "application/json", ...headers },
-            }, (res) => {
-              const chunks: Buffer[] = [];
-              res.on("data", (chunk: Buffer) => chunks.push(chunk));
-              res.on("end", () => {
-                const raw = Buffer.concat(chunks).toString("utf8");
-                try { resolve({ status: res.statusCode ?? 0, body: JSON.parse(raw) }); }
-                catch { resolve({ status: res.statusCode ?? 0, body: raw }); }
-              });
-            });
-            req.on("error", reject);
-            if (method === "POST") req.write("{}");
-            req.end();
-          }, reject);
-        });
+    // 4. Unknown or revoked deviceId cannot escape the exhausted anonymous bucket.
+    const revokedOnSameIp = await fetch(`${hub.edgeUrl}/api/edge-identity?nonce=${randomBytes(32).toString("base64url")}&origin=${encodeURIComponent(targetOrigin)}&deviceId=${encodeURIComponent(revoked.deviceId)}`, {
+      headers: { "CF-Connecting-IP": "198.51.100.9" },
+    });
+    expect(revokedOnSameIp.status).toBe(429);
+    const unknownOnSameIp = await fetch(`${hub.edgeUrl}/api/edge-identity?nonce=${randomBytes(32).toString("base64url")}&origin=${encodeURIComponent(targetOrigin)}&deviceId=device_does_not_exist`, {
+      headers: { "CF-Connecting-IP": "198.51.100.9" },
+    });
+    expect(unknownOnSameIp.status).toBe(429);
 
-      const inst = await sendHttp("GET", "/api/instance/nonexistent", variant.headers);
-      expect(inst.status, `/api/instance/* (${variant.label})`).toBe(403);
-      expect(inst.body).toEqual({ error: "instance_loopback_only" });
-
-      const grant = await sendHttp("POST", "/api/bot-messages/grant", variant.headers);
-      expect(grant.status, `/api/bot-messages/grant (${variant.label})`).toBe(403);
-      expect(grant.body).toEqual({ error: "local_controller_required" });
-
-      const local = await sendHttp("POST", "/api/bot-messages/local", variant.headers);
-      expect(local.status, `/api/bot-messages/local (${variant.label})`).toBe(403);
-      expect(local.body).toEqual({ error: "local_controller_required" });
+    // 5. Filling the entire 4,096-entry anonymous edge table does NOT starve known devices, direct anonymous TLS proofs, or loopback trusted operations.
+    for (let i = 0; i < 4200; i++) {
+      try {
+        hub.auth.edgeIdentity(randomBytes(32).toString("base64url"), targetOrigin, `edge-proxy:2001:db8:${i.toString(16)}::1`);
+      } catch (error) {
+        expect((error as Error).message).toBe("rate_limited");
+      }
     }
+    const newAnon = await fetch(`${hub.edgeUrl}/api/edge-identity?nonce=${randomBytes(32).toString("base64url")}&origin=${encodeURIComponent(targetOrigin)}`, {
+      headers: { "CF-Connecting-IP": "192.0.2.250" },
+    });
+    expect(newAnon.status).toBe(429);
+    const knownDuringFlood = await fetch(`${hub.edgeUrl}/api/edge-identity?nonce=${randomBytes(32).toString("base64url")}&origin=${encodeURIComponent(targetOrigin)}&deviceId=${encodeURIComponent(known.deviceId)}`, {
+      headers: { "CF-Connecting-IP": "192.0.2.250" },
+    });
+    expect(knownDuringFlood.status).toBe(200);
+    expect(hub.auth.tlsIdentity(randomBytes(32).toString("base64url"), Buffer.from("direct-leaf"), "198.51.100.88")).toBeDefined();
+    expect(hub.auth.tlsIdentity(randomBytes(32).toString("base64url"), Buffer.from("local-leaf"), "127.0.0.1")).toBeDefined();
+
+    // 6. CF-Connecting-IP: 127.0.0.1 on edgeUrl stays in edge-proxy namespace (audit source is edge-proxy:127.0.0.1, never 127.0.0.1).
+    const unauthEdge = await fetch(`${hub.edgeUrl}/api/devices`, { headers: { Authorization: "Bearer bad-edge-token", "CF-Connecting-IP": "127.0.0.1" } });
+    expect(unauthEdge.status).toBe(401);
+    const unauthEdgeShared = await fetch(`${hub.edgeUrl}/api/devices`, { headers: { Authorization: "Bearer bad-edge-token-2" } });
+    expect(unauthEdgeShared.status).toBe(401);
+    await hub.store.flushAudit();
+    const auditRows = await hub.store.db.all<{ detail_json: string }>("SELECT detail_json FROM audit_log WHERE kind='http.rejected' ORDER BY id");
+    const sources = auditRows.map((row) => JSON.parse(row.detail_json).source);
+    expect(sources).toContain("edge-proxy:127.0.0.1");
+    expect(sources).toContain("edge-proxy:shared");
+    expect(sources).not.toContain("127.0.0.1");
+  }, 20_000);
+
+  it("fences all six loopback-only privileged endpoints off the dedicated edge-proxy listener by listener boundary, never by headers", async () => {
+    const hub = await startHub();
+    const mainWs = hub.url.replace(/^http/, "ws");
+    const edgeWs = hub.edgeUrl.replace(/^http/, "ws");
+
+    // Direct loopback on the main/instance listener opens local privileged WS channels.
+    expect(await tryOpenWs(`${mainWs}/screen/v1/target`)).toBe(true);
+    expect(await tryOpenWs(`${mainWs}/screen/v1/target-media`)).toBe(true);
+    expect(await tryOpenWs(`${mainWs}/instance`)).toBe(true);
+
+    // On the dedicated edge-proxy listener, ALL 6 privileged endpoints are refused EVEN WITH clean loopback Host and ZERO proxy headers.
+    expect(await tryOpenWs(`${edgeWs}/screen/v1/target`)).toBe(false);
+    expect(await tryOpenWs(`${edgeWs}/screen/v1/target-media`)).toBe(false);
+    expect(await tryOpenWs(`${edgeWs}/instance`)).toBe(false);
+
+    const inst = await fetch(`${hub.edgeUrl}/api/instance/nonexistent`);
+    expect(inst.status).toBe(401);
+    expect(await inst.json()).toEqual({ error: "instance_unauthorized" });
+
+    const grant = await fetch(`${hub.edgeUrl}/api/bot-messages/grant`, { method: "POST", body: "{}" });
+    expect(grant.status).toBe(403);
+    expect(await grant.json()).toEqual({ error: "local_controller_required" });
+
+    const local = await fetch(`${hub.edgeUrl}/api/bot-messages/local`, { method: "POST", body: "{}" });
+    expect(local.status).toBe(403);
+    expect(await local.json()).toEqual({ error: "local_controller_required" });
   });
 
-  it("serves owner-authenticated Cloudflare configuration view & updates", async () => {
+  it("requires enrolled local owner controller and fresh one-use signed device action for Cloudflare settings and Quick Tunnel", async () => {
     const hub = await startHub();
     const view = await hub.cloudflare.view();
     expect(view.mode).toBe("named");
     expect(view.protocol).toBe("http2");
     expect(view.commands.quickHttp2).toContain("--protocol http2");
-    expect(view.commands.namedQuic).toContain(hub.url);
-    expect(view.loopbackTarget).toBe(hub.url);
+    expect(view.commands.namedQuic).toContain(hub.edgeUrl);
+    expect(view.loopbackTarget).toBe(hub.edgeUrl);
 
-    // Unauthenticated HTTP requests to owner Cloudflare API must fail with 401.
-    const unauth = await fetch(`${hub.url}${HOST_CLOUDFLARE_PATH}`);
-    expect(unauth.status).toBe(401);
+    // Unauthenticated HTTP requests fail with 401.
+    expect((await fetch(`${hub.url}${HOST_CLOUDFLARE_PATH}`)).status).toBe(401);
+    expect((await fetch(`${hub.url}${HOST_CLOUDFLARE_PATH}`, { method: "PUT", body: "{}" })).status).toBe(401);
+    expect((await fetch(`${hub.url}${HOST_CLOUDFLARE_QUICK_PATH}`, { method: "POST", body: "{}" })).status).toBe(401);
+
+    // Enroll a local desktop controller AND a remote paired owner device.
+    const localOwner = testDevice("cf_local_ctrl");
+    await hub.enrollLocalController(deviceFields(localOwner));
+    const localSession = await loginFor(hub.auth, localOwner);
+
+    const remoteOwner = testDevice("cf_remote_owner");
+    await enrollTrusted(hub.auth, remoteOwner);
+    const remoteSession = await loginFor(hub.auth, remoteOwner);
+
+    const updateCommand = { mode: "named" as const, protocol: "http2" as const, origins: ["https://signed.example.com"] };
+    const updateTarget = hashSecret(cloudflareUpdateProofText(updateCommand));
+    const quickCommand = { action: "stop" as const };
+    const quickTarget = hashSecret(cloudflareQuickActionProofText(quickCommand));
+
+    // 1. Remote paired owner device CANNOT mutate Cloudflare origins or Quick Tunnel even with a valid device signature.
+    const remoteUpdateProof = (await signedDeviceAction(hub.url, remoteSession.token, remoteOwner.privateKey, { operation: "cloudflare-tunnel", target: updateTarget })).proof;
+    const remoteUpdateRes = await fetch(`${hub.url}${HOST_CLOUDFLARE_PATH}`, {
+      method: "PUT",
+      headers: { Authorization: `Bearer ${remoteSession.token}` },
+      body: JSON.stringify({ command: updateCommand, proof: remoteUpdateProof }),
+    });
+    expect(remoteUpdateRes.status).toBe(403);
+    expect(await remoteUpdateRes.json()).toEqual({ error: "local_controller_required" });
+    expect(hub.cloudflare.isOriginAllowed("https://signed.example.com")).toBe(false);
+
+    const remoteQuickProof = (await signedDeviceAction(hub.url, remoteSession.token, remoteOwner.privateKey, { operation: "cloudflare-tunnel", target: quickTarget })).proof;
+    const remoteQuickRes = await fetch(`${hub.url}${HOST_CLOUDFLARE_QUICK_PATH}`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${remoteSession.token}` },
+      body: JSON.stringify({ command: quickCommand, proof: remoteQuickProof }),
+    });
+    expect(remoteQuickRes.status).toBe(403);
+    expect(await remoteQuickRes.json()).toEqual({ error: "local_controller_required" });
+
+    // 2. Local controller WITHOUT proof is rejected (stolen bearer token alone cannot mutate).
+    const unsignedUpdate = await fetch(`${hub.url}${HOST_CLOUDFLARE_PATH}`, {
+      method: "PUT",
+      headers: { Authorization: `Bearer ${localSession.token}` },
+      body: JSON.stringify({ command: updateCommand }),
+    });
+    expect(unsignedUpdate.status).toBe(403);
+    expect(await unsignedUpdate.json()).toEqual({ error: "device_action_proof_required" });
+
+    const unsignedQuick = await fetch(`${hub.url}${HOST_CLOUDFLARE_QUICK_PATH}`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${localSession.token}` },
+      body: JSON.stringify({ command: quickCommand }),
+    });
+    expect(unsignedQuick.status).toBe(403);
+    expect(await unsignedQuick.json()).toEqual({ error: "device_action_proof_required" });
+
+    // 3. Local controller arriving via edgeUrl (tunnel) is rejected even with valid proof.
+    const edgeProof = (await signedDeviceAction(hub.url, localSession.token, localOwner.privateKey, { operation: "cloudflare-tunnel", target: updateTarget })).proof;
+    const viaEdge = await fetch(`${hub.edgeUrl}${HOST_CLOUDFLARE_PATH}`, {
+      method: "PUT",
+      headers: { Authorization: `Bearer ${localSession.token}` },
+      body: JSON.stringify({ command: updateCommand, proof: edgeProof }),
+    });
+    expect(viaEdge.status).toBe(403);
+    expect(await viaEdge.json()).toEqual({ error: "local_controller_required" });
+
+    // 4. Substituted command fails and consumes the one-use proof.
+    const substitutedRes = await fetch(`${hub.url}${HOST_CLOUDFLARE_PATH}`, {
+      method: "PUT",
+      headers: { Authorization: `Bearer ${localSession.token}` },
+      body: JSON.stringify({ command: { ...updateCommand, origins: ["https://evil.example.com"] }, proof: edgeProof }),
+    });
+    expect(substitutedRes.status).toBe(403);
+    expect(await substitutedRes.json()).toEqual({ error: "device_action_invalid" });
+    expect(hub.cloudflare.isOriginAllowed("https://evil.example.com")).toBe(false);
+
+    // 5. Wrong device-action operation ("network") cannot authorize cloudflare-tunnel.
+    const wrongOpProof = (await signedDeviceAction(hub.url, localSession.token, localOwner.privateKey, { operation: "network", target: updateTarget })).proof;
+    const wrongOpRes = await fetch(`${hub.url}${HOST_CLOUDFLARE_PATH}`, {
+      method: "PUT",
+      headers: { Authorization: `Bearer ${localSession.token}` },
+      body: JSON.stringify({ command: updateCommand, proof: wrongOpProof }),
+    });
+    expect(wrongOpRes.status).toBe(403);
+    expect(await wrongOpRes.json()).toEqual({ error: "device_action_invalid" });
+
+    // 6. Fresh signed proof from local owner controller succeeds once, records audit, and rejects replay.
+    const validProof = (await signedDeviceAction(hub.url, localSession.token, localOwner.privateKey, { operation: "cloudflare-tunnel", target: updateTarget })).proof;
+    const okUpdate = await fetch(`${hub.url}${HOST_CLOUDFLARE_PATH}`, {
+      method: "PUT",
+      headers: { Authorization: `Bearer ${localSession.token}` },
+      body: JSON.stringify({ command: updateCommand, proof: validProof }),
+    });
+    expect(okUpdate.status).toBe(200);
+    expect((await okUpdate.json()).origins).toEqual(["https://signed.example.com"]);
+    expect(hub.cloudflare.isOriginAllowed("https://signed.example.com")).toBe(true);
+
+    const replayUpdate = await fetch(`${hub.url}${HOST_CLOUDFLARE_PATH}`, {
+      method: "PUT",
+      headers: { Authorization: `Bearer ${localSession.token}` },
+      body: JSON.stringify({ command: updateCommand, proof: validProof }),
+    });
+    expect(replayUpdate.status).toBe(403);
+    expect(await replayUpdate.json()).toEqual({ error: "device_action_expired" });
+
+    const validQuickProof = (await signedDeviceAction(hub.url, localSession.token, localOwner.privateKey, { operation: "cloudflare-tunnel", target: quickTarget })).proof;
+    const okQuick = await fetch(`${hub.url}${HOST_CLOUDFLARE_QUICK_PATH}`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${localSession.token}` },
+      body: JSON.stringify({ command: quickCommand, proof: validQuickProof }),
+    });
+    expect(okQuick.status).toBe(200);
+    expect((await okQuick.json()).running).toBe(false);
+
+    const audits = await hub.store.db.all<{ kind: string; actor: string }>("SELECT kind, actor FROM audit_log WHERE kind LIKE 'cloudflare.%' ORDER BY id");
+    expect(audits).toEqual([
+      { kind: "cloudflare.updated", actor: localOwner.deviceId },
+      { kind: "cloudflare.quick_stopped", actor: localOwner.deviceId },
+    ]);
   });
+
+  it("manages Cloudflare settings and Cloudflare pairing links end-to-end via Host CLI", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "tarobird-cf-cli-"));
+    dirs.push(dir);
+    const printed: unknown[] = [];
+    const logSpy = vi.spyOn(console, "log").mockImplementation((value) => { printed.push(value); });
+    await runHostCli(["init", "--name", "macmini", "--state-dir", dir, "--json"]);
+    const hub = await HubServer.start({ stateDir: dir });
+    hubs.push(hub);
+    const closeControl = await startHubControl(
+      dir,
+      { running: true, pid: process.pid, url: hub.url, instanceUrl: hub.instanceUrl, publicKey: hub.auth.publicKey },
+      () => {},
+      { enrollController: (controller) => hub.enrollLocalController(controller) },
+    );
+    try {
+      await runHostCli(["enroll", "--state-dir", dir, "--json"]);
+
+      // 1. status reads dedicated edgeUrl loopbackTarget
+      await runHostCli(["cloudflare", "status", "--state-dir", dir, "--json"]);
+      expect(JSON.parse(String(printed.at(-1)))).toMatchObject({
+        mode: "named",
+        protocol: "http2",
+        origins: [],
+        loopbackTarget: hub.edgeUrl,
+      });
+
+      // 2. Mutations require explicit --yes
+      await expect(runHostCli(["cloudflare", "allow", "https://cli-hub.example.com", "--state-dir", dir, "--json"])).rejects.toThrow("--yes");
+      await expect(runHostCli(["cloudflare", "quick", "start", "--state-dir", dir, "--json"])).rejects.toThrow("--yes");
+
+      // 3. allow / set / revoke sign real cloudflare-tunnel device actions and persist changes
+      await runHostCli(["cloudflare", "allow", "https://cli-hub.example.com", "--yes", "--state-dir", dir, "--json"]);
+      expect(JSON.parse(String(printed.at(-1))).origins).toEqual(["https://cli-hub.example.com"]);
+      expect(hub.cloudflare.isOriginAllowed("https://cli-hub.example.com")).toBe(true);
+
+      await runHostCli([
+        "cloudflare", "set", "--mode", "named", "--protocol", "quic",
+        "--origins", "https://a.example.com,https://b.example.com", "--yes", "--state-dir", dir, "--json",
+      ]);
+      expect(JSON.parse(String(printed.at(-1)))).toMatchObject({
+        mode: "named",
+        protocol: "quic",
+        origins: ["https://a.example.com", "https://b.example.com"],
+      });
+
+      await runHostCli(["cloudflare", "revoke", "https://a.example.com", "--yes", "--state-dir", dir, "--json"]);
+      expect(JSON.parse(String(printed.at(-1))).origins).toEqual(["https://b.example.com"]);
+
+      // 4. pair --cloudflare emits a valid invite link containing the authorized Cloudflare route
+      await runHostCli(["pair", "--cloudflare", "--state-dir", dir, "--json"]);
+      const pairOut = JSON.parse(String(printed.at(-1))) as { link: string; routes: Array<{ name: string; url: string }> };
+      expect(pairOut.routes).toEqual([{ name: "Cloudflare", url: "https://b.example.com" }]);
+      expect(pairOut.link).toMatch(/^tarocub:\/\/pair\?data=/);
+
+      // 5. quick stop and --clear-origins work cleanly
+      await runHostCli(["cloudflare", "quick", "stop", "--yes", "--state-dir", dir, "--json"]);
+      expect(JSON.parse(String(printed.at(-1))).running).toBe(false);
+
+      await runHostCli(["cloudflare", "set", "--clear-origins", "--yes", "--state-dir", dir, "--json"]);
+      expect(JSON.parse(String(printed.at(-1))).origins).toEqual([]);
+      expect(hub.cloudflare.isOriginAllowed("https://b.example.com")).toBe(false);
+    } finally {
+      logSpy.mockRestore();
+      await closeControl();
+    }
+  }, 20_000);
 });
 
 describe("Host-to-Host PrivateNetwork & Bot messaging over Cloudflare edgeRoutes (#103)", () => {

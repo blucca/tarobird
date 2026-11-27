@@ -58,7 +58,7 @@ import { hostNameSchema } from "../client-protocol/host-profile.js";
 import { PrivateNetwork } from "./private-network.js";
 import { certificateAuthorityFromChain, lanInterfaceKey, HostRoutes, type ManagedListener } from "./host-routes.js";
 import { HOST_ROUTES_PATH, HOST_LAN_SELECTION_PATH, managedLanSelectionSchema } from "../client-protocol/host-routes.js";
-import { HOST_CLOUDFLARE_PATH, HOST_CLOUDFLARE_QUICK_PATH, cloudflareQuickActionSchema } from "../client-protocol/cloudflare.js";
+import { HOST_CLOUDFLARE_PATH, HOST_CLOUDFLARE_QUICK_PATH, cloudflareQuickActionProofText, cloudflareQuickActionSchema, cloudflareUpdateProofText, cloudflareUpdateSchema } from "../client-protocol/cloudflare.js";
 import { HubCloudflareTunnel } from "./cloudflare-tunnel.js";
 import { markDeviceNameAlias } from "./network-device-name.js";
 import { networkCommandSchema } from "../client-protocol/private-network.js";
@@ -133,7 +133,7 @@ import { googleDocsErrorCode } from "../gdocs/errors.js";
 import { googleDocsStatus } from "../gdocs/settings.js";
 import { hubServiceCommand } from "./service.js";
 import { redactSecrets } from "../runtime/secret-redaction.js";
-import { RelaySources } from "../relay/sources.js";
+import { RelaySources, sourceAddress } from "../relay/sources.js";
 import { exportGoogleDocument } from "./google-export.js";
 import { ShutdownErrors } from "./shutdown.js";
 
@@ -155,13 +155,14 @@ function gatewayWorkbenchMetadata<T extends { workbench?: WorkbenchContext }>(me
 type BotConnection = { botSteer: boolean; engineQuota: boolean; contextUsage: boolean; history: boolean; designOpen: boolean; nativeInput: boolean; nativeReviewInput: boolean; engineTasks: boolean; piSession: boolean; ws: WebSocket; botId: string; queueCapable: boolean; queuePull: boolean; queueAdvertised: boolean; botMessages: boolean; agentBus: boolean; groupDiscussion: boolean; voicePolicy: boolean; widgetPolicy: boolean; replayQueue: boolean; ready: boolean };
 type Rpc = { resolve: (value: Json) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout>; ws: WebSocket };
 export interface HubTlsListener { exposure?: ListenerExposure; host: string; port: number; tls: TlsOptions; managed?: boolean }
-export interface HubServerOptions { voiceSettings?: HubVoiceSettings; asrSetup?: QwenAsrSetup; /** Internal lease duration override for isolated tests. */ drainLeaseMs?: number; relaySources?: RelaySources; exposure?: ListenerExposure; maxFileBytes?: number; managedBots?: BotManagerOptions; stateDir: string; host?: string; port?: number; tls?: TlsOptions; instancePort?: number; tlsListeners?: HubTlsListener[]; push?: PushConfig; origins?: string[]; clientDir?: string; googleDocs?: () => Promise<GoogleDocs>; onWarning?: (code: string) => void; networkExchange?: typeof exchangeNetworkPeer }
+export interface HubServerOptions { voiceSettings?: HubVoiceSettings; asrSetup?: QwenAsrSetup; /** Internal lease duration override for isolated tests. */ drainLeaseMs?: number; relaySources?: RelaySources; exposure?: ListenerExposure; maxFileBytes?: number; managedBots?: BotManagerOptions; stateDir: string; host?: string; port?: number; tls?: TlsOptions; instancePort?: number; edgePort?: number; tlsListeners?: HubTlsListener[]; push?: PushConfig; origins?: string[]; clientDir?: string; googleDocs?: () => Promise<GoogleDocs>; onWarning?: (code: string) => void; networkExchange?: typeof exchangeNetworkPeer }
 export class HubServer {
   private readonly relaySources: RelaySources;
   private readonly fragmentSockets = new WeakSet<WebSocket>();
   private readonly requestGuards = new WeakMap<IncomingMessage, () => Promise<void>>();
   private readonly downloads = new Map<AbortController, AuthSession>();
   readonly http: Server;
+  readonly edgeHttp: Server;
   readonly linkPreviews: HubLinkPreviews;
   readonly fileCenter: HubFileCenter;
   readonly workspaceDiff: HubWorkspaceDiff;
@@ -183,7 +184,7 @@ export class HubServer {
   private readonly networkAbort = new AbortController();
   private networkTick?: Promise<void>;
   private readonly networkSources = new Map<string, { remaining: number; updatedAt: number; until: number }>();
-  private readonly listeners: { server: Server; host: string; port: number; tls: boolean; instance: boolean; managed?: boolean; retired?: boolean; authority?: string }[] = [];
+  private readonly listeners: { server: Server; host: string; port: number; tls: boolean; instance: boolean; edgeProxy?: boolean; managed?: boolean; retired?: boolean; authority?: string }[] = [];
   private readonly listenerStarts = new Map<Server, Promise<void>>();
   readonly remoteScreen: HubRemoteScreen;
   private readonly screenSockets: RemoteScreenSockets;
@@ -359,7 +360,7 @@ export class HubServer {
       exchange: options.networkExchange ?? ((host, request) => exchangeNetworkPeer(host, request, { signal: this.networkAbort.signal })),
     });
     this.hostRoutes = new HostRoutes({ store, network: this.network, publicKey: auth.publicKey, stateDir: options.stateDir, listeners: () => this.managedListeners() });
-    this.cloudflare = new HubCloudflareTunnel({ store, loopbackTarget: () => this.url });
+    this.cloudflare = new HubCloudflareTunnel({ store, loopbackTarget: () => this.edgeUrl });
     const conversationsCreated = (userId: string, conversations: Conversation[]) => {
       for (const conversation of conversations) for (const c of this.clients) if (c.session?.userId === userId && (!conversation.hidden || c.capabilities.includes(DISPATCH_CAPABILITY))) { c.conversationIds.add(conversation.id); this.publishClient(c, { v: 1, type: "conversation.updated", conversation }); }
     };
@@ -413,6 +414,11 @@ export class HubServer {
     this.http = options.tls ? createTlsServer(options.tls) : createServer();
     this.attachListener(this.http, options.host ?? "127.0.0.1", options.port ?? 0, !!options.tls, !options.tls, options.exposure);
     if (options.tls) this.attachListener(createServer(), "127.0.0.1", options.instancePort ?? 0, false, true);
+    // Dedicated non-instance loopback listener exclusively for edge-terminated
+    // tunnels (e.g. DIY Cloudflare Tunnel). Local vs remote trust and instance
+    // privileges are enforced by listener boundary, never by HTTP headers.
+    this.edgeHttp = createServer();
+    this.attachListener(this.edgeHttp, "127.0.0.1", options.edgePort ?? 0, false, false, "private", false, undefined, true);
     for (const listener of options.tlsListeners ?? []) this.attachListener(createTlsServer(listener.tls), listener.host, listener.port, true, false, listener.exposure, listener.managed, listener.managed ? certificateAuthorityFromChain(listener.tls.cert) : undefined);
     this.disposers.push(store.subscribe((event) => {
       this.trackTask(this.broadcast(event).catch(() => options.onWarning?.("broadcast_failed")));
@@ -439,16 +445,16 @@ export class HubServer {
       void this.sweep().catch(() => options.onWarning?.("hub_sweep_failed")).finally(() => { checking = false; });
     }, 500); sweep.unref(); this.disposers.push(() => clearInterval(sweep));
   }
-  private attachListener(server: Server, host: string, port: number, tls: boolean, instance: boolean, exposure?: ListenerExposure, managed = false, authority?: string): void {
+  private attachListener(server: Server, host: string, port: number, tls: boolean, instance: boolean, exposure?: ListenerExposure, managed = false, authority?: string, edgeProxy = false): void {
     assertSafeBind(host, tls, exposure);
-    this.listeners.push({ server, host, port, tls, instance, managed, ...(authority ? { authority } : {}) });
+    this.listeners.push({ server, host, port, tls, instance, ...(edgeProxy ? { edgeProxy: true } : {}), managed, ...(authority ? { authority } : {}) });
     server.on("connection", (socket) => {
       this.connections.add(socket);
       socket.once("close", () => this.connections.delete(socket));
     });
     server.on("request", (req, res) => {
       if (this.stopping) { res.setHeader("Connection", "close"); this.respondError(res, new HubError("hub_stopping", 503)); return; }
-      const task = this.request(req, res, instance).catch(async (e: unknown) => {
+      const task = this.request(req, res, instance, edgeProxy).catch(async (e: unknown) => {
         if (req.url?.startsWith("/api/bot-messages/") || req.url?.startsWith("/api/instance/bot-messages") || req.headers["x-tarobot-message-passport"]) {
           await this.store.audit("bot-message.rejected", null, { stage: "http", reason: e instanceof HubError ? e.code.slice(0, 256) : "invalid_request" });
         }
@@ -459,13 +465,13 @@ export class HubServer {
     });
     server.on("upgrade", (req, socket, head) => {
       if (!this.stopping && this.originAllowed(req) && this.screenSockets.handles(req.url ?? "")) {
-        this.screenSockets.upgrade(req, socket, head, instance && !tls && this.isDirectLoopback(req), isLocalNetworkAddress(req.socket.remoteAddress ?? "")); return;
+        this.screenSockets.upgrade(req, socket, head, instance && !tls, isLocalNetworkAddress(req.socket.remoteAddress ?? "")); return;
       }
-      // A relay or local tunnel (e.g. cloudflared) arrives from loopback, so the
-      // socket address alone cannot distinguish a local instance connection from
-      // an untrusted remote client.
-      if (this.stopping || !this.originAllowed(req) || !["/ws", "/instance"].includes(req.url ?? "") || (req.url === "/instance" && (!instance || !this.isDirectLoopback(req)))) { socket.destroy(); return; }
-      this.sockets.handleUpgrade(req, socket, head, (ws) => req.url === "/instance" ? this.instanceSocket(ws) : this.clientSocket(ws, this.requestSource(req)));
+      // Instance sockets are strictly fenced to listeners with `instance === true`.
+      // Remote TLS listeners and the dedicated `edgeProxy` loopback listener have
+      // `instance === false` so tunnel/relay traffic can never reach `/instance`.
+      if (this.stopping || !this.originAllowed(req) || !["/ws", "/instance"].includes(req.url ?? "") || (req.url === "/instance" && !instance)) { socket.destroy(); return; }
+      this.sockets.handleUpgrade(req, socket, head, (ws) => req.url === "/instance" ? this.instanceSocket(ws) : this.clientSocket(ws, this.requestSource(req, edgeProxy)));
     });
   }
   private trackTask(work: Promise<unknown>): void {
@@ -485,7 +491,7 @@ export class HubServer {
     }).catch(error => {
       // A missing Wi-Fi/VPN address must not take down the local controller,
       // workers or relay. Only additional TLS endpoints may recover later.
-      if (server !== this.http && !listener.instance && ["EADDRNOTAVAIL", "EADDRINUSE", "ENODEV", "ENETUNREACH", "EAFNOSUPPORT"].includes((error as NodeJS.ErrnoException).code ?? "")) {
+      if (server !== this.http && !listener.instance && !listener.edgeProxy && ["EADDRNOTAVAIL", "EADDRINUSE", "ENODEV", "ENETUNREACH", "EAFNOSUPPORT"].includes((error as NodeJS.ErrnoException).code ?? "")) {
         this.options.onWarning?.("optional_listener_unavailable"); return;
       }
       throw error;
@@ -577,8 +583,9 @@ export class HubServer {
   }
   private listenerUrl(server: Server, tls: boolean): string { const address = server.address(); if (!address || typeof address === "string") throw new Error("not_listening"); return `${tls ? "https" : "http"}://${address.family === "IPv6" ? `[${address.address}]` : address.address}:${address.port}`; }
   get url(): string { return this.listenerUrl(this.http, !!this.options.tls); }
-  get urls(): string[] { return this.listeners.filter(({ server }) => server.listening).map(({ server, tls }) => this.listenerUrl(server, tls)); }
+  get urls(): string[] { return this.listeners.filter(({ server, edgeProxy }) => server.listening && !edgeProxy).map(({ server, tls }) => this.listenerUrl(server, tls)); }
   get instanceUrl(): string { const listener = this.listeners.find((l) => l.instance)!; return this.listenerUrl(listener.server, false); }
+  get edgeUrl(): string { return this.listenerUrl(this.edgeHttp, false); }
   /** Terminal intent is synchronous, before any maintenance or route I/O.
    * Once accepted, an expired/cancelled CLI drain must never resume work. */
   beginShutdown(): void {
@@ -666,46 +673,19 @@ export class HubServer {
     if (!origin) return true;
     return [...this.urls, ...NATIVE_ORIGINS, ...(this.options.origins ?? [])].includes(origin) || this.cloudflare.isOriginAllowed(origin);
   }
-  private hasProxyHeaders(req: IncomingMessage): boolean {
-    return Boolean(
-      req.headers["cf-ray"]
-      || req.headers["cf-connecting-ip"]
-      || req.headers["cf-visitor"]
-      || req.headers["cf-ipcountry"]
-      || req.headers["x-forwarded-for"]
-      || req.headers["x-forwarded-host"]
-      || req.headers["x-forwarded-proto"]
-      || req.headers["x-real-ip"]
-      || req.headers["true-client-ip"]
-      || req.headers["forwarded"]
-      || req.headers["via"],
-    );
-  }
-  private isLoopbackHostHeader(raw: string | undefined): boolean {
-    if (!raw || typeof raw !== "string" || /[\s/@\\?#]/.test(raw)) return false;
-    try {
-      const parsed = new URL(`http://${raw}`);
-      if (parsed.username || parsed.password || parsed.pathname !== "/" || parsed.search || parsed.hash) return false;
-      const hostname = parsed.hostname.replace(/^\[|\]$/g, "").replace(/\.$/, "").toLowerCase();
-      return hostname === "localhost" || isLoopback(hostname);
-    } catch { return false; }
-  }
-  /** True only for a direct local loopback caller—never a relay tunnel or
-   * reverse-proxied request carrying proxy headers or a non-loopback Host. */
-  private isDirectLoopback(req: IncomingMessage): boolean {
-    if (!isLoopback(req.socket.remoteAddress ?? "")) return false;
-    if (!isLoopback(this.relaySources.source(req.socket))) return false;
-    if (this.hasProxyHeaders(req)) return false;
-    return this.isLoopbackHostHeader(req.headers.host);
-  }
-  private requestSource(req: IncomingMessage): string {
-    const raw = this.relaySources.source(req.socket);
-    // Requests arriving via a local reverse proxy / cloudflared over loopback
-    // must never inherit trusted loopback rate buckets or spoofable header IPs.
-    if (isLoopback(raw) && (this.hasProxyHeaders(req) || !this.isLoopbackHostHeader(req.headers.host))) {
-      return "edge-proxy";
+  private requestSource(req: IncomingMessage, edgeProxy = false): string {
+    if (edgeProxy) {
+      // Dedicated non-instance loopback listener for Cloudflare Tunnel only.
+      // Attribute rate-limit/audit sources per external client IP from
+      // Cloudflare's edge-inserted CF-Connecting-IP header, always strictly
+      // inside the edge-proxy namespace (never loopback/trusted, never auth).
+      const header = req.headers["cf-connecting-ip"];
+      if (typeof header === "string") {
+        try { return `edge-proxy:${sourceAddress(header.trim())}`; } catch { /* fall back to shared edge bucket */ }
+      }
+      return "edge-proxy:shared";
     }
-    return raw;
+    return this.relaySources.source(req.socket);
   }
   private send(ws: WebSocket, value: unknown): Promise<void> {
     const work = writeFrame(ws, value, this.fragmentSockets.has(ws));
@@ -1575,8 +1555,8 @@ export class HubServer {
     if (bucket.remaining < 1) throw new HubError("rate_limited", 429);
     bucket.remaining--;
   }
-  private async request(req: IncomingMessage, res: ServerResponse, instanceAllowed: boolean): Promise<void> {
-    const source = this.requestSource(req);
+  private async request(req: IncomingMessage, res: ServerResponse, instanceAllowed: boolean, edgeProxy = false): Promise<void> {
+    const source = this.requestSource(req, edgeProxy);
     if (!this.originAllowed(req)) throw new HubError("origin_forbidden", 403);
     if (req.headers.origin) { res.setHeader("Access-Control-Allow-Origin", req.headers.origin); res.setHeader("Vary", "Origin"); }
     res.setHeader("Access-Control-Expose-Headers", "ETag, Content-Range, Accept-Ranges, Date");
@@ -1598,12 +1578,23 @@ export class HubServer {
     }
     if (route === "/api/edge-identity" && req.method === "GET") {
       // Edge-terminated HTTPS proofs (e.g. DIY Cloudflare Tunnel) are ONLY
-      // issued to real loopback tunnel hops for explicitly authorized origins,
-      // preventing remote third-party proxies from replaying another Hub's proof.
-      if (!isLoopback(req.socket.remoteAddress ?? "")) throw new HubError("edge_identity_loopback_only", 403);
+      // issued on the dedicated non-instance loopback edge-proxy listener and
+      // ONLY for explicitly authorized origins, preventing remote third-party
+      // proxies or misconfigured tunnels pointing at the main listener from
+      // obtaining edge proofs.
+      if (!edgeProxy || !isLoopback(req.socket.remoteAddress ?? "")) throw new HubError("edge_identity_loopback_only", 403);
       const requestedOrigin = url.searchParams.get("origin") ?? "";
       if (!this.cloudflare.isOriginAllowed(requestedOrigin)) throw new HubError("edge_origin_not_allowed", 403);
-      this.json(res, 200, this.auth.edgeIdentity(url.searchParams.get("nonce") ?? "", requestedOrigin, "edge-proxy")); return;
+      const bearer = req.headers.authorization?.replace(/^Bearer /, "");
+      let knownDeviceId = await this.auth.activeSessionDeviceId(bearer);
+      if (!knownDeviceId) {
+        const candidate = url.searchParams.get("deviceId");
+        if (candidate && idSchema.safeParse(candidate).success) {
+          const device = await this.store.device(candidate);
+          if (device && !device.revoked) knownDeviceId = device.id;
+        }
+      }
+      this.json(res, 200, this.auth.edgeIdentity(url.searchParams.get("nonce") ?? "", requestedOrigin, source, knownDeviceId)); return;
     }
     if (route === "/api/pair" && req.method === "POST") { this.json(res, 201, await this.auth.pairInvited(await this.jsonBody(req, 8192), source)); return; }
     if (route === "/api/bot-messages/challenge" && req.method === "GET") {
@@ -1633,12 +1624,8 @@ export class HubServer {
       this.networkRate(source, "enroll");
       this.json(res, 200, await this.network.enroll(await this.jsonBody(req, MAX_NETWORK_BYTES))); return;
     }
-    if (route.startsWith("/api/instance/")) {
-      if (!instanceAllowed) throw new HubError("instance_unauthorized", 401);
-      if (!this.isDirectLoopback(req)) throw new HubError("instance_loopback_only", 403);
-      await this.instanceHttp(req, res, route); return;
-    }
-    if ((route === "/api/bot-messages/grant" || route === "/api/bot-messages/local") && (!instanceAllowed || !this.isDirectLoopback(req))) {
+    if (route.startsWith("/api/instance/")) { if (!instanceAllowed) throw new HubError("instance_unauthorized", 401); await this.instanceHttp(req, res, route); return; }
+    if ((route === "/api/bot-messages/grant" || route === "/api/bot-messages/local") && (!instanceAllowed || !isLoopback(req.socket.remoteAddress ?? ""))) {
       throw new HubError("local_controller_required", 403);
     }
     if (!route.startsWith("/api/")) { await this.staticFile(route, res); return; }
@@ -1846,13 +1833,13 @@ export class HubServer {
         return;
       }
       if (route === "/api/bot-messages/grant" && req.method === "POST") {
-        if (!instanceAllowed || !this.isDirectLoopback(req)) throw new HubError("local_controller_required", 403);
+        if (!instanceAllowed || !isLoopback(req.socket.remoteAddress ?? "")) throw new HubError("local_controller_required", 403);
         messageControllerRequired = true; await requireOwner();
         const input = z.object({ command: z.record(z.string(), z.unknown()), proof: deviceActionProofSchema }).strict().parse(await this.jsonBody(req));
         await reply(200, await this.botMessages.grant(input.command, validateInQueue, () => this.auth.consumeBotMessageGrant(session, hashSecret(networkCanonical(input.command)), input.proof), session.deviceId)); return;
       }
       if (route === "/api/bot-messages/local" && req.method === "POST") {
-        if (!instanceAllowed || !this.isDirectLoopback(req)) throw new HubError("local_controller_required", 403);
+        if (!instanceAllowed || !isLoopback(req.socket.remoteAddress ?? "")) throw new HubError("local_controller_required", 403);
         messageControllerRequired = true; await requireOwner(); const input = botLocalRequestSchema.parse(await this.jsonBody(req, BOT_TRANSFER_BYTES));
         if (!input.sourceBot) throw new HubError("bot_message_source_required", 400);
         await reply(200, await this.botMessages.local(input, input.sourceBot, validateInQueue, true)); return;
@@ -1888,14 +1875,32 @@ export class HubServer {
         await requireOwner(); await reply(200, await this.cloudflare.view()); return;
       }
       if (route === HOST_CLOUDFLARE_PATH && req.method === "PUT") {
-        await requireOwner();
-        const view = await this.cloudflare.update(await this.jsonBody(req, 8192));
+        if (edgeProxy) throw new HubError("local_controller_required", 403);
+        messageControllerRequired = true; await requireOwner();
+        const input = z.object({ command: cloudflareUpdateSchema, proof: deviceActionProofSchema.optional() }).strict().parse(await this.jsonBody(req, 8192));
+        const target = hashSecret(cloudflareUpdateProofText(input.command));
+        const view = await this.cloudflare.update(input.command, async () => {
+          await this.auth.consumeCloudflareAction(session, target, input.proof);
+          await this.store.db.run(
+            "INSERT INTO audit_log(at,actor,kind,detail_json) VALUES(?,?,?,?)",
+            [Date.now(), session.deviceId, "cloudflare.updated", JSON.stringify({ ...(input.command.mode ? { mode: input.command.mode } : {}), ...(input.command.protocol ? { protocol: input.command.protocol } : {}), ...(input.command.origins ? { originsCount: input.command.origins.length } : {}) })],
+          );
+        });
         await reply(200, view); return;
       }
       if (route === HOST_CLOUDFLARE_QUICK_PATH && req.method === "POST") {
-        await requireOwner();
-        const action = cloudflareQuickActionSchema.parse(await this.jsonBody(req, 2048));
-        const view = action.action === "start" ? await this.cloudflare.startQuickTunnel(action.protocol) : await this.cloudflare.stopQuickTunnel();
+        if (edgeProxy) throw new HubError("local_controller_required", 403);
+        messageControllerRequired = true; await requireOwner();
+        const input = z.object({ command: cloudflareQuickActionSchema, proof: deviceActionProofSchema.optional() }).strict().parse(await this.jsonBody(req, 2048));
+        const target = hashSecret(cloudflareQuickActionProofText(input.command));
+        await this.store.db.transaction(async () => {
+          await this.auth.consumeCloudflareAction(session, target, input.proof);
+          await this.store.db.run(
+            "INSERT INTO audit_log(at,actor,kind,detail_json) VALUES(?,?,?,?)",
+            [Date.now(), session.deviceId, input.command.action === "start" ? "cloudflare.quick_started" : "cloudflare.quick_stopped", JSON.stringify({ action: input.command.action, ...(input.command.protocol ? { protocol: input.command.protocol } : {}) })],
+          );
+        });
+        const view = input.command.action === "start" ? await this.cloudflare.startQuickTunnel(input.command.protocol, validate) : await this.cloudflare.stopQuickTunnel();
         await reply(200, view); return;
       }
       if (route === "/api/network/manage" && req.method === "POST") {
@@ -2738,7 +2743,7 @@ export class HubServer {
     res.writeHead(200, { "Content-Type": mime, "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer", "Content-Security-Policy": `default-src 'self'; connect-src 'self' https: wss:${localConnect}; img-src 'self' blob: data:; media-src 'self' blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; frame-src 'self' blob: data:; font-src 'self' data:; frame-ancestors 'none'` }); res.end(await readFile(file));
   }
   private async instanceHttp(req: IncomingMessage, res: ServerResponse, route: string): Promise<void> {
-    if (!this.isDirectLoopback(req)) throw new HubError("instance_loopback_only", 403);
+    if (!isLoopback(req.socket.remoteAddress ?? "")) throw new HubError("instance_unauthorized", 401);
     const credentials = req.headers.authorization?.match(/^Instance ([A-Za-z0-9_-]+):([A-Za-z0-9_-]{32,256})$/);
     const botId = credentials?.[1];
     const record = botId ? await this.store.db.serial(() => this.store.db.get<{ secret_hash: string }>("SELECT secret_hash FROM bots WHERE id=? AND deleted_at IS NULL", [botId])) : undefined;

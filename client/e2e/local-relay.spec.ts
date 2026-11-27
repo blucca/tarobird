@@ -143,10 +143,10 @@ test("opening an empty relay editor is not an unsaved change", async ({ page }) 
 
 test("Cloudflare settings handle older hosts, loading user state, Named QUIC toggle, Quick toggle preserving edits, and English errors", async ({ page }) => {
   const cf = page.locator(".local-cloudflare-settings");
-  // Named mode respects QUIC vs HTTP/2 toggle in the recommended command.
+  // Named mode respects QUIC vs HTTP/2 toggle in the recommended command targeting the dedicated edge-proxy loopback port.
   await expect(cf.locator(".cf-command-box code")).toContainText("--protocol http2 run");
   await cf.getByRole("button", { name: "QUIC（UDP/7844）", exact: true }).click();
-  await expect(cf.locator(".cf-command-box code")).toHaveText("cloudflared tunnel run --url http://127.0.0.1:8788 <your-tunnel-name>");
+  await expect(cf.locator(".cf-command-box code")).toHaveText("cloudflared tunnel run --url http://127.0.0.1:8790 <your-tunnel-name>");
   await cf.getByRole("button", { name: "HTTP/2（推荐 · TCP/443）", exact: true }).click();
 
   // Add an unsaved domain edit, switch to Quick mode, start and stop Quick Tunnel without losing the unsaved domain edit or mutating PrivateNetwork.

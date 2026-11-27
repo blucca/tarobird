@@ -162,14 +162,17 @@ export class HubCloudflareTunnel {
     return this.config;
   }
 
-  private async persist(next: CloudflareConfig): Promise<void> {
+  private async persistInTransaction(next: CloudflareConfig): Promise<CloudflareConfig> {
     const parsed = cloudflareConfigSchema.parse(next);
-    await this.options.store.db.serial(() =>
-      this.options.store.db.run(
-        "INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        [CLOUDFLARE_META_KEY, JSON.stringify(parsed)],
-      ),
+    await this.options.store.db.run(
+      "INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+      [CLOUDFLARE_META_KEY, JSON.stringify(parsed)],
     );
+    return parsed;
+  }
+
+  private async persist(next: CloudflareConfig): Promise<void> {
+    const parsed = await this.options.store.db.serial(() => this.persistInTransaction(next));
     this.config = parsed;
     this.loaded = true;
   }
@@ -211,22 +214,33 @@ export class HubCloudflareTunnel {
     });
   }
 
-  async update(raw: unknown): Promise<CloudflareView> {
+  async update(raw: unknown, authorizeInTransaction?: () => Promise<void>): Promise<CloudflareView> {
     const patch = cloudflareUpdateSchema.parse(raw);
-    const current = await this.load();
-    await this.persist({
-      v: 1,
-      mode: patch.mode ?? current.mode,
-      protocol: patch.protocol ?? current.protocol,
-      origins: patch.origins ?? current.origins,
+    const committed = await this.options.store.db.transaction(async () => {
+      await authorizeInTransaction?.();
+      const row = await this.options.store.db.get<{ value: string }>("SELECT value FROM meta WHERE key=?", [CLOUDFLARE_META_KEY]);
+      let current = defaultCloudflareConfig();
+      if (row) {
+        try { current = cloudflareConfigSchema.parse(JSON.parse(row.value)); }
+        catch { current = defaultCloudflareConfig(); }
+      }
+      return this.persistInTransaction({
+        v: 1,
+        mode: patch.mode ?? current.mode,
+        protocol: patch.protocol ?? current.protocol,
+        origins: patch.origins ?? current.origins,
+      });
     });
+    this.config = committed;
+    this.loaded = true;
     return this.view();
   }
 
-  startQuickTunnel(protocol?: CloudflareProtocol): Promise<CloudflareView> {
+  startQuickTunnel(protocol?: CloudflareProtocol, validate?: () => Promise<unknown>): Promise<CloudflareView> {
     if (this.closed) return Promise.reject(new HubError("hub_stopping", 503));
     return this.serialize(async () => {
       if (this.closed) throw new HubError("hub_stopping", 503);
+      await validate?.();
       const config = await this.load();
       const chosen = protocol ?? config.protocol;
       if (chosen !== config.protocol || config.mode !== "quick") {
@@ -237,6 +251,7 @@ export class HubCloudflareTunnel {
       }
       await this.stopChildLocked();
       if (this.closed) throw new HubError("hub_stopping", 503);
+      await validate?.();
 
       const bin = await this.detect();
       this.cachedBinary = { value: bin, until: Date.now() + 30_000 };

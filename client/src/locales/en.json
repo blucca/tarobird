@@ -5734,5 +5734,7 @@
   "上移 Cloudflare 隧道 {0}": "Move Cloudflare Tunnel {0} up",
   "下移 Cloudflare 隧道 {0}": "Move Cloudflare Tunnel {0} down",
   "移除 Cloudflare 隧道 {0}": "Remove Cloudflare Tunnel {0}",
-  "Cloudflare 隧道 {0} 名称": "Cloudflare Tunnel {0} name"
+  "Cloudflare 隧道 {0} 名称": "Cloudflare Tunnel {0} name",
+  "仅主机本机的已登记控制器可修改 Cloudflare 隧道配置，请在这台主机上操作。": "Only an enrolled local controller on this Host can change Cloudflare Tunnel settings.",
+  "设备签名验证未完成或已过期，请重试。": "Device signature verification did not complete or expired. Please try again."
 }

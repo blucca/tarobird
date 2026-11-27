@@ -38,12 +38,13 @@ type PairingRow = { device_id: string; name: string; platform: string; public_ke
 /** Rate-limit key for a caller; never an authorization input. Addresses are
  * canonicalized like relay sources (dotted or hex IPv4-mapped forms become
  * IPv4); one IPv6 /64, which a single host usually controls, is one source.
- * Relay namespaces (`relay:<id>:<address>`) are kept; other labels are as-is. */
+ * Relay (`relay:<id>:<address>`) and edge-proxy (`edge-proxy:<address>`)
+ * namespaces are kept; other labels are as-is. */
 export function rateSource(source: string): string {
-  const relay = /^(relay:[A-Za-z0-9_-]{1,128}:)(.+)$/.exec(source);
-  const prefix = relay?.[1] ?? "";
+  const namespaced = /^((?:relay:[A-Za-z0-9_-]{1,128}|edge-proxy):)(.+)$/.exec(source);
+  const prefix = namespaced?.[1] ?? "";
   let address: string;
-  try { address = sourceAddress(relay?.[2] ?? source); } catch { return source; }
+  try { address = sourceAddress(namespaced?.[2] ?? source); } catch { return source; }
   if (isIP(address) === 4) return prefix + address;
   const [head = "", tail = ""] = address.split("::"), left = head ? head.split(":") : [], right = tail ? tail.split(":") : [];
   const groups = address.includes("::") ? [...left, ...Array(Math.max(0, 8 - left.length - right.length)).fill("0"), ...right] : left;
@@ -58,8 +59,10 @@ export class HubAuth {
   private actions = new Map<string, { session: AuthSession; statement: DeviceActionStatement }>();
   private desktopControllers = new Map<string, DesktopControllerChallenge>();
   private limits = new Map<string, { count: number; until: number }>();
+  private edgeLimits = new Map<string, { count: number; until: number }>();
   private knownLimits = new Map<string, { count: number; until: number }>();
   private trustedLimits = new Map<string, { count: number; until: number }>();
+  private nextLimitExpiry = Infinity;
   private revocationListeners = new Set<(deviceId: string) => void>();
   private readonly invites: PairingInviteRegistry;
   private constructor(readonly store: HubStore, identity: z.infer<typeof identitySchema>, private readonly now: () => number, monotonic: () => number) {
@@ -89,20 +92,32 @@ export class HubAuth {
     const now = this.now();
     for (const [id, c] of this.challenges) if (c.expiresAt < now) this.challenges.delete(id);
     for (const [id, t] of this.tokens) if (t.expiresAt < now) this.tokens.delete(id);
-    for (const limits of [this.limits, this.knownLimits, this.trustedLimits]) for (const [id, l] of limits) if (l.until < now) limits.delete(id);
+    if (now > this.nextLimitExpiry) {
+      let next = Infinity;
+      for (const limits of [this.limits, this.edgeLimits, this.knownLimits, this.trustedLimits]) {
+        for (const [id, l] of limits) {
+          if (l.until < now) limits.delete(id);
+          else if (l.until < next) next = l.until;
+        }
+      }
+      this.nextLimitExpiry = next;
+    }
     for (const [id, a] of this.actions) if (a.statement.expiresAt <= now || a.session.expiresAt <= now) this.actions.delete(id);
     for (const [nonce, challenge] of this.desktopControllers) if (challenge.expiresAt <= now) this.desktopControllers.delete(nonce);
   }
-  private rate(key: string, maximum: number, table: "anonymous" | "device" | "trusted" = "anonymous"): void {
+  private rate(key: string, maximum: number, table: "anonymous" | "edge" | "device" | "trusted" = "anonymous"): void {
     this.prune();
     // Source-aware tunnels can introduce many distinct public addresses. Never
     // allocate unbounded buckets or evict an existing caller to admit a new one.
-    // Remote callers citing an enrolled device get their own table; owner
-    // approvals and actual local callers use one remote input can never fill.
-    // Relay metadata is namespaced and can never claim to be a local socket.
-    const limits = table === "trusted" ? this.trustedLimits : table === "device" ? this.knownLimits : this.limits;
+    // Remote callers citing an enrolled device get their own table; anonymous
+    // edge-identity probes get their own bounded table separate from direct/VPS
+    // anonymous limits; owner approvals and actual local callers use one remote
+    // input can never fill. Relay/edge metadata is namespaced and can never
+    // claim to be a local socket.
+    const limits = table === "trusted" ? this.trustedLimits : table === "device" ? this.knownLimits : table === "edge" ? this.edgeLimits : this.limits;
     if (!limits.has(key) && limits.size >= 4096) throw new HubError("rate_limited", 429);
     const old = limits.get(key) ?? { count: 0, until: this.now() + PAIRING_MS };
+    if (old.until < this.nextLimitExpiry) this.nextLimitExpiry = old.until;
     old.count = Math.min(old.count + 1, maximum + 1); limits.set(key, old);
     if (old.count > maximum) throw new HubError("rate_limited", 429);
   }
@@ -320,7 +335,7 @@ export class HubAuth {
   }
   /** Caller holds the DB queue so the subject cannot change during verification. */
   private async actionTargetDigest(action: DeviceAction): Promise<string> {
-    if (action.operation === "network" || action.operation === "bot-message-grant" || action.operation === "screen-grant") return action.target;
+    if (action.operation === "network" || action.operation === "bot-message-grant" || action.operation === "screen-grant" || action.operation === "cloudflare-tunnel") return action.target;
     if (action.operation === "approve") {
       const row = await this.store.db.get<PairingRow>("SELECT * FROM pairing_requests WHERE code_hash=? AND status='pending'", [hashSecret(action.target)]);
       if (!row || row.expires_at <= this.now()) throw new HubError("pairing_expired_or_invalid", 403);
@@ -362,6 +377,14 @@ export class HubAuth {
     if (!(await this.localDesktopControllersInTransaction()).has(session.deviceId)) throw new HubError("local_controller_required", 403);
     await this.consumeDeviceAction(session, { operation: "screen-grant", target }, proof);
   }
+  /** Cloudflare Tunnel configuration widens the Host's external trust/ingress
+   * surface and can spawn local cloudflared. Require an enrolled local owner
+   * controller plus a fresh one-use device action proof bound to the command. */
+  async consumeCloudflareAction(session: AuthSession, target: string, proof?: DeviceActionProof): Promise<void> {
+    await this.validateSessionInTransaction(session); await this.store.requireOwner(session.userId);
+    if (!(await this.localDesktopControllersInTransaction()).has(session.deviceId)) throw new HubError("local_controller_required", 403);
+    await this.consumeDeviceAction(session, { operation: "cloudflare-tunnel", target }, proof);
+  }
   /** Called only inside the mutation transaction, after current owner/trust checks. */
   private async consumeDeviceAction(session: AuthSession | undefined, action: DeviceAction, proof?: DeviceActionProof, admit?: () => void): Promise<DeviceActionStatement> {
     if (!session || !proof) throw new HubError("device_action_proof_required", 403);
@@ -394,14 +417,32 @@ export class HubAuth {
     return { ...proof, signature: sign(null, Buffer.from(tlsIdentityProof(proof)), this.privateKey).toString("base64") };
   }
   /** Signed proof for an explicitly authorized edge-terminated HTTPS route
-   * (e.g. DIY Cloudflare Tunnel). Always rate-limited as anonymous/external,
-   * never granted loopback trusted quota. */
-  edgeIdentity(nonce: string, rawOrigin: string, source: string): EdgeIdentity {
-    this.rate(`edge-identity:${rateSource(source)}`, 60, "anonymous");
+   * (e.g. DIY Cloudflare Tunnel). Never granted loopback trusted quota:
+   * unauthenticated callers are bucketed per (source, origin) in a dedicated
+   * bounded edge table, while known/authenticated devices use reserved
+   * known-device capacity so external callers cannot lock them out. */
+  edgeIdentity(nonce: string, rawOrigin: string, source: string, knownDeviceId?: string): EdgeIdentity {
+    const canonicalOrigin = edgeOriginSchema.safeParse(rawOrigin).data ?? "invalid";
+    if (knownDeviceId) {
+      this.rate(`edge-identity-known:${JSON.stringify([rateSource(source), knownDeviceId, canonicalOrigin])}`, 60, "device");
+    } else {
+      this.rate(`edge-identity:${JSON.stringify([rateSource(source), canonicalOrigin])}`, 60, "edge");
+    }
     tlsIdentityNonceSchema.parse(nonce);
     const origin = edgeOriginSchema.parse(rawOrigin);
     const proof: EdgeIdentityUnsigned = { v: 1, type: "edge.identity", publicKey: this.publicKey, nonce, origin };
     return { ...proof, signature: sign(null, Buffer.from(edgeIdentityProof(proof)), this.privateKey).toString("base64") };
+  }
+  /** Quiet session lookup for rate-limit bucket isolation only; never authorizes
+   * an operation and never emits rejection audits when absent or stale. */
+  async activeSessionDeviceId(token: string | undefined): Promise<string | undefined> {
+    if (!token) return undefined;
+    this.prune();
+    const session = this.tokens.get(hashSecret(token));
+    if (!session || session.expiresAt <= this.now()) return undefined;
+    const device = await this.store.device(session.deviceId);
+    if (!device || device.revoked) { this.tokens.delete(hashSecret(token)); return undefined; }
+    return session.deviceId;
   }
   async challenge(connectionId: string, deviceId: string, clientNonce: string, source: string): Promise<{ nonce: string; signature: string; publicKey: string }> {
     const device = await this.store.device(deviceId);

@@ -4,7 +4,6 @@ import {
   cloudflareOriginSchema,
   cloudflareViewSchema,
   HOST_CLOUDFLARE_PATH,
-  HOST_CLOUDFLARE_QUICK_PATH,
   type CloudflareMode,
   type CloudflareProtocol,
   type CloudflareView,
@@ -24,6 +23,8 @@ function isUnsupportedHostError(cause: unknown): boolean {
 
 function saveErrorMessage(cause: unknown): string {
   if (cause instanceof HubHttpError) {
+    if (cause.code === "local_controller_required") return t("仅主机本机的已登记控制器可修改 Cloudflare 隧道配置，请在这台主机上操作。");
+    if (cause.code.startsWith("device_action_")) return t("设备签名验证未完成或已过期，请重试。");
     if (cause.status === 401 || cause.status === 403) return t("当前设备没有修改 Cloudflare 隧道配置的权限，请重新连接后重试。");
     if (cause.status === 404 || cause.code === "not_found") return t("此主机需要更新后才能设置 Cloudflare 隧道。");
   }
@@ -32,6 +33,8 @@ function saveErrorMessage(cause: unknown): string {
 
 function quickTunnelErrorMessage(cause: unknown): string {
   const code = cause instanceof HubHttpError ? cause.code : cause instanceof Error ? cause.message : "";
+  if (code === "local_controller_required") return t("仅主机本机的已登记控制器可修改 Cloudflare 隧道配置，请在这台主机上操作。");
+  if (code.startsWith("device_action_")) return t("设备签名验证未完成或已过期，请重试。");
   if (code.includes("cloudflared_not_installed")) return t("未检测到 cloudflared，请先在主机安装 cloudflared（例如 brew install cloudflared）。");
   if (code.includes("cloudflared_start_timeout")) return t("Quick Tunnel 启动超时，请检查网络连接或切换为 HTTP/2（--protocol http2）后重试。");
   if (code.includes("cloudflared_stopped")) return t("Quick Tunnel 已停止。");
@@ -116,13 +119,8 @@ export function LocalCloudflareSettings({ connection, dirtyChange, busyChange }:
     }
     setBusy(true);
     try {
-      const raw = await connection.http(HOST_CLOUDFLARE_PATH, {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ mode, protocol, origins: normalized }),
-      });
+      const updated = await connection.updateCloudflareSettings({ mode, protocol, origins: normalized });
       if (!mounted.current) return;
-      const updated = cloudflareViewSchema.parse(raw);
       applyView(updated);
       setNotice(t("Cloudflare 隧道配置已保存。已授权域名可在配对和远程访问时通过身份验证。"));
     } catch (cause) {
@@ -137,13 +135,8 @@ export function LocalCloudflareSettings({ connection, dirtyChange, busyChange }:
     if (busy || !available || unsupported) return;
     setBusy(true); setError(""); setNotice("");
     try {
-      const raw = await connection.http(HOST_CLOUDFLARE_QUICK_PATH, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ action, protocol }),
-      });
+      const updated = await connection.cloudflareQuickAction({ action, protocol });
       if (!mounted.current) return;
-      const updated = cloudflareViewSchema.parse(raw);
       // Preserve unsaved domain edits while updating live runtime status and baseline.
       setView(updated);
       setBaseline(JSON.stringify({ mode: updated.mode, protocol: updated.protocol, origins: updated.origins }));

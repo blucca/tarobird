@@ -49,13 +49,25 @@ is enforced by the Hub before dispatch. See [client architecture](client/archite
 
 Rate-limit sources from the built-in relay arrive through the mTLS v2 control
 channel and an exact local socket registry, not client-controlled HTTP headers.
-These values affect quotas/audit attribution only. Remote loopback reports stay
-in the relay namespace, and worker APIs retain their listener boundary. Unknown
+Main loopback, instance, and TLS/built-in-relay listeners ignore all forwarding
+headers (`X-Forwarded-For`, `CF-Connecting-IP`, `Forwarded`, etc.) so a local
+or direct caller can never switch rate-limit buckets or alter audit sources by
+adding an HTTP header. For opt-in DIY Cloudflare Tunnel routes, traffic lands on
+a separate, non-instance-privileged loopback HTTP listener (`edge-proxy`); only
+requests arriving on that dedicated listener are placed in the `edge-proxy:`
+namespace, where Cloudflare's edge-inserted `CF-Connecting-IP` header is
+normalized per client IP (with IPv6 `/64` grouping, falling back to
+`edge-proxy:shared`). These values affect quotas/audit attribution only, never
+authorization. Remote loopback reports stay in the `relay:` or `edge-proxy:`
+namespace, and worker/instance APIs retain their listener boundary. Unknown
 devices cannot consume a known device's challenge bucket; successful signatures
 are not rejected by another caller's failure counter. Bounded tables reserve
-known/local capacity. NAT, distributed saturation and dishonest relay operators
-remain availability limits. Both runtimes require upgrading; see
-[relay source isolation](client/relay-source-isolation.md).
+known/local capacity and isolate anonymous `/api/edge-identity` probes from
+direct/relay anonymous tables. NAT, distributed saturation, dishonest relay
+operators and Cloudflare edge header fidelity remain availability limits. Both
+runtimes require upgrading for built-in relay isolation; see
+[relay source isolation](client/relay-source-isolation.md) and
+[DIY Cloudflare Tunnel boundary](#diy-cloudflare-tunnel-edge-proxy-boundary).
 
 Authenticated HTTP requests recheck trust after body receipt, at guarded queue
 entries and before private responses. Pairing/revocation actor checks share the
@@ -760,17 +772,23 @@ reservations do not block imports; live different-key reservations still do.
 Revoked imported device keys are not silently reactivated in a new network.
 Shared route and transport guards reject loopback/unspecified IPv4 and IPv6,
 including IPv4-mapped forms; this does not replace TLS and host-identity checks.
-Host-to-Host directory synchronization also verifies the peer's signed TLS
-identity against the observed leaf certificate, then pins that leaf before
-sending membership metadata. A TLS-terminating relay cannot substitute its own
-valid certificate and forward the peer's identity proof. Pins are bounded and
-expire after five minutes; certificate rotation requires a fresh proof.
+Host-to-Host directory synchronization over `Direct`, `Tailscale`, and built-in
+TLS-passthrough `VPS` routes also verifies the peer's signed TLS identity
+against the observed leaf certificate, then pins that leaf before sending
+membership metadata. On those routes a TLS-terminating relay cannot substitute
+its own valid certificate and forward the peer's identity proof. Pins are
+bounded and expire after five minutes; certificate rotation requires a fresh
+proof. Opt-in `Cloudflare` (`edgeRoutes`) routes are an explicit exception to
+leaf pinning: Cloudflare's edge terminates outer TLS and can read or modify
+traffic in transit, so peers instead verify system WebPKI TLS plus an
+origin-bound `/api/edge-identity` Ed25519 proof (see
+[DIY Cloudflare Tunnel boundary](#diy-cloudflare-tunnel-edge-proxy-boundary)).
 
 ## Cross-host Bot messages
 
 The [Bot message MVP](client/cross-host-bot-messages-2026-10-17.md) does not widen Agent Bus. Network membership alone grants no Bot messaging access. Recipient-local grants bind a source Hub key and source Bot to a target Bot; owner grant/revoke operations require an enrolled loopback controller plus a fresh, one-use device signature over the command digest. Gateway instance credentials cannot grant access.
 
-Short-lived Hub-signed passports bind the target identity, source Bot, hop count, method/path and body digest. Normal TLS validation, a proof bound to the observed TLS leaf, and a signed recipient challenge precede private transfer. Subsequent TLS handshakes check the proved certificate before sending headers or bodies. A cached certificate mismatch permits one fresh proof, not replay of an ambiguously delivered POST. Target-side writer guards and response guards recheck membership, grant and Bot revocation. Responses/files are limited to the sending Bot's own correlated request, not arbitrary conversation history. Uploads use existing HubAttachments APIs with additional source/conversation binding. Lost POST responses are never automatically retried on another route. Request digests, rate limits and queue admission are durable; botSource inputs never enter question/approval/control handlers. The same-OS-user trust limitation remains unchanged.
+Short-lived Hub-signed passports bind the target identity, source Bot, hop count, method/path and body digest. On `Direct`, `Tailscale`, and `VPS` routes, normal TLS validation, a proof bound to the observed TLS leaf, and a signed recipient challenge precede private transfer (subsequent TLS handshakes check the proved certificate before sending headers or bodies, and a cached certificate mismatch permits one fresh proof, not replay of an ambiguously delivered POST). On opt-in `Cloudflare` (`edgeRoutes`) routes, Cloudflare's edge terminates outer TLS and can observe or tamper with traffic in transit; transfer uses system WebPKI TLS plus an origin-bound `/api/edge-identity` proof alongside the Hub-signed passport and signed reply, without leaf pinning. Target-side writer guards and response guards recheck membership, grant and Bot revocation. Responses/files are limited to the sending Bot's own correlated request, not arbitrary conversation history. Uploads use existing HubAttachments APIs with additional source/conversation binding. Lost POST responses are never automatically retried on another route. Request digests, rate limits and queue admission are durable; botSource inputs never enter question/approval/control handlers. The same-OS-user trust limitation remains unchanged.
 
 
 ### Engine approval ownership (2026-10-19)
@@ -1032,3 +1050,55 @@ model write followed by a failed state read, a timed-out write, or a lost sessio
 guard remains uncertain; do not automatically replay it. Workspace equivalence
 uses physical identity and Windows case comparison, while Windows launch cwd
 keeps its logical junction path and its native ancestor-resource semantics.
+
+## DIY Cloudflare Tunnel (edge-proxy) boundary
+
+User-managed Cloudflare Tunnel (`cloudflared`) routes are an explicit opt-in
+transport alongside `Direct`, `Tailscale`, and built-in TLS-passthrough `VPS`
+routes. They change the transport confidentiality/integrity boundary compared to
+leaf-pinned routes and are fenced as follows:
+
+- **Edge TLS termination & trust model**: Cloudflare Tunnel terminates outer TLS
+  at Cloudflare's edge using a WebPKI certificate, then forwards HTTP/WebSocket
+  traffic over `cloudflared` to the Host. **Cloudflare's edge can therefore read
+  and modify traffic traversing a `Cloudflare` route** (messages, attachments,
+  bearer session tokens, metadata, and unsigned HTTP bodies). Mutual Ed25519
+  WebSocket handshakes, one-use device-action proofs, signed network manifests,
+  and signed Bot passports still prevent impersonation or forging signed
+  operations, and `Direct`, `Tailscale`, and `VPS` routes retain strict
+  leaf-certificate pinning via `/api/tls-identity`.
+- **Dedicated non-instance loopback listener**: The Hub binds a separate
+  loopback HTTP listener (`127.0.0.1:<edgePort>`, `instance = false`) solely for
+  Cloudflare Tunnel ingress—distinct from the main loopback HTTP listener and
+  the instance listener. Local vs. remote trust and instance privileges are
+  enforced strictly by listener boundary, never by client-controllable HTTP
+  headers on the main loopback listener. Privileged local endpoints
+  (`/instance`, `/api/instance/*`, `/screen/v1/target`, `/screen/v1/target-media`,
+  `/api/bot-messages/grant`, and `/api/bot-messages/local`) are rejected on the
+  `edge-proxy` listener regardless of headers. Conversely, `/api/edge-identity`
+  is served only on the `edge-proxy` listener and only for HTTPS origins
+  explicitly authorized on the Host (saved Cloudflare origins, active local
+  Quick Tunnel, or `TAROBOT_CLOUDFLARE_ORIGINS`).
+- **Origin-bound attestation & DoS isolation**: Native clients and peer Hosts
+  verify system WebPKI TLS (custom CA overrides are rejected) and obtain a fresh
+  Ed25519 `/api/edge-identity` proof bound to `(publicKey, nonce, origin)` so an
+  arbitrary third-party proxy cannot replay a proof for an unauthorized domain.
+  Only requests arriving on the `edge-proxy` listener enter the `edge-proxy:`
+  rate-limit/audit namespace; per-client attribution reads Cloudflare's
+  edge-inserted `CF-Connecting-IP` (canonicalized with IPv6 `/64` grouping,
+  falling back to `edge-proxy:shared`, never treated as loopback/trusted).
+  Unauthorized origins allocate no buckets. Anonymous `/api/edge-identity`
+  buckets are isolated per `(source, origin)` in a dedicated bounded 4,096-entry
+  edge table (separate from direct/relay anonymous limits), while known or
+  authenticated devices use reserved 4,096-entry known-device capacity so an
+  external caller knowing the tunnel domain cannot lock out legitimate clients.
+- **Configuration & Quick Tunnel authorization**: Reading Cloudflare status
+  (`GET /api/host-routes/cloudflare`) is owner-scoped. Modifying authorized
+  origins/settings (`PUT /api/host-routes/cloudflare`) or starting/stopping a
+  local Quick Tunnel (`POST /api/host-routes/cloudflare/quick`) requires an
+  enrolled local owner controller (Desktop App or Host CLI, never a remote
+  paired device and never requests arriving over the `edge-proxy` listener) plus
+  a fresh, one-use `cloudflare-tunnel` device-action signature bound to the
+  exact command and HTTP session, consumed atomically inside the mutation
+  transaction and recorded in the audit log. See
+  [DIY Cloudflare Tunnel](client/cloudflare-tunnel-diy.md).

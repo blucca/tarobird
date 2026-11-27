@@ -44,6 +44,27 @@ export const cloudflareQuickActionSchema = z.object({
 }).strict();
 export type CloudflareQuickAction = z.infer<typeof cloudflareQuickActionSchema>;
 
+/** Stable, domain-separated signed intent for Cloudflare settings updates. */
+export function cloudflareUpdateProofText(command: CloudflareUpdate): string {
+  const v = cloudflareUpdateSchema.parse(command);
+  return JSON.stringify([
+    "tarobot/cloudflare-update/v1",
+    v.mode ?? null,
+    v.protocol ?? null,
+    v.origins ?? null,
+  ]);
+}
+
+/** Stable, domain-separated signed intent for Quick Tunnel lifecycle actions. */
+export function cloudflareQuickActionProofText(command: CloudflareQuickAction): string {
+  const v = cloudflareQuickActionSchema.parse(command);
+  return JSON.stringify([
+    "tarobot/cloudflare-quick/v1",
+    v.action,
+    v.protocol ?? null,
+  ]);
+}
+
 export const cloudflareViewSchema = z.object({
   v: z.literal(1),
   installed: z.boolean(),

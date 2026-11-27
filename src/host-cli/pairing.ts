@@ -2,6 +2,7 @@ import { pairingInviteTokenSchema } from "../client-protocol/pairing-invites.js"
 import qrcode from "qrcode-terminal";
 import { isDirectRoute, routesSchema, type Route } from "../client-protocol/routes.js";
 import { sharedRoutesSchema } from "../client-protocol/private-network.js";
+import { isLoopbackOrUnspecified } from "../client-protocol/loopback-address.js";
 
 /** A phone's one-time pairing route must not replace a configured network route. */
 export function pairingSharedRoutes(existing: Route[], selected: Route): Route[] {
@@ -18,7 +19,12 @@ export function pairingSharedRoutes(existing: Route[], selected: Route): Route[]
 export function hostPairingLink(publicKey: string, routes: Route[], invite: string): string {
   if (!/^[A-Za-z0-9+/]{59}=$/.test(publicKey)) throw new Error("主机身份公钥无效。");
   // A phone cannot connect to the computer's loopback, even if both use localhost.
-  const parsed = routesSchema.parse(sharedRoutesSchema.parse(routes));
+  // Pair links may carry Direct, Tailscale, VPS, or authorized Cloudflare routes.
+  const parsed = routesSchema.parse(routes);
+  for (const route of parsed) {
+    const u = new URL(route.url);
+    if (u.protocol !== "https:" || isLoopbackOrUnspecified(u.hostname)) throw new Error("network_route_must_be_remote");
+  }
   const link = `tarocub://pair?data=${encodeURIComponent(JSON.stringify({ v: 1, kind: "connect", hubPublicKey: publicKey, routes: parsed }))}&invite=${pairingInviteTokenSchema.parse(invite)}`;
   if (link.length > 8192) throw new Error("配对信息过长，请减少同时分享的线路。");
   return link;

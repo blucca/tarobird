@@ -1520,6 +1520,30 @@
           "fingerprint": "258cca7a8e42d54d201f4528b4c562bef41b6ce9022a600d1d7639364a92abeb"
         }
       ]
+    },
+    {
+      "path": "client/e2e/fixtures/local-relay.tsx",
+      "sha256": "44054305b732a449217fb424a82f7d35e1f133ff1c09baae7315fc509d7bffe2",
+      "reviewer": "antigravity",
+      "note": "Re-reviewed unchanged synthetic CGNAT Tailscale fixture address after updating Cloudflare edge-proxy fixture port and signed action helpers; no owner data or new exemptions.",
+      "findings": [
+        {
+          "kind": "non-example-public-ip",
+          "fingerprint": "d2a4c7100116c273732bd68f5fc6f61ba55591215158ab88b06927b0c899d454"
+        }
+      ]
+    },
+    {
+      "path": "client/e2e/local-relay.spec.ts",
+      "sha256": "ff9f681b99e1c074a743538ef7bb62ea54b544117388bf3daab8cb602e69195c",
+      "reviewer": "antigravity",
+      "note": "Re-reviewed unchanged synthetic CGNAT Tailscale fixture address after updating Cloudflare edge-proxy fixture port assertion; no owner data or new exemptions.",
+      "findings": [
+        {
+          "kind": "non-example-public-ip",
+          "fingerprint": "d2a4c7100116c273732bd68f5fc6f61ba55591215158ab88b06927b0c899d454"
+        }
+      ]
     }
   ]
 }

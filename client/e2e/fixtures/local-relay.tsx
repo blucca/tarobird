@@ -1,6 +1,6 @@
 import { mockIPC } from "@tauri-apps/api/mocks";
 import { createRoot } from "react-dom/client";
-import { cloudflareCommands, HOST_CLOUDFLARE_PATH, HOST_CLOUDFLARE_QUICK_PATH, type CloudflareView } from "../../../src/client-protocol/cloudflare.js";
+import { cloudflareCommands, HOST_CLOUDFLARE_PATH, type CloudflareQuickAction, type CloudflareUpdate, type CloudflareView } from "../../../src/client-protocol/cloudflare.js";
 import { ConnectionPanel } from "../../src/ConnectionPanel.js";
 import { HubHttpError } from "../../src/http-error.js";
 import { RuntimeHostContext } from "../../src/RuntimeHost.js";
@@ -31,8 +31,8 @@ const defaultCloudflare = (): CloudflareView => ({
   mode: "named",
   protocol: "http2",
   origins: [],
-  loopbackTarget: "http://127.0.0.1:8788",
-  commands: cloudflareCommands("http://127.0.0.1:8788"),
+  loopbackTarget: "http://127.0.0.1:8790",
+  commands: cloudflareCommands("http://127.0.0.1:8790"),
 });
 const state = {
   reads: 0, writes: [] as unknown[], updates: 0, native: [] as string[], health: [] as string[],
@@ -48,41 +48,40 @@ const connection = {
   http: async (path: string, init?: RequestInit) => {
     if (path === HOST_CLOUDFLARE_PATH) {
       if (state.cloudflare404) throw new HubHttpError(404, "not_found");
-      if ((init?.method ?? "GET").toUpperCase() === "PUT") {
-        const patch = JSON.parse(String(init?.body ?? "{}")) as Partial<CloudflareView>;
-        state.cloudflareWrites.push(patch);
-        state.cloudflare = {
-          ...state.cloudflare,
-          ...(patch.mode ? { mode: patch.mode } : {}),
-          ...(patch.protocol ? { protocol: patch.protocol } : {}),
-          ...(patch.origins ? { origins: patch.origins } : {}),
-        };
-        return structuredClone(state.cloudflare);
-      }
       state.cloudflareReads++;
       return structuredClone(state.cloudflare);
     }
-    if (path === HOST_CLOUDFLARE_QUICK_PATH) {
-      if (state.cloudflare404) throw new HubHttpError(404, "not_found");
-      const body = JSON.parse(String(init?.body ?? "{}")) as { action: "start" | "stop"; protocol?: "http2" | "quic" };
-      state.cloudflareQuickActions.push(body);
-      if (state.cloudflareFailQuick) throw new HubHttpError(502, state.cloudflareFailQuick);
-      if (body.action === "start") {
-        state.cloudflare = {
-          ...state.cloudflare,
-          mode: "quick",
-          protocol: body.protocol ?? state.cloudflare.protocol,
-          running: true,
-          activeUrl: "https://demo-quick.trycloudflare.com",
-        };
-      } else {
-        const next = { ...state.cloudflare, running: false };
-        delete next.activeUrl;
-        state.cloudflare = next;
-      }
-      return structuredClone(state.cloudflare);
-    }
     return invites.http(path, init);
+  },
+  updateCloudflareSettings: async (patch: CloudflareUpdate) => {
+    if (state.cloudflare404) throw new HubHttpError(404, "not_found");
+    state.cloudflareWrites.push(patch);
+    state.cloudflare = {
+      ...state.cloudflare,
+      ...(patch.mode ? { mode: patch.mode } : {}),
+      ...(patch.protocol ? { protocol: patch.protocol } : {}),
+      ...(patch.origins ? { origins: patch.origins } : {}),
+    };
+    return structuredClone(state.cloudflare);
+  },
+  cloudflareQuickAction: async (body: CloudflareQuickAction) => {
+    if (state.cloudflare404) throw new HubHttpError(404, "not_found");
+    state.cloudflareQuickActions.push(body);
+    if (state.cloudflareFailQuick) throw new HubHttpError(502, state.cloudflareFailQuick);
+    if (body.action === "start") {
+      state.cloudflare = {
+        ...state.cloudflare,
+        mode: "quick",
+        protocol: body.protocol ?? state.cloudflare.protocol,
+        running: true,
+        activeUrl: "https://demo-quick.trycloudflare.com",
+      };
+    } else {
+      const next = { ...state.cloudflare, running: false };
+      delete next.activeUrl;
+      state.cloudflare = next;
+    }
+    return structuredClone(state.cloudflare);
   },
   subscribe: (listener: () => void) => { listeners.add(listener); return () => { listeners.delete(listener); }; },
   refreshNetwork: async () => { state.reads++; if (state.failRead) throw Error("fixture_read_failure"); return connection.state.network; },

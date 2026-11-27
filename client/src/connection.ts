@@ -29,7 +29,7 @@ import { rememberRouteTrust } from "./route-trust.js";
 import { connectionErrorMessage, connectionVerificationFailure, connectionVerificationMessage, preferredVerificationFailure } from "./connection-verification.js";
 import { runtimeHostId } from "./host-registry.js";
 import { isEdgeTlsRoute, orderedRoutes, localRoutesSchema, deploymentSchema, deploymentMatchesRoutes, type Deployment, type RouteHealth } from "../../src/client-protocol/routes.js";
-import { HOST_CLOUDFLARE_CAPABILITY } from "../../src/client-protocol/cloudflare.js";
+import { HOST_CLOUDFLARE_CAPABILITY, HOST_CLOUDFLARE_PATH, HOST_CLOUDFLARE_QUICK_PATH, cloudflareQuickActionProofText, cloudflareQuickActionSchema, cloudflareUpdateProofText, cloudflareUpdateSchema, cloudflareViewSchema, type CloudflareQuickAction, type CloudflareUpdate, type CloudflareView } from "../../src/client-protocol/cloudflare.js";
 import { avatarSchema, avatarKey, profileUserSchema, type ProfileAvatar, type ProfileCache, type AvatarTarget } from "../../src/client-protocol/avatars.js";
 import type { CreateBotInput } from "../../src/client-protocol/bots.js";
 import { sha256 } from "@noble/hashes/sha2.js";
@@ -1302,6 +1302,34 @@ export class HubConnection {
     return { join, network: { url: route.url, publicKey: this.identity.hubPublicKey, ...routeTrust(route.url, this.identity.hubPublicKey) } };
   }
   async screenStop(sessionId?: string) { return this.screenRequest("/api/screens/stop", { method: "POST", body: JSON.stringify({ sessionId }) }); }
+
+  async updateCloudflareSettings(raw: CloudflareUpdate): Promise<CloudflareView> {
+    return this.duringMutation(async () => {
+      const command = cloudflareUpdateSchema.parse(raw), token = this.token, epoch = this.httpEpoch;
+      const current = () => { if (!token || this.closed || this.token !== token || this.httpEpoch !== epoch || epoch.signal.aborted) throw new HubHttpError(409, "device_action_cancelled"); };
+      current();
+      const action = deviceActionSchema.parse({ operation: "cloudflare-tunnel", target: bytesToHex(sha256(new TextEncoder().encode(cloudflareUpdateProofText(command)))) });
+      const statement = boundDeviceActionStatement(await this.httpRequest("/api/devices/challenge", { method: "POST", body: JSON.stringify(action) }),
+        { action, hubPublicKey: this.identity.hubPublicKey ?? "", deviceId: this.identity.deviceId, sessionHash: bytesToHex(sha256(new TextEncoder().encode(token!))) });
+      current(); const signature = await signDeviceAction(this.identity, statement); current();
+      const result = await this.httpRequest(HOST_CLOUDFLARE_PATH, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ command, proof: { nonce: statement.nonce, signature } }) });
+      current(); return cloudflareViewSchema.parse(result);
+    });
+  }
+
+  async cloudflareQuickAction(raw: CloudflareQuickAction): Promise<CloudflareView> {
+    return this.duringMutation(async () => {
+      const command = cloudflareQuickActionSchema.parse(raw), token = this.token, epoch = this.httpEpoch;
+      const current = () => { if (!token || this.closed || this.token !== token || this.httpEpoch !== epoch || epoch.signal.aborted) throw new HubHttpError(409, "device_action_cancelled"); };
+      current();
+      const action = deviceActionSchema.parse({ operation: "cloudflare-tunnel", target: bytesToHex(sha256(new TextEncoder().encode(cloudflareQuickActionProofText(command)))) });
+      const statement = boundDeviceActionStatement(await this.httpRequest("/api/devices/challenge", { method: "POST", body: JSON.stringify(action) }),
+        { action, hubPublicKey: this.identity.hubPublicKey ?? "", deviceId: this.identity.deviceId, sessionHash: bytesToHex(sha256(new TextEncoder().encode(token!))) });
+      current(); const signature = await signDeviceAction(this.identity, statement); current();
+      const result = await this.httpRequest(HOST_CLOUDFLARE_QUICK_PATH, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ command, proof: { nonce: statement.nonce, signature } }) });
+      current(); return cloudflareViewSchema.parse(result);
+    });
+  }
 
   async saveBotMessageGrants(raw: BotMessageGrantsCommand, signal?: AbortSignal, submitting?: () => void) {
     return this.duringMutation(async () => botMessageGrantsSnapshotSchema.parse(await this.performMessageGrantRequest("/api/bot-messages/grants", botMessageGrantsCommandSchema.parse(raw), signal, submitting)));
