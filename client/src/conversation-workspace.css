@@ -52,6 +52,13 @@
   color: var(--bg);
 }
 
+/* Monochrome's accent is ink, which made the count a black dot. Use the chosen
+   mono accent (warm grey by default) instead; approval alerts stay orange. */
+:root[data-palette=mono] .workspace-rail-trigger-badge:not(.is-alert) {
+  background: var(--mono-mark, var(--muted));
+  color: #fff;
+}
+
 .conversation-workspace-rail {
   position: relative;
   display: flex;
