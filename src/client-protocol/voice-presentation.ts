@@ -2,6 +2,14 @@ import type { CardElement } from "./index.js";
 
 export const isGeneratedVoiceFilename = (name: string): boolean => /^voice-\d{10,}\.(?:m4a|mp4|webm|ogg|wav)$/i.test(name);
 
+/** Explicit recording flag wins; legacy App recordings fall back to the
+ * recorder's generated `voice-<timestamp>.<ext>` name. */
+export function isRecordedVoiceBlock(block: { type: string; name?: string; recording?: boolean }): boolean {
+  if (block.type !== "audio") return false;
+  if (block.recording !== undefined) return block.recording;
+  return !!block.name && isGeneratedVoiceFilename(block.name);
+}
+
 /** Older hosts include an internal recording name in ASR cards. Keep cached
  * history and copy/forward data intact; omit only that known metadata row. */
 export function voiceCardElements(elements: CardElement[]): CardElement[] {

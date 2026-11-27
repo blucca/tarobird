@@ -1,4 +1,6 @@
 import { createDesignBackup, type DesignBackupContent } from "./workbench-design-backup.js";
+import { isRecordedVoiceFile, markRecordedVoiceFile } from "./voice-recording-marker.js";
+import { isGeneratedVoiceFilename } from "../../src/client-protocol/voice-presentation.js";
 import { clearAttachmentDiskCache } from "./attachment-disk-cache.js";
 import type { DesignPersistSidecar } from "./workbench-design-session.js";
 import { designDocumentSchema, encodeDesignFile, decodeDesignFile, type DesignFile, type DesignDocument } from "./workbench-design.js";
@@ -48,7 +50,7 @@ export type Preferences = { sidebarLayout: SidebarLayout; sidebarGroupByHost: bo
 export const defaultPreferences: Preferences = { sidebarLayout: "bots", sidebarGroupByHost: false, showDisconnectedBots: false, showTicketConversations: false, layoutDensity: normalizeLayoutDensity(undefined), theme: DEFAULT_THEME, palette: DEFAULT_PALETTE, monoAccent: DEFAULT_MONO_ACCENT, locale: systemLocale(), fontSize: 14, quietStart: "", quietEnd: "", showModelIcons: true, animatedAvatars: true, animations: true, linkPreviewStyle: "card" };
 export type ConversationDraft = { files: File[]; workbench?: WorkbenchDraft; reply?: Message; previewChoice?: string | null; previewStyle: import("../../src/client-protocol/links.js").LinkPreviewStyle; recipients?: string[] };
 export type DraftPreview = { text: string; files: number; reply: boolean };
-type StoredConversationDraft = Omit<ConversationDraft, "files"> & { files: { bytes: ArrayBuffer; name: string; type: string; lastModified: number }[]; revision: string; owner: string; size: number; active: number };
+type StoredConversationDraft = Omit<ConversationDraft, "files"> & { files: { bytes: ArrayBuffer; name: string; type: string; lastModified: number; recording?: boolean }[]; revision: string; owner: string; size: number; active: number };
 export const DRAFT_CONVERSATION_BYTES = 64 * 1024 * 1024;
 export const DRAFT_TOTAL_BYTES = 128 * 1024 * 1024;
 export const SHARE_DRAFT_RETENTION_MS = 24 * 60 * 60 * 1000;
@@ -1156,11 +1158,16 @@ export class ClientCache {
     if (!stored) return { draft: { files: [], previewStyle: "card" } };
     if (stored.owner !== draftOwner(identity)) throw new Error("draft_identity_changed");
     const { revision, owner: _owner, size: _size, active: _active, files, ...metadata } = stored;
-    return { revision, draft: { ...metadata, files: files.map(file => new File([file.bytes], file.name, { type: file.type, lastModified: file.lastModified })) } };
+    return { revision, draft: { ...metadata, files: files.map(file => {
+      const restored = new File([file.bytes], file.name, { type: file.type, lastModified: file.lastModified });
+      const isRecording = file.recording === true
+        || (file.recording === undefined && /^audio\//i.test(file.type) && isGeneratedVoiceFilename(file.name));
+      return isRecording ? markRecordedVoiceFile(restored) : restored;
+    }) } };
   }
   async saveConversationDraft(id: string, draft: ConversationDraft, identity: Identity, expectedRevision?: string): Promise<string | undefined> {
     const { files, ...metadata } = draft;
-    const metadataBytes = new TextEncoder().encode(JSON.stringify({ ...metadata, fileMetadata: files.map(({ name, type, lastModified }) => ({ name, type, lastModified })) })).byteLength;
+    const metadataBytes = new TextEncoder().encode(JSON.stringify({ ...metadata, fileMetadata: files.map((file) => ({ name: file.name, type: file.type, lastModified: file.lastModified, recording: isRecordedVoiceFile(file) })) })).byteLength;
     const size = files.reduce((sum, file) => sum + file.size, 0) + metadataBytes;
     if (metadataBytes > 1024 * 1024) throw new Error("draft_metadata_too_large");
     if (files.length > 32 || size > DRAFT_CONVERSATION_BYTES) throw new Error("draft_capacity_exceeded");
@@ -1173,7 +1180,7 @@ export class ClientCache {
         bytes = file.arrayBuffer().finally(() => this.draftFileBytes.delete(file));
         this.draftFileBytes.set(file, bytes);
       }
-      return { bytes: await bytes, name: file.name, type: file.type, lastModified: file.lastModified };
+      return { bytes: await bytes, name: file.name, type: file.type, lastModified: file.lastModified, recording: isRecordedVoiceFile(file) };
     }));
     const tx = await this.write(["conversationDrafts", ...(metadata.reply ? ["messages" as const] : [])]), settings = tx.objectStore("settings"), store = tx.objectStore("conversationDrafts");
     if (metadata.reply && (await tx.objectStore("messages").get(metadata.reply.id))?.status === "deleted") delete metadata.reply;

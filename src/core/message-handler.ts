@@ -1,4 +1,5 @@
 import { isBotControl } from "../client-protocol/bot-messages.js";
+import { isGeneratedVoiceFilename } from "../client-protocol/voice-presentation.js";
 import { backgroundTaskBody, backgroundTaskContext, backgroundTaskReplyTo } from "./background-task-notice.js";
 import { createRunRecord, recordRunEvent } from "./run-record.js";
 import { createScopedRunPresentation, finishScopedRunPresentation } from "./scoped-run-presentation.js";
@@ -154,6 +155,7 @@ import {
   stableCoreNumericId,
   type CoreChatMode,
   type CoreIncomingMessage,
+  type CoreNormalizedAttachment,
   type CoreNormalizedBridgeMessage,
 } from "./message-normalizer.js";
 import { sendManagedCard, updateManagedCard, updateManagedCardElement, type ManagedCardHandle } from "./managed-card.js";
@@ -1046,10 +1048,9 @@ async function transitionQueuedCoreCardToStarted(
     return;
   }
 
+  const profile = channel.profile === "gateway" ? "gateway" : channelProfile();
   const hasMedia = normalized.attachments.some((attachment) =>
-    attachment.kind === "audio"
-    || attachment.kind === "video"
-    || (attachment.kind === "file" && hasTranscribableMediaExtension(attachment.fileName ?? "")));
+    isTranscribableCoreAttachment(attachment, undefined, profile));
   const hasAttachments = normalized.attachments.length > 0;
   const progressText = locale === "en"
     ? hasMedia
@@ -4118,8 +4119,23 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
-function isTranscribableCoreMedia(downloaded: DownloadedCoreAttachment): boolean {
-  if (downloaded.attachment.kind === "audio" || downloaded.attachment.kind === "video") {
+function isTranscribableCoreAttachment(
+  attachment: CoreNormalizedAttachment,
+  fallbackPath?: string,
+  profile = channelProfile(),
+): boolean {
+  if (profile === "gateway") {
+    if (isVideoCoreAttachment(attachment, fallbackPath, profile)) {
+      return true;
+    }
+    if (attachment.recording !== undefined) {
+      return attachment.kind === "audio" && attachment.recording;
+    }
+    return attachment.kind === "audio"
+      && !!attachment.fileName
+      && isGeneratedVoiceFilename(attachment.fileName);
+  }
+  if (attachment.kind === "audio" || attachment.kind === "video") {
     return true;
   }
   // A recording FORWARDED from another app (WeChat, a recorder, a meeting
@@ -4127,18 +4143,33 @@ function isTranscribableCoreMedia(downloaded: DownloadedCoreAttachment): boolean
   // used to skip transcription entirely — so a 24-minute .m4a never reached the
   // long-audio cloud route and the engine transcribed it locally by hand.
   // Decide by container instead. Images and documents are unaffected.
-  if (downloaded.attachment.kind !== "file") {
+  if (attachment.kind !== "file") {
     return false;
   }
-  return hasTranscribableMediaExtension(downloaded.attachment.fileName ?? downloaded.localPath);
+  return hasTranscribableMediaExtension(attachment.fileName ?? fallbackPath ?? "");
+}
+
+function isTranscribableCoreMedia(downloaded: DownloadedCoreAttachment): boolean {
+  return isTranscribableCoreAttachment(downloaded.attachment, downloaded.localPath);
+}
+
+function isVideoCoreAttachment(
+  attachment: CoreNormalizedAttachment,
+  fallbackPath?: string,
+  profile = channelProfile(),
+): boolean {
+  if (attachment.kind === "video") {
+    return true;
+  }
+  if (attachment.kind !== "file") {
+    return false;
+  }
+  if (profile === "gateway" && attachment.mime && /^audio\//i.test(attachment.mime)) {
+    return false;
+  }
+  return hasTranscribableVideoExtension(attachment.fileName ?? fallbackPath ?? "");
 }
 
 function isVideoCoreMedia(downloaded: DownloadedCoreAttachment): boolean {
-  if (downloaded.attachment.kind === "video") {
-    return true;
-  }
-  if (downloaded.attachment.kind !== "file") {
-    return false;
-  }
-  return hasTranscribableVideoExtension(downloaded.attachment.fileName ?? downloaded.localPath);
+  return isVideoCoreAttachment(downloaded.attachment, downloaded.localPath);
 }
