@@ -1284,9 +1284,9 @@ export class HubConnection {
    * Host shows one only to such a request (an App from before Windows targets
    * parses the reply as a Mac's and would fail on all of it); a Host from
    * before Windows targets ignores the query. */
-  async hostResources(options?: { force?: boolean }) {
+  async hostResources(options?: { force?: boolean; signal?: AbortSignal }) {
     const query = options?.force ? "?force=1" : "";
-    return hostResourcesSnapshotSchema.parse(await this.httpRequest(HOST_RESOURCES_PATH + query, {}, { ms: 10_000, code: "host_resources_timeout" }));
+    return hostResourcesSnapshotSchema.parse(await this.httpRequest(HOST_RESOURCES_PATH + query, { signal: options?.signal }, { ms: 10_000, code: "host_resources_timeout" }));
   }
   async stopHostResource(raw: HostResourceStopRequest) {
     const body = JSON.stringify(hostResourceStopRequestSchema.parse(raw));

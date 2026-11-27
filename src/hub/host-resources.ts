@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import path from "node:path";
+import { createHash } from "node:crypto";
 import { promisify } from "node:util";
 import {
   hostResourcesSnapshotSchema,
@@ -17,8 +17,29 @@ import { HubError, type HubStore } from "./store.js";
 
 const execFileAsync = promisify(execFile);
 const HISTORY_LIMIT = 24;
+const MAX_HISTORY_USERS = 128;
 const MIN_HISTORY_INTERVAL_MS = 1_500;
+const MAX_SELF_PROCESSES = 32;
+const MAX_BOT_GROUPS = 128;
+const MAX_CONVERSATIONS_PER_BOT = 64;
+const MAX_PROCESSES_PER_GROUP = 64;
+const MAX_UNATTRIBUTED_PROCESSES = 64;
+const MAX_PROCESS_ID_LEN = 200;
+const MAX_PROCESS_NAME_LEN = 160;
+const MAX_BOT_NAME_LEN = 120;
+const MAX_ENGINE_LEN = 48;
+const MAX_TITLE_LEN = 256;
+const MAX_PLATFORM_LEN = 32;
+
 const ACTIVE_RUN_PHASES = runSummarySchema.shape.phase.options.filter(isRunActive);
+
+// Desktop App process matchers:
+// - DIRECT_PARENT_APP_RE applies only when a process directly spawned this Hub (dev/Electron launches).
+// - DESKTOP_APP_NAME_RE matches packaged TaroBird desktop binaries even when the Hub is detached (ppid=1),
+//   without matching unrelated Electron apps or `tarobot-host` processes.
+const DIRECT_PARENT_APP_RE = /^(?:electron|tarobird|tarobot|tarocub-client)(?:[\s.-]|$)/i;
+const DIRECT_PARENT_CHILD_RE = /electron|helper|renderer|gpu|utility|network|crashpad|tarobird|tarobot|tarocub-client/i;
+const DESKTOP_APP_NAME_RE = /^(?:tarocub-client(?:\.exe)?|tarobird(?:\.exe)?|tarobird\s+helper(?:\b.*)?|tarocub-client\s+helper(?:\b.*)?|tarobot-desktop(?:-core)?(?:\.exe)?)$/i;
 
 export interface OsProcessSample {
   pid: number;
@@ -31,6 +52,7 @@ export interface OsProcessSample {
 export interface HostResourcesOptions {
   store: HubStore;
   hubPid?: number;
+  desktopAppPid?: number | (() => number | undefined);
   platform?: NodeJS.Platform;
   childPids: () => Map<string, number>;
   stopBotTurn: (botId: string, conversationId: string, userId: string) => Promise<boolean>;
@@ -42,11 +64,55 @@ function roundCpu(value: number): number {
   return Number.isFinite(value) && value > 0 ? Math.round(value * 10) / 10 : 0;
 }
 
-function sanitizeProcessName(raw: string): string {
+function clampString(value: string, max: number): string {
+  return value.length <= max ? value : value.slice(0, max);
+}
+
+function makeProcessId(prefix: string, parts: readonly (string | number)[]): string {
+  const raw = [prefix, ...parts].join(":");
+  if (raw.length <= MAX_PROCESS_ID_LEN) return raw;
+  const digest = createHash("sha256").update(raw).digest("hex").slice(0, 16);
+  const tail = String(parts[parts.length - 1] ?? "");
+  return clampString(`${prefix}:${digest}:${tail}`, MAX_PROCESS_ID_LEN);
+}
+
+function sortProcessesByUsage(processes: readonly ResourceProcess[]): ResourceProcess[] {
+  return [...processes].sort((a, b) =>
+    b.memoryBytes - a.memoryBytes || b.cpuPercent - a.cpuPercent || a.pid - b.pid,
+  );
+}
+
+function sortConversationsByUsage(conversations: readonly ResourceConversationGroup[]): ResourceConversationGroup[] {
+  return [...conversations].sort((a, b) =>
+    b.memoryBytes - a.memoryBytes || b.cpuPercent - a.cpuPercent || a.title.localeCompare(b.title),
+  );
+}
+
+function sortBotsByUsage(bots: readonly ResourceBotGroup[]): ResourceBotGroup[] {
+  return [...bots].sort((a, b) =>
+    b.memoryBytes - a.memoryBytes || b.cpuPercent - a.cpuPercent || b.activeTurns - a.activeTurns || a.botName.localeCompare(b.botName),
+  );
+}
+
+export function sanitizeProcessName(raw: string): string {
   const trimmed = raw.trim().replace(/[\x00-\x1f\x7f]/g, "");
   if (!trimmed) return "process";
-  const base = path.basename(trimmed.split(/\s+/)[0] || trimmed);
-  return base.slice(0, 120) || "process";
+  const withoutTrailingSep = trimmed.replace(/[\\/]+$/, "");
+  if (!withoutTrailingSep) return "process";
+  const lastSep = Math.max(withoutTrailingSep.lastIndexOf("/"), withoutTrailingSep.lastIndexOf("\\"));
+  const base = (lastSep >= 0 ? withoutTrailingSep.slice(lastSep + 1) : withoutTrailingSep).trim();
+  return clampString(base, 120) || "process";
+}
+
+export function buildWindowsProcessSampleScript(): string {
+  // Keep strictly compatible with Windows PowerShell 5.1 (no PS7-only operators like `??` or `&&`).
+  return [
+    "$ErrorActionPreference='SilentlyContinue'",
+    "$procs = Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name,WorkingSetSize",
+    "$perf = @{}; Get-CimInstance Win32_PerfFormattedData_PerfProc_Process | ForEach-Object { if ($null -ne $_.IDProcess) { $perf[[int]$_.IDProcess] = [double]$_.PercentProcessorTime } }",
+    "$out = foreach ($p in $procs) { $id = [int]$p.ProcessId; $cpu = if ($perf.ContainsKey($id)) { $perf[$id] } else { 0 }; [pscustomobject]@{ ProcessId=$id; ParentProcessId=[int]$p.ParentProcessId; Name=$p.Name; WorkingSetSize=[double]$p.WorkingSetSize; CpuPercent=$cpu } }",
+    "$out | ConvertTo-Json -Compress",
+  ].join("; ");
 }
 
 export function parsePosixPsOutput(stdout: string): OsProcessSample[] {
@@ -101,13 +167,7 @@ export function parseWindowsProcessJson(stdout: string): OsProcessSample[] {
 
 async function sampleOsProcesses(platform: NodeJS.Platform): Promise<OsProcessSample[]> {
   if (platform === "win32") {
-    const script = [
-      "$ErrorActionPreference='SilentlyContinue'",
-      "$procs = Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name,WorkingSetSize",
-      "$perf = @{}; Get-CimInstance Win32_PerfFormattedData_PerfProc_Process | ForEach-Object { $perf[[int]$_.IDProcess] = [double]$_.PercentProcessorTime }",
-      "$out = foreach ($p in $procs) { [pscustomobject]@{ ProcessId=[int]$p.ProcessId; ParentProcessId=[int]$p.ParentProcessId; Name=$p.Name; WorkingSetSize=[double]$p.WorkingSetSize; CpuPercent=($perf[[int]$p.ProcessId] ?? 0) } }",
-      "$out | ConvertTo-Json -Compress",
-    ].join("; ");
+    const script = buildWindowsProcessSampleScript();
     try {
       const { stdout } = await execFileAsync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], { timeout: 4000, maxBuffer: 8 * 1024 * 1024, windowsHide: true });
       const rows = parseWindowsProcessJson(stdout);
@@ -123,13 +183,17 @@ async function sampleOsProcesses(platform: NodeJS.Platform): Promise<OsProcessSa
   return [{ pid: process.pid, ppid: process.ppid, cpuPercent: 0, memoryBytes: process.memoryUsage().rss, name: "node" }];
 }
 
-function collectDescendants(rootPid: number, byParent: Map<number, OsProcessSample[]>): OsProcessSample[] {
+function collectDescendants(
+  rootPid: number,
+  byParent: Map<number, OsProcessSample[]>,
+  stopAtPids?: ReadonlySet<number>,
+): OsProcessSample[] {
   const result: OsProcessSample[] = [];
   const visited = new Set<number>([rootPid]);
   const queue = [...(byParent.get(rootPid) ?? [])];
   while (queue.length) {
     const current = queue.shift()!;
-    if (visited.has(current.pid)) continue;
+    if (visited.has(current.pid) || stopAtPids?.has(current.pid)) continue;
     visited.add(current.pid);
     result.push(current);
     const children = byParent.get(current.pid);
@@ -141,17 +205,46 @@ function collectDescendants(rootPid: number, byParent: Map<number, OsProcessSamp
 interface ActiveConversationTurn {
   botId: string;
   conversationId: string;
-  conversationTitle: string;
   startedAt: number;
 }
 
+interface UserHistoryBucket {
+  points: ResourceSparklinePoint[];
+  lastSampleAt: number;
+}
+
 export class HubHostResources {
-  private readonly history: ResourceSparklinePoint[] = [];
-  private lastSampleAt = 0;
+  private readonly histories = new Map<string, UserHistoryBucket>();
 
   constructor(private readonly options: HostResourcesOptions) {}
 
-  private async activeTurnsForUser(userId: string, allowedConversationIds: Set<string>, titles: Map<string, string>): Promise<ActiveConversationTurn[]> {
+  private resolveDesktopAppPid(): number | undefined {
+    const configured = typeof this.options.desktopAppPid === "function"
+      ? this.options.desktopAppPid()
+      : this.options.desktopAppPid;
+    if (typeof configured === "number" && Number.isInteger(configured) && configured > 0) return configured;
+    const rawEnv = process.env.TAROBIRD_DESKTOP_PID;
+    if (rawEnv) {
+      const parsed = Number(rawEnv);
+      if (Number.isInteger(parsed) && parsed > 0) return parsed;
+    }
+    return undefined;
+  }
+
+  private historyBucket(userId: string): UserHistoryBucket {
+    let bucket = this.histories.get(userId);
+    if (!bucket) {
+      if (this.histories.size >= MAX_HISTORY_USERS) {
+        const oldestKey = this.histories.keys().next().value;
+        if (oldestKey !== undefined) this.histories.delete(oldestKey);
+      }
+      bucket = { points: [], lastSampleAt: 0 };
+      this.histories.set(userId, bucket);
+    }
+    return bucket;
+  }
+
+  private async allActiveTurns(): Promise<ActiveConversationTurn[]> {
     const rows = await this.options.store.db.serial(() => this.options.store.db.all<{
       conversation_id: string;
       author_id: string;
@@ -164,7 +257,6 @@ export class HubHostResources {
     const seen = new Set<string>();
     const turns: ActiveConversationTurn[] = [];
     for (const row of rows) {
-      if (!allowedConversationIds.has(row.conversation_id)) continue;
       let active = row.status === "pending" || row.status === "streaming";
       let startedAt = row.created_at;
       try {
@@ -185,7 +277,6 @@ export class HubHostResources {
       turns.push({
         botId: row.author_id,
         conversationId: row.conversation_id,
-        conversationTitle: titles.get(row.conversation_id) ?? row.conversation_id,
         startedAt,
       });
     }
@@ -193,12 +284,14 @@ export class HubHostResources {
   }
 
   async snapshot(userId: string, canStop: boolean, force = false): Promise<HostResourcesSnapshot> {
+    const isOwner = canStop;
     const platform = this.options.platform ?? process.platform;
     const hubPid = this.options.hubPid ?? process.pid;
-    const [samples, bots, conversations] = await Promise.all([
+    const [samples, bots, conversations, activeTurnsAll] = await Promise.all([
       (this.options.sampleProcesses ?? (() => sampleOsProcesses(platform)))(),
       this.options.store.bots(userId),
       this.options.store.conversations(userId),
+      this.allActiveTurns(),
     ]);
 
     const byPid = new Map<number, OsProcessSample>();
@@ -211,16 +304,25 @@ export class HubHostResources {
     }
 
     const conversationIds = new Set(conversations.map((c) => c.id));
-    const conversationTitles = new Map(conversations.map((c) => [c.id, c.title]));
-    const activeTurns = await this.activeTurnsForUser(userId, conversationIds, conversationTitles);
+    const conversationTitles = new Map(conversations.map((c) => [c.id, clampString(c.title, MAX_TITLE_LEN)]));
     const activeTurnsByBot = new Map<string, ActiveConversationTurn[]>();
-    for (const turn of activeTurns) {
+    for (const turn of activeTurnsAll) {
       const list = activeTurnsByBot.get(turn.botId);
       if (list) list.push(turn);
       else activeTurnsByBot.set(turn.botId, [turn]);
     }
 
     const botPids = this.options.childPids();
+    // Always track ALL managed Bot gateway trees regardless of userId so ungranted Bots
+    // can never leak into `unattributed` or desktop App process trees.
+    const allManagedBotTreePids = new Set<number>();
+    for (const gatewayPid of botPids.values()) {
+      allManagedBotTreePids.add(gatewayPid);
+      for (const proc of collectDescendants(gatewayPid, byParent)) {
+        allManagedBotTreePids.add(proc.pid);
+      }
+    }
+
     const visibleBots = bots.filter((b) => !b.deletedAt);
     const ownedPids = new Set<number>();
 
@@ -233,8 +335,8 @@ export class HubHostResources {
     };
     ownedPids.add(hostSample.pid);
 
-    const selfProcesses: ResourceProcess[] = [{
-      id: `host:${hostSample.pid}`,
+    const hostProcess: ResourceProcess = {
+      id: makeProcessId("host", [hostSample.pid]),
       pid: hostSample.pid,
       ppid: hostSample.ppid,
       name: "TaroBird Host",
@@ -242,165 +344,220 @@ export class HubHostResources {
       cpuPercent: roundCpu(hostSample.cpuPercent),
       memoryBytes: hostSample.memoryBytes,
       stoppable: false,
-    }];
+    };
 
-    // Detect local desktop App (Electron main/renderer) if it spawned this Host.
-    const parentSample = hostSample.ppid > 1 ? byPid.get(hostSample.ppid) : undefined;
-    if (parentSample && /electron|tarobird|tarobot/i.test(parentSample.name)) {
-      ownedPids.add(parentSample.pid);
-      selfProcesses.push({
-        id: `app:${parentSample.pid}`,
-        pid: parentSample.pid,
-        ppid: parentSample.ppid,
-        name: "TaroBird App",
+    // Detect local desktop App (Electron main/renderer/helpers), whether it directly
+    // spawned this Hub or runs alongside a detached Hub (ppid=1) as `tarocub-client` / `TaroBird`.
+    const appStopPids = new Set<number>([hostSample.pid, ...allManagedBotTreePids]);
+    const appProcesses: ResourceProcess[] = [];
+    const addAppProcess = (sample: OsProcessSample, displayName?: string) => {
+      if (ownedPids.has(sample.pid) || allManagedBotTreePids.has(sample.pid)) return;
+      ownedPids.add(sample.pid);
+      appProcesses.push({
+        id: makeProcessId("app", [sample.pid]),
+        pid: sample.pid,
+        ppid: sample.ppid,
+        name: clampString(displayName ?? sample.name, MAX_PROCESS_NAME_LEN) || "TaroBird App",
         kind: "app",
-        cpuPercent: roundCpu(parentSample.cpuPercent),
-        memoryBytes: parentSample.memoryBytes,
+        cpuPercent: roundCpu(sample.cpuPercent),
+        memoryBytes: sample.memoryBytes,
         stoppable: false,
       });
-      for (const sibling of byParent.get(parentSample.pid) ?? []) {
-        if (sibling.pid === hostSample.pid || ownedPids.has(sibling.pid)) continue;
-        if (/electron|helper|renderer|gpu|tarobird|tarobot/i.test(sibling.name)) {
-          ownedPids.add(sibling.pid);
-          selfProcesses.push({
-            id: `app:${sibling.pid}`,
-            pid: sibling.pid,
-            ppid: sibling.ppid,
-            name: sibling.name,
-            kind: "app",
-            cpuPercent: roundCpu(sibling.cpuPercent),
-            memoryBytes: sibling.memoryBytes,
-            stoppable: false,
-          });
-        }
+    };
+
+    const addAppTree = (root: OsProcessSample, filterChildrenByName: boolean) => {
+      if (ownedPids.has(root.pid) || allManagedBotTreePids.has(root.pid)) return;
+      addAppProcess(root, appProcesses.length === 0 ? "TaroBird App" : root.name);
+      for (const child of collectDescendants(root.pid, byParent, appStopPids)) {
+        if (filterChildrenByName && !DIRECT_PARENT_CHILD_RE.test(child.name)) continue;
+        addAppProcess(child);
       }
+    };
+
+    const explicitDesktopPid = this.resolveDesktopAppPid();
+    if (explicitDesktopPid) {
+      const explicitRoot = byPid.get(explicitDesktopPid);
+      if (explicitRoot) addAppTree(explicitRoot, false);
     }
 
-    const botGroups: ResourceBotGroup[] = [];
+    const parentSample = hostSample.ppid > 1 ? byPid.get(hostSample.ppid) : undefined;
+    if (parentSample && DIRECT_PARENT_APP_RE.test(parentSample.name)) {
+      addAppTree(parentSample, !DESKTOP_APP_NAME_RE.test(parentSample.name));
+    }
+
+    const matchedAppSamples = samples.filter(
+      (sample) => !ownedPids.has(sample.pid) && !allManagedBotTreePids.has(sample.pid) && DESKTOP_APP_NAME_RE.test(sample.name),
+    );
+    const matchedAppPids = new Set(matchedAppSamples.map((sample) => sample.pid));
+    for (const candidate of matchedAppSamples) {
+      if (!matchedAppPids.has(candidate.ppid)) {
+        addAppTree(candidate, false);
+      }
+    }
+    for (const candidate of matchedAppSamples) {
+      addAppProcess(candidate);
+    }
+
+    const allSelfProcesses: ResourceProcess[] = [hostProcess, ...appProcesses];
+    const hostCpu = roundCpu(hostProcess.cpuPercent);
+    const hostMem = hostProcess.memoryBytes;
+    const appCpu = roundCpu(appProcesses.reduce((s, p) => s + p.cpuPercent, 0));
+    const appMem = appProcesses.reduce((s, p) => s + p.memoryBytes, 0);
+    const cappedSelfProcesses: ResourceProcess[] = [
+      hostProcess,
+      ...sortProcessesByUsage(appProcesses).slice(0, MAX_SELF_PROCESSES - 1),
+    ];
+
+    const allBotGroups: ResourceBotGroup[] = [];
+    let totalBotProcessCount = 0;
+    let totalVisibleActiveTasks = 0;
+
     for (const bot of visibleBots) {
       const gatewayPid = botPids.get(bot.id);
       const gatewaySample = gatewayPid ? byPid.get(gatewayPid) : undefined;
-      const turns = activeTurnsByBot.get(bot.id) ?? [];
-      if (!gatewaySample && !turns.length && !bot.online) continue;
+      const allTurns = activeTurnsByBot.get(bot.id) ?? [];
+      const visibleTurns = allTurns.filter((turn) => conversationIds.has(turn.conversationId));
+      const hasHiddenTurns = allTurns.length > visibleTurns.length;
+      if (!gatewaySample && !visibleTurns.length && !bot.online) continue;
 
       const descendants = gatewayPid ? collectDescendants(gatewayPid, byParent) : [];
       if (gatewayPid) ownedPids.add(gatewayPid);
       for (const proc of descendants) ownedPids.add(proc.pid);
 
+      const safeBotName = clampString(bot.name, MAX_BOT_NAME_LEN);
+      const safeEngine = clampString(bot.engine, MAX_ENGINE_LEN);
       const convGroups: ResourceConversationGroup[] = [];
       const botUnattributed: ResourceProcess[] = [];
 
+      const buildTurnProcess = (turn: ActiveConversationTurn, title: string, proc: OsProcessSample): ResourceProcess => ({
+        id: makeProcessId("engine", [bot.id, turn.conversationId, proc.pid]),
+        pid: proc.pid,
+        ppid: proc.ppid,
+        name: clampString(proc.name, MAX_PROCESS_NAME_LEN) || "process",
+        kind: "engine",
+        cpuPercent: roundCpu(proc.cpuPercent),
+        memoryBytes: proc.memoryBytes,
+        botId: bot.id,
+        botName: safeBotName,
+        engine: safeEngine,
+        conversationId: turn.conversationId,
+        conversationTitle: title,
+        startedAt: turn.startedAt,
+        stoppable: canStop,
+      });
+
+      const buildBotEngineProcess = (tag: string, proc: OsProcessSample): ResourceProcess => ({
+        id: makeProcessId("engine", [bot.id, tag, proc.pid]),
+        pid: proc.pid,
+        ppid: proc.ppid,
+        name: clampString(proc.name, MAX_PROCESS_NAME_LEN) || "process",
+        kind: "engine",
+        cpuPercent: roundCpu(proc.cpuPercent),
+        memoryBytes: proc.memoryBytes,
+        botId: bot.id,
+        botName: safeBotName,
+        engine: safeEngine,
+        stoppable: canStop,
+      });
+
       if (gatewaySample) {
         botUnattributed.push({
-          id: `gateway:${bot.id}:${gatewaySample.pid}`,
+          id: makeProcessId("gateway", [bot.id, gatewaySample.pid]),
           pid: gatewaySample.pid,
           ppid: gatewaySample.ppid,
-          name: `${bot.engine || "bot"} gateway`,
+          name: clampString(`${safeEngine || "bot"} gateway`, MAX_PROCESS_NAME_LEN),
           kind: "gateway",
           cpuPercent: roundCpu(gatewaySample.cpuPercent),
           memoryBytes: gatewaySample.memoryBytes,
           botId: bot.id,
-          botName: bot.name,
-          engine: bot.engine,
+          botName: safeBotName,
+          engine: safeEngine,
           stoppable: false,
         });
       }
 
-      if (turns.length === 1) {
-        const turn = turns[0]!;
-        const turnProcesses: ResourceProcess[] = descendants.map((proc) => ({
-          id: `engine:${bot.id}:${turn.conversationId}:${proc.pid}`,
-          pid: proc.pid,
-          ppid: proc.ppid,
-          name: proc.name,
-          kind: "engine",
-          cpuPercent: roundCpu(proc.cpuPercent),
-          memoryBytes: proc.memoryBytes,
-          botId: bot.id,
-          botName: bot.name,
-          engine: bot.engine,
-          conversationId: turn.conversationId,
-          conversationTitle: turn.conversationTitle,
-          startedAt: turn.startedAt,
-          stoppable: canStop,
-        }));
-        convGroups.push({
-          conversationId: turn.conversationId,
-          title: turn.conversationTitle,
-          active: true,
-          cpuPercent: roundCpu(turnProcesses.reduce((sum, p) => sum + p.cpuPercent, 0)),
-          memoryBytes: turnProcesses.reduce((sum, p) => sum + p.memoryBytes, 0),
-          stoppable: canStop,
-          processes: turnProcesses,
-        });
-      } else if (turns.length > 1) {
-        // Group top-level direct children of gateway (each representing a spawned engine tree)
-        // in ascending PID order alongside turns in ascending start order.
-        const directChildren = (gatewayPid ? byParent.get(gatewayPid) ?? [] : []).slice().sort((a, b) => a.pid - b.pid);
-        const assignedPids = new Set<number>();
-        turns.forEach((turn, index) => {
-          const root = directChildren[index];
-          const tree = root ? [root, ...collectDescendants(root.pid, byParent)] : [];
-          for (const proc of tree) assignedPids.add(proc.pid);
-          const turnProcesses: ResourceProcess[] = tree.map((proc) => ({
-            id: `engine:${bot.id}:${turn.conversationId}:${proc.pid}`,
-            pid: proc.pid,
-            ppid: proc.ppid,
-            name: proc.name,
-            kind: "engine",
-            cpuPercent: roundCpu(proc.cpuPercent),
-            memoryBytes: proc.memoryBytes,
-            botId: bot.id,
-            botName: bot.name,
-            engine: bot.engine,
-            conversationId: turn.conversationId,
-            conversationTitle: turn.conversationTitle,
-            startedAt: turn.startedAt,
-            stoppable: canStop,
-          }));
+      let botProcessCount = gatewaySample ? 1 : 0;
+
+      if (allTurns.length === 1) {
+        const turn = allTurns[0]!;
+        if (conversationIds.has(turn.conversationId)) {
+          const title = conversationTitles.get(turn.conversationId) ?? clampString(turn.conversationId, MAX_TITLE_LEN);
+          const allTurnProcesses = descendants.map((proc) => buildTurnProcess(turn, title, proc));
+          botProcessCount += allTurnProcesses.length;
           convGroups.push({
             conversationId: turn.conversationId,
-            title: turn.conversationTitle,
+            title,
             active: true,
-            cpuPercent: roundCpu(turnProcesses.reduce((sum, p) => sum + p.cpuPercent, 0)),
-            memoryBytes: turnProcesses.reduce((sum, p) => sum + p.memoryBytes, 0),
+            cpuPercent: roundCpu(allTurnProcesses.reduce((sum, p) => sum + p.cpuPercent, 0)),
+            memoryBytes: allTurnProcesses.reduce((sum, p) => sum + p.memoryBytes, 0),
             stoppable: canStop,
-            processes: turnProcesses,
+            processes: sortProcessesByUsage(allTurnProcesses).slice(0, MAX_PROCESSES_PER_GROUP),
           });
-        });
-        for (const proc of descendants) {
-          if (assignedPids.has(proc.pid)) continue;
-          botUnattributed.push({
-            id: `engine:${bot.id}:unattributed:${proc.pid}`,
-            pid: proc.pid,
-            ppid: proc.ppid,
-            name: proc.name,
-            kind: "engine",
-            cpuPercent: roundCpu(proc.cpuPercent),
-            memoryBytes: proc.memoryBytes,
-            botId: bot.id,
-            botName: bot.name,
-            engine: bot.engine,
-            stoppable: canStop,
+        } else if (isOwner) {
+          for (const proc of descendants) {
+            botUnattributed.push(buildBotEngineProcess("unattributed", proc));
+          }
+          botProcessCount += descendants.length;
+        }
+        // When `!isOwner` and the single active turn belongs to another user,
+        // omit its engine/tool descendants entirely so private activity never leaks.
+      } else if (allTurns.length > 1) {
+        const directChildren = (gatewayPid ? byParent.get(gatewayPid) ?? [] : []).slice().sort((a, b) => a.pid - b.pid);
+        if (!isOwner && hasHiddenTurns && directChildren.length < allTurns.length) {
+          // Shared worker serves both visible and hidden turns; expose only the user's
+          // own active conversation entries without leaking another user's subprocesses.
+          for (const turn of visibleTurns) {
+            const title = conversationTitles.get(turn.conversationId) ?? clampString(turn.conversationId, MAX_TITLE_LEN);
+            convGroups.push({
+              conversationId: turn.conversationId,
+              title,
+              active: true,
+              cpuPercent: 0,
+              memoryBytes: 0,
+              stoppable: canStop,
+              processes: [],
+            });
+          }
+        } else {
+          const assignedPids = new Set<number>();
+          allTurns.forEach((turn, index) => {
+            const root = directChildren[index];
+            const tree = root ? [root, ...collectDescendants(root.pid, byParent)] : [];
+            for (const proc of tree) assignedPids.add(proc.pid);
+            if (conversationIds.has(turn.conversationId)) {
+              const title = conversationTitles.get(turn.conversationId) ?? clampString(turn.conversationId, MAX_TITLE_LEN);
+              const allTurnProcesses = tree.map((proc) => buildTurnProcess(turn, title, proc));
+              botProcessCount += allTurnProcesses.length;
+              convGroups.push({
+                conversationId: turn.conversationId,
+                title,
+                active: true,
+                cpuPercent: roundCpu(allTurnProcesses.reduce((sum, p) => sum + p.cpuPercent, 0)),
+                memoryBytes: allTurnProcesses.reduce((sum, p) => sum + p.memoryBytes, 0),
+                stoppable: canStop,
+                processes: sortProcessesByUsage(allTurnProcesses).slice(0, MAX_PROCESSES_PER_GROUP),
+              });
+            } else if (isOwner) {
+              for (const proc of tree) {
+                botUnattributed.push(buildBotEngineProcess("unattributed", proc));
+              }
+              botProcessCount += tree.length;
+            }
           });
+          if (isOwner || !hasHiddenTurns) {
+            for (const proc of descendants) {
+              if (assignedPids.has(proc.pid)) continue;
+              botUnattributed.push(buildBotEngineProcess("unattributed", proc));
+              botProcessCount += 1;
+            }
+          }
         }
       } else {
         // Idle persistent engine workers (e.g., Codex app-server / Claude stream / Pi RPC)
         for (const proc of descendants) {
-          botUnattributed.push({
-            id: `engine:${bot.id}:idle:${proc.pid}`,
-            pid: proc.pid,
-            ppid: proc.ppid,
-            name: proc.name,
-            kind: "engine",
-            cpuPercent: roundCpu(proc.cpuPercent),
-            memoryBytes: proc.memoryBytes,
-            botId: bot.id,
-            botName: bot.name,
-            engine: bot.engine,
-            stoppable: canStop,
-          });
+          botUnattributed.push(buildBotEngineProcess("idle", proc));
         }
+        botProcessCount += descendants.length;
       }
 
       const botCpu = roundCpu(
@@ -408,62 +565,63 @@ export class HubHostResources {
       );
       const botMem = convGroups.reduce((s, c) => s + c.memoryBytes, 0) + botUnattributed.reduce((s, p) => s + p.memoryBytes, 0);
 
-      botGroups.push({
+      totalBotProcessCount += botProcessCount;
+      totalVisibleActiveTasks += visibleTurns.length;
+
+      allBotGroups.push({
         botId: bot.id,
-        botName: bot.name,
-        engine: bot.engine,
+        botName: safeBotName,
+        engine: safeEngine,
         online: Boolean(bot.online),
         ...(gatewayPid ? { gatewayPid } : {}),
         cpuPercent: botCpu,
         memoryBytes: botMem,
-        activeTurns: turns.length,
-        conversations: convGroups,
-        unattributed: botUnattributed,
+        activeTurns: visibleTurns.length,
+        conversations: sortConversationsByUsage(convGroups).slice(0, MAX_CONVERSATIONS_PER_BOT),
+        unattributed: sortProcessesByUsage(botUnattributed).slice(0, MAX_PROCESSES_PER_GROUP),
       });
     }
 
-    // Any remaining descendants of the Hub not attributed to a Bot gateway
-    const unattributed: ResourceProcess[] = [];
-    for (const proc of collectDescendants(hubPid, byParent)) {
-      if (ownedPids.has(proc.pid)) continue;
-      ownedPids.add(proc.pid);
-      unattributed.push({
-        id: `unattributed:${proc.pid}`,
-        pid: proc.pid,
-        ppid: proc.ppid,
-        name: proc.name,
-        kind: "unattributed",
-        cpuPercent: roundCpu(proc.cpuPercent),
-        memoryBytes: proc.memoryBytes,
-        stoppable: false,
-      });
+    // Any remaining descendants of the Hub not attributed to any managed Bot gateway.
+    // Only visible to Host owners; managed Bot trees are always excluded regardless of userId.
+    const allUnattributed: ResourceProcess[] = [];
+    if (isOwner) {
+      for (const proc of collectDescendants(hubPid, byParent)) {
+        if (ownedPids.has(proc.pid) || allManagedBotTreePids.has(proc.pid)) continue;
+        ownedPids.add(proc.pid);
+        allUnattributed.push({
+          id: makeProcessId("unattributed", [proc.pid]),
+          pid: proc.pid,
+          ppid: proc.ppid,
+          name: clampString(proc.name, MAX_PROCESS_NAME_LEN) || "process",
+          kind: "unattributed",
+          cpuPercent: roundCpu(proc.cpuPercent),
+          memoryBytes: proc.memoryBytes,
+          stoppable: false,
+        });
+      }
     }
 
-    const hostCpu = roundCpu(selfProcesses.filter((p) => p.kind === "host").reduce((s, p) => s + p.cpuPercent, 0));
-    const hostMem = selfProcesses.filter((p) => p.kind === "host").reduce((s, p) => s + p.memoryBytes, 0);
-    const appCpu = roundCpu(selfProcesses.filter((p) => p.kind === "app").reduce((s, p) => s + p.cpuPercent, 0));
-    const appMem = selfProcesses.filter((p) => p.kind === "app").reduce((s, p) => s + p.memoryBytes, 0);
-    const engineCpu = roundCpu(botGroups.reduce((s, b) => s + b.cpuPercent, 0) + unattributed.reduce((s, p) => s + p.cpuPercent, 0));
-    const engineMem = botGroups.reduce((s, b) => s + b.memoryBytes, 0) + unattributed.reduce((s, p) => s + p.memoryBytes, 0);
+    const engineCpu = roundCpu(allBotGroups.reduce((s, b) => s + b.cpuPercent, 0) + allUnattributed.reduce((s, p) => s + p.cpuPercent, 0));
+    const engineMem = allBotGroups.reduce((s, b) => s + b.memoryBytes, 0) + allUnattributed.reduce((s, p) => s + p.memoryBytes, 0);
     const totalCpu = roundCpu(hostCpu + appCpu + engineCpu);
     const totalMem = hostMem + appMem + engineMem;
     const now = Date.now();
 
-    if (force || !this.history.length || now - this.lastSampleAt >= MIN_HISTORY_INTERVAL_MS) {
-      this.lastSampleAt = now;
-      this.history.push({ at: now, cpuPercent: totalCpu, memoryBytes: totalMem });
-      while (this.history.length > HISTORY_LIMIT) this.history.shift();
+    const bucket = this.historyBucket(userId);
+    const allowForce = isOwner && force;
+    if (allowForce || !bucket.points.length || now - bucket.lastSampleAt >= MIN_HISTORY_INTERVAL_MS) {
+      bucket.lastSampleAt = now;
+      bucket.points.push({ at: now, cpuPercent: totalCpu, memoryBytes: totalMem });
+      while (bucket.points.length > HISTORY_LIMIT) bucket.points.shift();
     }
 
-    const processCount =
-      selfProcesses.length +
-      botGroups.reduce((s, b) => s + b.unattributed.length + b.conversations.reduce((cs, c) => cs + c.processes.length, 0), 0) +
-      unattributed.length;
+    const processCount = allSelfProcesses.length + totalBotProcessCount + allUnattributed.length;
 
     return hostResourcesSnapshotSchema.parse({
       v: 1,
       sampledAt: now,
-      platform,
+      platform: clampString(platform, MAX_PLATFORM_LEN) || "unknown",
       canStop,
       summary: {
         totalCpuPercent: totalCpu,
@@ -474,13 +632,13 @@ export class HubHostResources {
         appMemoryBytes: appMem,
         engineCpuPercent: engineCpu,
         engineMemoryBytes: engineMem,
-        activeTasks: activeTurns.length,
+        activeTasks: totalVisibleActiveTasks,
         processCount,
       },
-      history: [...this.history],
-      selfProcesses,
-      bots: botGroups,
-      unattributed,
+      history: [...bucket.points],
+      selfProcesses: cappedSelfProcesses,
+      bots: sortBotsByUsage(allBotGroups).slice(0, MAX_BOT_GROUPS),
+      unattributed: sortProcessesByUsage(allUnattributed).slice(0, MAX_UNATTRIBUTED_PROCESSES),
     });
   }
 
@@ -491,20 +649,16 @@ export class HubHostResources {
       if (!conversation || !conversation.botIds.includes(request.botId)) {
         throw new HubError("bot_forbidden", 403);
       }
-      try {
-        const stopped = await this.options.stopBotTurn(request.botId, request.conversationId, userId);
-        await this.options.store.audit("host_resources.stopped", userId, {
-          botId: request.botId,
-          conversationId: request.conversationId,
-          method: "turn_stop",
-          stopped,
-        });
-        if (stopped || !request.pid) {
-          return { ok: true, stopped, method: "turn_stop" };
-        }
-      } catch (error) {
-        if (!request.pid) throw error;
-      }
+      // Graceful conversation turn stop never falls through to `killProcessTree`:
+      // persistent engine workers (Codex app-server, Claude, Pi RPC, ACP) may serve other active runs.
+      const stopped = await this.options.stopBotTurn(request.botId, request.conversationId, userId);
+      await this.options.store.audit("host_resources.stopped", userId, {
+        botId: request.botId,
+        conversationId: request.conversationId,
+        method: "turn_stop",
+        stopped,
+      });
+      return { ok: true, stopped, method: "turn_stop" };
     }
 
     if (!request.pid) {
@@ -535,7 +689,6 @@ export class HubHostResources {
     }
     await this.options.store.audit("host_resources.stopped", userId, {
       botId: request.botId,
-      ...(request.conversationId ? { conversationId: request.conversationId } : {}),
       pid: request.pid,
       method: "process_tree",
     });

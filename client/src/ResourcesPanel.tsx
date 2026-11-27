@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type RefObject } from "react";
+import { forwardRef, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore, type RefObject } from "react";
 import { Activity, ChevronDown, ChevronRight, Monitor, RefreshCw, Square, X } from "lucide-react";
 import {
   formatCpuPercent,
@@ -13,7 +13,7 @@ import {
   type ResourceSparklinePoint,
 } from "../../src/client-protocol/host-resources.js";
 import { useBackAction } from "./back-navigation.js";
-import type { HubConnection } from "./connection.js";
+import type { ConnectionState, HubConnection } from "./connection.js";
 import { CreationDialog } from "./CreationDialog.js";
 import { useDialogDrag } from "./dialog-drag.js";
 import { t, useLocale } from "./i18n.js";
@@ -27,6 +27,37 @@ export type ResourceHostEntry = {
 
 const POLL_CLOSED_MS = 10_000;
 const POLL_OPEN_MS = 3_000;
+
+function useConnectionState(connection: HubConnection | undefined): ConnectionState | undefined {
+  const subscribe = useCallback(
+    (notify: () => void) => (connection ? connection.subscribe(notify) : () => {}),
+    [connection],
+  );
+  return useSyncExternalStore(subscribe, () => connection?.state);
+}
+
+function useStableConnections(hosts: readonly ResourceHostEntry[]): readonly HubConnection[] {
+  const ref = useRef<readonly HubConnection[]>([]);
+  const next = hosts.map((host) => host.connection);
+  if (next.length !== ref.current.length || next.some((conn, index) => conn !== ref.current[index])) {
+    ref.current = next;
+  }
+  return ref.current;
+}
+
+export function useAnyHostResourcesAvailable(hosts: readonly ResourceHostEntry[]): boolean {
+  const connections = useStableConnections(hosts);
+  const subscribe = useCallback((notify: () => void) => {
+    const unsubs = connections.map((conn) => conn.subscribe(notify));
+    return () => {
+      for (const unsub of unsubs) unsub();
+    };
+  }, [connections]);
+  return useSyncExternalStore(
+    subscribe,
+    () => connections.some((conn) => Boolean(conn.state.hostResourcesAvailable)),
+  );
+}
 
 export function ResourceSparkline({
   points,
@@ -62,55 +93,126 @@ export function ResourceSparkline({
   );
 }
 
-type PendingStop = {
-  botId: string;
-  botName: string;
-  conversationId?: string;
-  conversationTitle?: string;
-  pid?: number;
-  processName?: string;
-};
+type PendingStop =
+  | {
+    mode: "conversation";
+    botId: string;
+    botName: string;
+    conversationId: string;
+    conversationTitle: string;
+  }
+  | {
+    mode: "process";
+    botId: string;
+    botName: string;
+    pid: number;
+    processName: string;
+  };
+
+function isAbortError(cause: unknown): boolean {
+  return cause instanceof DOMException
+    ? cause.name === "AbortError"
+    : cause instanceof Error && cause.name === "AbortError";
+}
 
 function useHostResources(connection: HubConnection | undefined, active: boolean, intervalMs: number) {
+  const connState = useConnectionState(connection);
+  const status = connState?.status ?? "offline";
+  const available = Boolean(connState?.hostResourcesAvailable);
+  const ready = Boolean(connection && status === "online" && available);
+
   const [snapshot, setSnapshot] = useState<HostResourcesSnapshot>();
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
-  const inflight = useRef(false);
+
+  const mountedRef = useRef(true);
+  const activeConnectionRef = useRef<HubConnection | undefined>(connection);
+  activeConnectionRef.current = connection;
+  const requestSeqRef = useRef(0);
+  const inflightRef = useRef<{ connection: HubConnection; seq: number; controller: AbortController } | null>(null);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      requestSeqRef.current += 1;
+      inflightRef.current?.controller.abort();
+      inflightRef.current = null;
+    };
+  }, []);
 
   const load = useCallback(async (force = false) => {
-    if (!connection || connection.state.status !== "online" || !connection.state.hostResourcesAvailable || inflight.current) return;
-    inflight.current = true;
+    if (!connection || connection.state.status !== "online" || !connection.state.hostResourcesAvailable) return;
+    if (!force && inflightRef.current?.connection === connection) return;
+    if (inflightRef.current) {
+      inflightRef.current.controller.abort();
+      inflightRef.current = null;
+    }
+    const seq = ++requestSeqRef.current;
+    const controller = new AbortController();
+    inflightRef.current = { connection, seq, controller };
     setLoading(true);
     try {
-      const data = await connection.hostResources({ force });
+      const data = await connection.hostResources({ force, signal: controller.signal });
+      if (!mountedRef.current || requestSeqRef.current !== seq || activeConnectionRef.current !== connection) return;
       setSnapshot(data);
       setError("");
     } catch (cause) {
+      if (!mountedRef.current || requestSeqRef.current !== seq || activeConnectionRef.current !== connection) return;
+      if (controller.signal.aborted && isAbortError(cause)) return;
       setError(cause instanceof Error ? cause.message : t("无法读取资源数据"));
     } finally {
-      inflight.current = false;
-      setLoading(false);
+      if (inflightRef.current?.seq === seq) inflightRef.current = null;
+      if (mountedRef.current && requestSeqRef.current === seq && activeConnectionRef.current === connection) {
+        setLoading(false);
+      }
     }
   }, [connection]);
 
   useEffect(() => {
+    requestSeqRef.current += 1;
+    inflightRef.current?.controller.abort();
+    inflightRef.current = null;
     setSnapshot(undefined);
     setError("");
+    setLoading(false);
   }, [connection]);
 
   useEffect(() => {
-    if (!active || !connection) return;
+    if (!active || !connection || !ready) {
+      requestSeqRef.current += 1;
+      inflightRef.current?.controller.abort();
+      inflightRef.current = null;
+      setLoading(false);
+      return;
+    }
     void load(false);
     const timer = setInterval(() => {
       if (!document.hidden) void load(false);
     }, intervalMs);
-    return () => clearInterval(timer);
-  }, [active, connection, intervalMs, load]);
+    return () => {
+      clearInterval(timer);
+      requestSeqRef.current += 1;
+      inflightRef.current?.controller.abort();
+      inflightRef.current = null;
+    };
+  }, [active, connection, ready, intervalMs, load]);
 
-  return { snapshot, loading, error, refresh: () => void load(true) };
+  return {
+    snapshot,
+    loading,
+    error,
+    status,
+    available,
+    ready,
+    refresh: useCallback(() => { void load(true); }, [load]),
+  };
 }
 
 function ResourceTreeBody({
+  hostName,
+  status,
+  available,
   snapshot,
   loading,
   error,
@@ -118,6 +220,9 @@ function ResourceTreeBody({
   stoppingKey,
   onRequestStop,
 }: {
+  hostName: string;
+  status: ConnectionState["status"];
+  available: boolean;
   snapshot?: HostResourcesSnapshot;
   loading: boolean;
   error: string;
@@ -128,6 +233,15 @@ function ResourceTreeBody({
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
   const sortedBots = useMemo(() => sortResourceBots(snapshot?.bots ?? [], sort), [snapshot?.bots, sort]);
 
+  if (status === "connecting") {
+    return <p className="resources-empty muted" role="status">{t("正在连接「{0}」…", hostName)}</p>;
+  }
+  if (status !== "online") {
+    return <p className="resources-empty muted" role="status">{t("主机「{0}」当前离线，恢复连接后可查看资源占用。", hostName)}</p>;
+  }
+  if (!available) {
+    return <p className="resources-empty muted" role="status">{t("主机「{0}」暂不支持资源管理，请更新主机后查看。", hostName)}</p>;
+  }
   if (error && !snapshot) {
     return <p className="resources-empty error-text" role="alert">{t("暂时无法读取资源使用情况。")}</p>;
   }
@@ -230,12 +344,11 @@ function ResourceTreeBody({
                                   disabled={stoppingKey === convStopKey}
                                   aria-label={t("停止 {0} 中的运行", conv.title)}
                                   onClick={() => onRequestStop?.({
+                                    mode: "conversation",
                                     botId: bot.botId,
                                     botName: bot.botName,
                                     conversationId: conv.conversationId,
                                     conversationTitle: conv.title,
-                                    pid: conv.processes[0]?.pid,
-                                    processName: conv.processes[0]?.name,
                                   })}
                                 >
                                   <Square size={11} aria-hidden="true" />
@@ -246,7 +359,7 @@ function ResourceTreeBody({
                             {conv.processes.length > 0 && (
                               <ul className="resources-proc-list">
                                 {conv.processes.map((proc: ResourceProcess) => {
-                                  const procKey = `${bot.botId}:${conv.conversationId}:${proc.pid}`;
+                                  const procKey = `${bot.botId}:pid:${proc.pid}`;
                                   return (
                                     <li key={proc.id} className="resources-proc-row">
                                       <span className="resources-proc-name">{proc.name}</span>
@@ -262,10 +375,9 @@ function ResourceTreeBody({
                                           disabled={stoppingKey === procKey}
                                           aria-label={t("停止进程 {0}", proc.pid)}
                                           onClick={() => onRequestStop?.({
+                                            mode: "process",
                                             botId: bot.botId,
                                             botName: bot.botName,
-                                            conversationId: conv.conversationId,
-                                            conversationTitle: conv.title,
                                             pid: proc.pid,
                                             processName: proc.name,
                                           })}
@@ -300,6 +412,7 @@ function ResourceTreeBody({
                                     disabled={stoppingKey === procKey}
                                     aria-label={t("停止进程 {0}", proc.pid)}
                                     onClick={() => onRequestStop?.({
+                                      mode: "process",
                                       botId: bot.botId,
                                       botName: bot.botName,
                                       pid: proc.pid,
@@ -353,12 +466,16 @@ function ResourcesDialog({
   hosts,
   targetHost,
   onSelectHost,
+  status,
+  available,
+  ready,
   snapshot,
   loading,
   error,
   sort,
   onSortChange,
   stopNotice,
+  stopError,
   stoppingKey,
   pendingStop,
   onRequestStop,
@@ -372,12 +489,16 @@ function ResourcesDialog({
   hosts: readonly ResourceHostEntry[];
   targetHost: ResourceHostEntry;
   onSelectHost: (hostId: string) => void;
+  status: ConnectionState["status"];
+  available: boolean;
+  ready: boolean;
   snapshot?: HostResourcesSnapshot;
   loading: boolean;
   error: string;
   sort: ResourceSortKey;
   onSortChange: (sort: ResourceSortKey) => void;
   stopNotice: string;
+  stopError: string;
   stoppingKey?: string;
   pendingStop?: PendingStop;
   onRequestStop: (target: PendingStop) => void;
@@ -385,7 +506,7 @@ function ResourcesDialog({
   onCancelStop: () => void;
   onRefresh: () => void;
   onClose: () => void;
-  returnFocus: RefObject<HTMLButtonElement | null>;
+  returnFocus?: RefObject<HTMLButtonElement | null>;
 }) {
   const dialogRef = useRef<HTMLDialogElement>(null);
   const headerRef = useRef<HTMLElement>(null);
@@ -415,7 +536,8 @@ function ResourcesDialog({
     return () => {
       intentionalClose.current = true;
       node?.close();
-      (returnFocus.current ?? before)?.focus({ preventScroll: true });
+      const target = returnFocus?.current?.isConnected ? returnFocus.current : before?.isConnected ? before : null;
+      target?.focus({ preventScroll: true });
     };
   }, [returnFocus]);
 
@@ -473,7 +595,7 @@ function ResourcesDialog({
               className="icon-button"
               aria-label={t("刷新资源")}
               title={t("刷新资源")}
-              disabled={loading}
+              disabled={loading || !ready}
               onClick={onRefresh}
             >
               <RefreshCw size={15} className={loading ? "spin" : undefined} />
@@ -496,6 +618,7 @@ function ResourcesDialog({
               <Monitor size={14} aria-hidden="true" />
               <select
                 aria-label={t("切换主机")}
+                disabled={!!stoppingKey}
                 value={targetHost.id}
                 onChange={(e) => onSelectHost(e.target.value)}
               >
@@ -520,6 +643,9 @@ function ResourcesDialog({
         {stopNotice && <p className="resources-notice" role="status">{stopNotice}</p>}
 
         <ResourceTreeBody
+          hostName={targetHost.name}
+          status={status}
+          available={available}
           snapshot={snapshot}
           loading={loading}
           error={error}
@@ -531,24 +657,29 @@ function ResourcesDialog({
 
       {pendingStop && (
         <CreationDialog
-          title={t("确认停止进程？")}
+          title={pendingStop.mode === "conversation" ? t("确认停止当前运行？") : t("确认终止进程？")}
           closeLabel={t("取消")}
           close={onCancelStop}
           busy={!!stoppingKey}
           showHost={false}
         >
           <p>
-            {pendingStop.conversationTitle
+            {pendingStop.mode === "conversation"
               ? t("将停止「{0}」在对话「{1}」中的当前运行，效果与在聊天中点击停止相同，对话中会显示已停止。", pendingStop.botName, pendingStop.conversationTitle)
-              : t("将停止「{0}」的引擎进程（PID {1}）。", pendingStop.botName, pendingStop.pid ?? 0)}
+              : t("将直接终止「{0}」的子进程树（PID {1}）。若该进程为共享引擎进程，同一 Bot 的其他运行中对话也可能受影响。", pendingStop.botName, pendingStop.pid)}
           </p>
-          {pendingStop.pid && (
-            <p className="muted">{t("目标进程：{0} (PID {1})", pendingStop.processName ?? "engine", pendingStop.pid)}</p>
+          {pendingStop.mode === "process" && (
+            <p className="muted">{t("目标进程：{0} (PID {1})", pendingStop.processName, pendingStop.pid)}</p>
           )}
+          {stopError && <p className="error-text" role="alert">{stopError}</p>}
           <div className="quick-actions">
             <button type="button" disabled={!!stoppingKey} onClick={onCancelStop}>{t("取消")}</button>
             <button type="button" className="text-danger" disabled={!!stoppingKey} onClick={onConfirmStop}>
-              {stoppingKey ? t("正在停止…") : t("确认停止")}
+              {stoppingKey
+                ? t("正在停止…")
+                : pendingStop.mode === "conversation"
+                  ? t("确认停止")
+                  : t("确认终止")}
             </button>
           </div>
         </CreationDialog>
@@ -557,7 +688,170 @@ function ResourcesDialog({
   );
 }
 
-/** Desktop bottom-right status bar entry + centered Resource Manager modal dialog. */
+/** Standalone Resource Manager modal mounted at desktop Workspace / ADHD level. */
+export function ResourcesManagerDialog({
+  id,
+  hosts,
+  activeHostId,
+  visible,
+  onClose,
+  returnFocus,
+}: {
+  id?: string;
+  hosts: readonly ResourceHostEntry[];
+  activeHostId: string;
+  visible: boolean;
+  onClose: () => void;
+  returnFocus?: RefObject<HTMLButtonElement | null>;
+}) {
+  useLocale();
+  const fallbackId = useId();
+  const dialogId = id ?? fallbackId;
+  const [selectedHostId, setSelectedHostId] = useState(activeHostId);
+  const [sort, setSort] = useState<ResourceSortKey>("memory");
+  const [pendingStop, setPendingStop] = useState<PendingStop>();
+  const [stoppingKey, setStoppingKey] = useState<string>();
+  const [stopNotice, setStopNotice] = useState("");
+  const [stopError, setStopError] = useState("");
+  const postStopTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const selectedHostIdRef = useRef(selectedHostId);
+
+  const targetHost = hosts.find((h) => h.id === selectedHostId)
+    ?? hosts.find((h) => h.id === activeHostId)
+    ?? hosts[0];
+  selectedHostIdRef.current = targetHost?.id ?? "";
+
+  useEffect(() => () => {
+    if (postStopTimerRef.current) clearTimeout(postStopTimerRef.current);
+  }, []);
+
+  useEffect(() => {
+    if (!visible) onClose();
+  }, [visible, onClose]);
+
+  const { snapshot, loading, error, status, available, ready, refresh } = useHostResources(
+    targetHost?.connection,
+    visible,
+    POLL_OPEN_MS,
+  );
+
+  if (!targetHost) return null;
+
+  const selectHost = (hostId: string) => {
+    if (postStopTimerRef.current) {
+      clearTimeout(postStopTimerRef.current);
+      postStopTimerRef.current = undefined;
+    }
+    setPendingStop(undefined);
+    setStopError("");
+    setStopNotice("");
+    setSelectedHostId(hostId);
+  };
+
+  const confirmStop = async () => {
+    if (!pendingStop || !targetHost) return;
+    const stopTarget = pendingStop;
+    const stopHost = targetHost;
+    const key = stopTarget.mode === "conversation"
+      ? `${stopTarget.botId}:${stopTarget.conversationId}`
+      : `${stopTarget.botId}:pid:${stopTarget.pid}`;
+    setStoppingKey(key);
+    setStopNotice("");
+    setStopError("");
+    try {
+      const payload: HostResourceStopRequest = stopTarget.mode === "conversation"
+        ? { botId: stopTarget.botId, conversationId: stopTarget.conversationId }
+        : { botId: stopTarget.botId, pid: stopTarget.pid };
+      const result = await stopHost.connection.stopHostResource(payload);
+      if (selectedHostIdRef.current !== stopHost.id) return;
+      setPendingStop(undefined);
+      setStopError("");
+      setStopNotice(
+        stopTarget.mode === "conversation"
+          ? (result.stopped
+            ? t("已请求停止「{0}」中的运行。", stopTarget.conversationTitle)
+            : t("「{0}」当前没有进行中的运行。", stopTarget.conversationTitle))
+          : t("已终止进程 {0}（PID {1}）。", stopTarget.processName, stopTarget.pid),
+      );
+      if (postStopTimerRef.current) clearTimeout(postStopTimerRef.current);
+      postStopTimerRef.current = setTimeout(() => {
+        postStopTimerRef.current = undefined;
+        if (selectedHostIdRef.current === stopHost.id) refresh();
+      }, 300);
+    } catch {
+      if (selectedHostIdRef.current !== stopHost.id) return;
+      setStopError(t("停止进程失败，请确认此设备具有管理员权限且主机在线。"));
+    } finally {
+      setStoppingKey(undefined);
+    }
+  };
+
+  return (
+    <ResourcesDialog
+      id={dialogId}
+      hosts={hosts}
+      targetHost={targetHost}
+      onSelectHost={selectHost}
+      status={status}
+      available={available}
+      ready={ready}
+      snapshot={snapshot}
+      loading={loading}
+      error={error}
+      sort={sort}
+      onSortChange={setSort}
+      stopNotice={stopNotice}
+      stopError={stopError}
+      stoppingKey={stoppingKey}
+      pendingStop={pendingStop}
+      onRequestStop={(target) => {
+        setStopError("");
+        setPendingStop(target);
+      }}
+      onConfirmStop={() => void confirmStop()}
+      onCancelStop={() => {
+        if (!stoppingKey) {
+          setStopError("");
+          setPendingStop(undefined);
+        }
+      }}
+      onRefresh={refresh}
+      onClose={onClose}
+      returnFocus={returnFocus}
+    />
+  );
+}
+
+/** Lightweight Workspace Rail footer icon button that opens the shared Resource Manager dialog. */
+export const ResourcesTriggerButton = forwardRef<HTMLButtonElement, {
+  connection: HubConnection;
+  visible: boolean;
+  open: boolean;
+  controlsId?: string;
+  onOpen: () => void;
+}>(function ResourcesTriggerButton({ connection, visible, open, controlsId, onOpen }, ref) {
+  useLocale();
+  const { snapshot } = useHostResources(connection, visible && !open, POLL_CLOSED_MS);
+  const summaryMem = snapshot ? formatMemoryBytes(snapshot.summary.totalMemoryBytes) : "";
+
+  return (
+    <button
+      ref={ref}
+      type="button"
+      className={`icon-button resources-footer-button${open ? " is-open" : ""}`}
+      aria-haspopup="dialog"
+      aria-expanded={open}
+      aria-controls={open ? controlsId : undefined}
+      aria-label={t("资源")}
+      title={snapshot ? t("资源 · CPU {0} · 内存 {1}", formatCpuPercent(snapshot.summary.totalCpuPercent), summaryMem) : t("资源")}
+      onClick={onOpen}
+    >
+      <Activity size={15} aria-hidden="true" />
+    </button>
+  );
+});
+
+/** Self-contained desktop status bar entry + centered Resource Manager modal dialog. */
 export function DesktopResourcesBar({
   hosts,
   activeHostId,
@@ -569,90 +863,33 @@ export function DesktopResourcesBar({
 }) {
   useLocale();
   const [open, setOpen] = useState(false);
-  const [selectedHostId, setSelectedHostId] = useState(activeHostId);
-  const [sort, setSort] = useState<ResourceSortKey>("memory");
-  const [pendingStop, setPendingStop] = useState<PendingStop>();
-  const [stoppingKey, setStoppingKey] = useState<string>();
-  const [stopNotice, setStopNotice] = useState("");
   const dialogId = useId();
   const triggerRef = useRef<HTMLButtonElement>(null);
+  const anyAvailable = useAnyHostResourcesAvailable(hosts);
+  const activeHost = hosts.find((h) => h.id === activeHostId) ?? hosts[0];
 
   useEffect(() => {
-    if (!open) setSelectedHostId(activeHostId);
-  }, [activeHostId, open]);
-
-  useEffect(() => {
-    if (!visible && open) {
-      setPendingStop(undefined);
-      setOpen(false);
-    }
+    if (!visible && open) setOpen(false);
   }, [visible, open]);
 
-  const targetHost = hosts.find((h) => h.id === selectedHostId) ?? hosts.find((h) => h.id === activeHostId) ?? hosts[0];
-  const { snapshot, loading, error, refresh } = useHostResources(targetHost?.connection, visible, open ? POLL_OPEN_MS : POLL_CLOSED_MS);
-
-  if (!targetHost || !targetHost.connection.state.hostResourcesAvailable) return null;
-
-  const confirmStop = async () => {
-    if (!pendingStop || !targetHost) return;
-    const key = pendingStop.conversationId
-      ? `${pendingStop.botId}:${pendingStop.conversationId}`
-      : `${pendingStop.botId}:pid:${pendingStop.pid ?? 0}`;
-    setStoppingKey(key);
-    setStopNotice("");
-    try {
-      const payload: HostResourceStopRequest = {
-        botId: pendingStop.botId,
-        ...(pendingStop.conversationId ? { conversationId: pendingStop.conversationId } : {}),
-        ...(pendingStop.pid ? { pid: pendingStop.pid } : {}),
-      };
-      await targetHost.connection.stopHostResource(payload);
-      setPendingStop(undefined);
-      setStopNotice(pendingStop.conversationTitle ? t("已请求停止「{0}」中的运行。", pendingStop.conversationTitle) : t("已请求停止该引擎进程。"));
-      setTimeout(refresh, 300);
-    } catch {
-      setStopNotice(t("停止进程失败，请确认此设备具有管理员权限且主机在线。"));
-    } finally {
-      setStoppingKey(undefined);
-    }
-  };
-
-  const summaryMem = snapshot ? formatMemoryBytes(snapshot.summary.totalMemoryBytes) : "";
+  if (!activeHost || (!open && !anyAvailable)) return null;
 
   return (
     <>
-      <button
+      <ResourcesTriggerButton
         ref={triggerRef}
-        type="button"
-        className={`icon-button resources-footer-button${open ? " is-open" : ""}`}
-        aria-haspopup="dialog"
-        aria-expanded={open}
-        aria-controls={open ? dialogId : undefined}
-        aria-label={t("资源")}
-        title={snapshot ? t("资源 · CPU {0} · 内存 {1}", formatCpuPercent(snapshot.summary.totalCpuPercent), summaryMem) : t("资源")}
-        onClick={() => { setStopNotice(""); setOpen(true); }}
-      >
-        <Activity size={15} aria-hidden="true" />
-      </button>
-
+        connection={activeHost.connection}
+        visible={visible}
+        open={open}
+        controlsId={dialogId}
+        onOpen={() => setOpen(true)}
+      />
       {open && (
-        <ResourcesDialog
+        <ResourcesManagerDialog
           id={dialogId}
           hosts={hosts}
-          targetHost={targetHost}
-          onSelectHost={(hostId) => { setStopNotice(""); setSelectedHostId(hostId); }}
-          snapshot={snapshot}
-          loading={loading}
-          error={error}
-          sort={sort}
-          onSortChange={setSort}
-          stopNotice={stopNotice}
-          stoppingKey={stoppingKey}
-          pendingStop={pendingStop}
-          onRequestStop={setPendingStop}
-          onConfirmStop={() => void confirmStop()}
-          onCancelStop={() => { if (!stoppingKey) setPendingStop(undefined); }}
-          onRefresh={refresh}
+          activeHostId={activeHostId}
+          visible={visible}
           onClose={() => setOpen(false)}
           returnFocus={triggerRef}
         />
