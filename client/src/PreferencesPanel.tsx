@@ -25,6 +25,7 @@ import { AudioLines, Bell, Database, FolderOpen, Check, ChevronLeft, ChevronRigh
 import { ConnectionPanel } from "./ConnectionPanel.js";
 import { ScreenControlPanel } from "./ScreenControlPanel.js";
 import { hasScreenViewer } from "./mobile-screen-viewer-transport.js";
+import { HostTerminalSettings } from "./TerminalPanel.js";
 import type { OpenNetwork } from "./network-navigation.js";
 import "./network-settings.css";
 import { CreationDialog } from "./CreationDialog.js";
@@ -140,10 +141,11 @@ export function PreferencesPanel({ connection, preferences, update, close, forge
   const [libraryBusy, setLibraryBusy] = useState(false);
   const [voiceDirty, setVoiceDirty] = useState(false), [voiceBusy, setVoiceBusy] = useState(false);
   const [messageGrantsDirty, setMessageGrantsDirty] = useState(false), [messageGrantsBusy, setMessageGrantsBusy] = useState(false);
+  const [terminalBusy, setTerminalBusy] = useState(false);
   const [deviceDrafts, setDeviceDrafts] = useState<Record<string, boolean>>({});
   const deviceDirty = Object.values(deviceDrafts).some(Boolean);
   const deviceDraftChange = useCallback((id: string, value: boolean) => setDeviceDrafts(previous => previous[id] === value ? previous : { ...previous, [id]: value }), []);
-  const dirty = notificationDirty || deviceDirty || messageGrantsDirty || voiceDirty || backupDirty || engineDirty, settingsBusy = libraryBusy || notificationBusy || messageGrantsBusy || voiceBusy || widgetBusy || backupBusy || engineBusy;
+  const dirty = notificationDirty || deviceDirty || messageGrantsDirty || voiceDirty || backupDirty || engineDirty, settingsBusy = libraryBusy || notificationBusy || messageGrantsBusy || terminalBusy || voiceBusy || widgetBusy || backupBusy || engineBusy;
   const [scan, setScan] = useState(false);
   const [devices, setDevices] = useState<Device[]>([]), [code, setCode] = useState("");
   const [selectedDevice, setSelectedDevice] = useState<string>(), [discardDeviceDraft, setDiscardDeviceDraft] = useState(false);
@@ -555,6 +557,12 @@ export function PreferencesPanel({ connection, preferences, update, close, forge
           </div>
           {!detailDevice && message("devices")}
           {!wizard && message("pair")}
+          <HostTerminalSettings
+            connection={connection}
+            active={section === "devices"}
+            refreshKey={devices.map((device) => `${device.id}:${device.revoked}:${device.name}`).join("|")}
+            busyChange={setTerminalBusy}
+          />
           <MobileLockSettings/>
           {!hostName && <div className="settings-danger">
             <h4>{t("危险操作")}</h4>

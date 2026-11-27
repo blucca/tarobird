@@ -28,7 +28,7 @@ impl Statement {
         match self.action.operation.as_str() {
             "approve" if self.action.target.len() == 8 && self.action.target.bytes().all(|c| c.is_ascii_digit()) => {},
             "revoke" if id(&self.action.target) => {},
-            "network" | "bot-message-grant" | "screen-grant" if digest(&self.action.target) => {},
+            "network" | "bot-message-grant" | "screen-grant" | "terminal-grant" if digest(&self.action.target) => {},
             _ => return Err("invalid_device_action".into()),
         }
         serde_json::to_string(&("tarocub/device-action/v1", &self.hub_public_key, &self.device_id, &self.session_hash,

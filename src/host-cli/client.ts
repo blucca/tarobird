@@ -215,7 +215,7 @@ export class LocalHostClient {
     const raw = await this.request("/api/devices/challenge", "POST", action);
     const statement = boundDeviceActionStatement(raw, { hubPublicKey: this.publicKey, deviceId: this.deviceId, sessionHash: hashSecret(this.#token), action });
     if (statement.expiresAt <= Date.now() || statement.expiresAt > Math.min(this.ready.expiresAt, Date.now() + 31_000)
-      || (action.operation === "network" || action.operation === "bot-message-grant" || action.operation === "screen-grant") && statement.targetDigest !== action.target) throw new HostCliError("device_action_invalid");
+      || (action.operation === "network" || action.operation === "bot-message-grant" || action.operation === "screen-grant" || action.operation === "terminal-grant") && statement.targetDigest !== action.target) throw new HostCliError("device_action_invalid");
     return { nonce: statement.nonce, signature: sign(null, Buffer.from(deviceActionProofText(statement)), this.#key).toString("base64") };
   }
 }
