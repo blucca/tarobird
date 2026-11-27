@@ -147,12 +147,12 @@ export const ConversationList = memo(function ConversationList({ connection, hos
   // A selected topic may remain in a manually folded group. Mode changes and
   // mounted hidden sidebars must not overwrite the owner's disclosure choice.
   const listed = useMemo(
-    () => navigationItems({ connection, bots, conversations: unreadMatch ? unreadMatch.conversations : conversations }, showDisconnectedBots, retainedIds),
-    [connection, bots, conversations, unreadMatch, showDisconnectedBots, retainedIds, showTickets, state.status, state.navigationGraceUntil, state.readOnly, state.closed],
+    () => navigationItems({ connection, bots, conversations: unreadMatch ? unreadMatch.conversations : conversations, activity }, showDisconnectedBots, retainedIds),
+    [connection, bots, conversations, activity, unreadMatch, showDisconnectedBots, retainedIds, showTickets, state.status, state.navigationGraceUntil, state.readOnly, state.closed],
   );
   const hiddenBots = listed.bots.length < bots.length;
   const listedIds = useMemo(() => new Set(listed.conversations.map(chat => chat.id)), [listed.conversations]);
-  const hiddenConversations = listedConversations(conversations).some(chat => !chat.archived && !chat.parentId && !listedIds.has(chat.id));
+  const hiddenConversations = listedConversations(conversations, activity).some(chat => !chat.archived && !chat.parentId && !listedIds.has(chat.id));
   const { active, ordinary, childrenByParent, directByBot } = useMemo(() => {
     const available = listed.conversations.filter((c) => !c.archived && (!c.parentId || !conversationsById.get(c.parentId)?.archived));
     const updated = new Map(available.map((c) => [c.id, activity[c.id]?.at ?? c.createdAt]));

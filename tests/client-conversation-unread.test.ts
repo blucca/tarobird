@@ -39,6 +39,16 @@ it('leaves hidden dispatcher worker conversations out of the badge unless the de
   try { expect(conversationUnreadTotal(chats, state)).toBe(5); } finally { setTicketConversationsVisible(false); }
 });
 
+it('counts a hidden ticket conversation in the badge only while it waits for the owner', () => {
+  const chats = [chat('home'), { ...chat('worker'), hidden: true } as Conversation];
+  const waiting = { home: activity(1), worker: { ...activity(2), attention: { m0: { kind: 'approval' as const, at: 100 } } } };
+  expect(conversationUnreadTotal(chats, waiting)).toBe(3);
+  expect(filterUnreadHostItems(chats, waiting).matchingIds.has('worker')).toBe(true);
+  const answered = { home: activity(1), worker: { ...activity(2), attention: {} } };
+  expect(conversationUnreadTotal(chats, answered)).toBe(1);
+  expect(filterUnreadHostItems(chats, answered).matchingIds.has('worker')).toBe(false);
+});
+
 it('filters unread conversations, bots, groups and retained open chats without including archived or read items', () => {
   const chats = [
     chat('d1', false, undefined, 'direct', ['botA']),

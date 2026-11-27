@@ -13,8 +13,8 @@ export type UnreadHostMatch = {
   groupIds: Set<string>;
 };
 
-function liveUnreadConversations(all: readonly Conversation[]): Conversation[] {
-  const conversations = listedConversations(all);
+function liveUnreadConversations(all: readonly Conversation[], activity: Readonly<Record<string, ConversationActivity>>): Conversation[] {
+  const conversations = listedConversations(all, activity);
   const roots = new Set(conversations.filter(chat => !chat.archived && !chat.parentId).map(chat => chat.id));
   return conversations.filter(chat => !chat.archived && (!chat.parentId || roots.has(chat.parentId)));
 }
@@ -22,10 +22,11 @@ function liveUnreadConversations(all: readonly Conversation[]): Conversation[] {
 /** Count the canonical inbox, independently of search, folding and Bot presence.
  * Archived history retains its unread state for restoration but has no badge.
  * A topic is visible only with its live root; stale activity has no target.
- * Hidden ticket conversations count only while the device lists them. */
+ * Hidden ticket conversations count only while the device lists them or while
+ * they wait for the owner. */
 export function conversationUnreadTotal(all: readonly Conversation[], activity: Readonly<Record<string, ConversationActivity>>): number {
   let count = 0;
-  for (const chat of liveUnreadConversations(all)) {
+  for (const chat of liveUnreadConversations(all, activity)) {
     count += Object.keys(activity[chat.id]?.unread ?? {}).length;
   }
   return count;
@@ -41,7 +42,7 @@ export function filterUnreadHostItems(
   globalPins: readonly string[] = [],
   retainedId?: string,
 ): UnreadHostMatch {
-  const live = liveUnreadConversations(all);
+  const live = liveUnreadConversations(all, activity);
   const globals = new Set(globalPins);
   const matchingIds = new Set<string>();
   for (const chat of live) {

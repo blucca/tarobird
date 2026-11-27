@@ -30,8 +30,8 @@ export function retainsOfflineNavigation(connection: HubConnection): boolean {
 /** A view-only filter. Brief link loss retains last-known visible Bots, without
  * changing their offline status or treating cached presence as reachability.
  * Keep groups/topics and memberless history; never mutate the canonical cache. */
-export function navigationItems(host: Pick<InboxHost, 'connection' | 'bots' | 'conversations' | 'viewingHistory'>, showDisconnectedBots = false, retained?: ReadonlySet<string>) {
-  const conversations = listedConversations(host.conversations);
+export function navigationItems(host: Pick<InboxHost, 'connection' | 'bots' | 'conversations' | 'viewingHistory'> & { activity?: InboxHost['activity'] }, showDisconnectedBots = false, retained?: ReadonlySet<string>) {
+  const conversations = listedConversations(host.conversations, host.activity);
   if (showDisconnectedBots || host.viewingHistory) return { bots: host.bots, conversations };
   const bots = host.connection.state.status === 'online' || retainsOfflineNavigation(host.connection) ? host.bots.filter(bot => !!bot.online) : [];
   const connected = new Set(bots.map(bot => bot.id));
@@ -113,7 +113,7 @@ export function unreadFor(activity: ConversationActivity | undefined): number {
 export function buildConversationRows(hosts: InboxHost[]): InboxRow[] {
   const rows: InboxRow[] = [];
   for (const host of hosts) {
-    const conversations = listedConversations(host.conversations);
+    const conversations = listedConversations(host.conversations, host.activity);
     const botNames = new Map(host.bots.map((bot) => [bot.id, bot.name] as const));
     const pins = new Set(host.pins);
     const globals = new Set(host.globalPins);

@@ -21,7 +21,7 @@ import type { WorkbenchDraft } from "./workbench-draft.js";
 import type { DesignCommentAcceptance } from "./design-comment-delivery.js";
 import { WORKBENCH_DESIGN_CAPABILITY, WORKBENCH_DESIGN_OPEN_CAPABILITY, WORKBENCH_DESIGN_COMMENTS_CAPABILITY, WORKBENCH_DESIGN_HISTORY_CAPABILITY, WORKBENCH_SLIDES_CAPABILITY } from "../../src/client-protocol/workbench-design.js";
 import { DISPATCH_CAPABILITY, DISPATCH_CROSS_HOST_CAPABILITY, dispatchWireRoute, crossHostDispatchGrantCommandSchema, crossHostDispatchGrantsSnapshotSchema, type CrossHostDispatchGrantCommand } from "../../src/client-protocol/dispatch.js";
-import { ticketConversationsVisible } from "./dispatcher.js";
+import { notifiesWhileHidden } from "./dispatcher.js";
 import { screenStatusSchema, screenJoinSchema, screenConfigureSchema, screenConfigureText, screenPolicySchema, REMOTE_SCREEN_FLIGHT_CAPABILITY, REMOTE_SCREEN_QUALITY_CAPABILITY, REMOTE_SCREEN_UDP_BOOST_CAPABILITY, type ScreenConfigure } from "../../src/client-protocol/remote-screen.js";
 import { estimateServerTimeOffset } from "../../src/client-protocol/screen-metrics.js";
 import {
@@ -715,7 +715,7 @@ export class HubConnection {
             const preferences = this.state.notifications?.preferences;
             // Topic and preview choices are the same device preferences the Hub applies to phone pushes.
             const notice = preferences?.enabled ? desktopNotice(message, preferences) : undefined;
-            if ((!this.syncing || this.independentSync && !this.pendingSync.has(message.conversationId)) && preferences && notice && !quietNow(preferences, Date.now()) && !this.state.notifications?.mutedConversations?.includes(message.conversationId) && (document.visibilityState !== "visible" || !document.hasFocus()) && ["macos", "windows"].includes(nativePlatform()) && (ticketConversationsVisible() || !(await this.cache.conversation(message.conversationId).catch(() => undefined))?.hidden) && await this.cache.claimNotification(message.id)) {
+            if ((!this.syncing || this.independentSync && !this.pendingSync.has(message.conversationId)) && preferences && notice && !quietNow(preferences, Date.now()) && !this.state.notifications?.mutedConversations?.includes(message.conversationId) && (document.visibilityState !== "visible" || !document.hasFocus()) && ["macos", "windows"].includes(nativePlatform()) && (notifiesWhileHidden(message) || !(await this.cache.conversation(message.conversationId).catch(() => undefined))?.hidden) && await this.cache.claimNotification(message.id)) {
               const title = notice.preview ? (await this.cache.conversation(message.conversationId).catch(() => undefined))?.title : undefined;
               const resolve = () => {
                 const current = this.state.notifications;

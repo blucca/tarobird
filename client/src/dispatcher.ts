@@ -1,5 +1,6 @@
 import { useSyncExternalStore } from "react";
 import type { Conversation, Message } from "../../src/client-protocol/index.js";
+import { messageAttention } from "./attention.js";
 
 /** dispatch.v1: chosen only at creation. Other or unknown roles display as ordinary Bots. */
 export const isDispatcher = (bot?: { role?: string }) => bot?.role === "dispatcher";
@@ -18,10 +19,24 @@ export function setTicketConversationsVisible(value: boolean): void {
 export const ticketConversationsVisible = snapshot;
 export function useTicketConversationsVisible(): boolean { return useSyncExternalStore(subscribe, snapshot, snapshot); }
 
+/** A hidden ticket conversation with an open approval or question for the
+ * owner: it is listed, counted and notified like any other while it waits. */
+export function waitsForOwner(activity: { attention?: Record<string, unknown> } | undefined): boolean {
+  return !!activity?.attention && Object.keys(activity.attention).length > 0;
+}
+
+/** Whether `message` may raise a desktop notice even in a hidden ticket
+ * conversation: the device lists those, or it is an open approval or question
+ * (the same request that keeps the conversation listed while it waits). */
+export function notifiesWhileHidden(message: Message): boolean {
+  return visible || !!messageAttention(message);
+}
+
 /** Lists, counts, pickers and avatar signals skip a dispatcher's hidden worker
- * conversations. Opening one by ID (the ticket panel) still uses the full cache. */
-export function listedConversations<T extends Pick<Conversation, "hidden">>(conversations: readonly T[]): T[] {
-  return visible || !conversations.some(chat => chat.hidden) ? conversations as T[] : conversations.filter(chat => !chat.hidden);
+ * conversations, unless one waits for the owner (with `activity` given).
+ * Opening one by ID (the ticket panel) still uses the full cache. */
+export function listedConversations<T extends Pick<Conversation, "hidden" | "id">>(conversations: readonly T[], activity?: Readonly<Record<string, { attention?: Record<string, unknown> } | undefined>>): T[] {
+  return visible || !conversations.some(chat => chat.hidden) ? conversations as T[] : conversations.filter(chat => !chat.hidden || waitsForOwner(activity?.[chat.id]));
 }
 
 /** A Host notice in a dispatcher's conversation (a ticket settled or resumed).

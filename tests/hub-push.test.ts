@@ -69,6 +69,27 @@ test.each(["partial", "interrupted", "stopped", "error"])("a %s run cannot send 
   expect(JSON.parse(row!.payload_json)).toMatchObject({ messageId: result.id, kind: "error", body: "「Private conversation」 · Alpha\n任务未完成：点按查看当前进展。" });
 });
 
+test("a hidden ticket conversation pushes an open approval like an ordinary one, and nothing else", async () => {
+  const approval = (disabled = false) => [{ type: "card" as const, elements: [{ type: "markdown" as const, text: "Run the build?" }, { type: "button" as const, text: "Allow", actionId: "allow", disabled, value: { requestId: "req_1", cctb_lark: "approval", decision: "allow_once" } }] }];
+  const payloads = async () => (await store.db.all<{ payload_json: string }>("SELECT payload_json FROM push_outbox ORDER BY rowid")).map(row => JSON.parse(row.payload_json) as PushPayload);
+  const ordinary = await store.publishBotMessage("alpha", { conversationId: conversation, status: "complete", blocks: approval() });
+  const [visible] = await payloads();
+  expect(visible).toMatchObject({ messageId: ordinary.id, kind: "action" });
+  await store.db.run("DELETE FROM push_outbox"); await store.db.run("DELETE FROM push_receipts");
+  await store.db.run("UPDATE conversations SET hidden=1 WHERE id=?", [conversation]);
+  // An ordinary answer in the hidden conversation still reports through the dispatcher only.
+  await message("worker progress");
+  expect(await payloads()).toEqual([]);
+  const waiting = await store.publishBotMessage("alpha", { conversationId: conversation, status: "complete", blocks: approval() });
+  const [hidden] = await payloads();
+  // Same fields and wording as the ordinary approval push: kind, body shape, conversation and message only.
+  expect(Object.keys(hidden!).sort()).toEqual(Object.keys(visible!).sort());
+  expect(hidden).toMatchObject({ messageId: waiting.id, conversationId: conversation, kind: "action", body: visible!.body });
+  // Once answered (actions disabled) nothing more is pushed.
+  await store.publishBotMessage("alpha", { id: waiting.id, conversationId: conversation, status: "complete", blocks: approval(true) });
+  expect(await payloads()).toHaveLength(1);
+});
+
 test.each(["thinking", "working", "answering", "waiting_approval", "waiting_answer", "stopping", "delivering"])("an older Gateway's complete envelope during %s waits for the terminal notification", async phase => {
   const summary = { version: 1, id: "run_active", revision: 1, phase, startedAt: 1, updatedAt: 2, count: 0, completed: 0, failed: 0, truncated: false };
   const sent = await store.publishBotMessage("alpha", { conversationId: conversation, status: "complete", blocks: [{ type: "card", elements: [], extra: { nativeRun: summary } }] });
