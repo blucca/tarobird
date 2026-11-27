@@ -3,6 +3,7 @@ import type { Message } from "../../src/client-protocol/index.js";
 export type CachedConversationMessages = {
   messages: Message[];
   revision: number;
+  lineage?: string;
 };
 
 export const DEFAULT_MESSAGE_CACHE_CONVERSATIONS = 16;
@@ -22,6 +23,10 @@ export class ConversationMessageCache {
     private readonly maxMessages = DEFAULT_MESSAGE_CACHE_MAX_MESSAGES,
   ) {}
 
+  inspect(conversationId: string): CachedConversationMessages | undefined {
+    return this.entries.get(conversationId);
+  }
+
   peek(conversationId: string): CachedConversationMessages | undefined {
     const entry = this.entries.get(conversationId);
     if (!entry) return undefined;
@@ -30,7 +35,7 @@ export class ConversationMessageCache {
     return entry;
   }
 
-  set(conversationId: string, messages: Message[], revision = 0): boolean {
+  set(conversationId: string, messages: Message[], revision = 0, lineage?: string): boolean {
     if (messages.length > this.maxMessages) {
       this.invalidate(conversationId);
       return false;
@@ -40,13 +45,20 @@ export class ConversationMessageCache {
       this.totalMessages -= existing.messages.length;
       this.entries.delete(conversationId);
     }
-    this.entries.set(conversationId, { messages, revision });
+    this.entries.set(conversationId, { messages, revision, lineage });
     this.totalMessages += messages.length;
     this.evict(conversationId);
     return true;
   }
 
-  patchMessage(conversationId: string, message: Message): boolean {
+  setRevision(conversationId: string, revision: number, lineage?: string): void {
+    const existing = this.entries.get(conversationId);
+    if (!existing) return;
+    existing.revision = revision;
+    existing.lineage = lineage;
+  }
+
+  patchMessage(conversationId: string, message: Message, revision?: number): boolean {
     const existing = this.entries.get(conversationId);
     if (!existing) return false;
     this.entries.delete(conversationId);
@@ -85,6 +97,7 @@ export class ConversationMessageCache {
       this.totalMessages += 1;
     }
     existing.messages = next;
+    if (revision !== undefined) existing.revision = revision;
     this.evict(conversationId);
     return true;
   }

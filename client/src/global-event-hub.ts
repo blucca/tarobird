@@ -50,14 +50,9 @@ function dispatchBucket(bucket: Bucket, event: Event): void {
 }
 
 function attachBucket(target: GlobalTarget, type: string, bucket: Bucket): void {
-  if (!bucket.capture && !bucket.passive) {
-    target.addEventListener(type, bucket.nativeListener);
-    return;
-  }
-  const options: AddEventListenerOptions = bucket.passive
-    ? { capture: bucket.capture, passive: true }
-    : { capture: bucket.capture };
-  target.addEventListener(type, bucket.nativeListener, options);
+  // Always pass `passive` explicitly so default-passive events (wheel, touchstart,
+  // touchmove on window/document) genuinely become active when passive is false.
+  target.addEventListener(type, bucket.nativeListener, { capture: bucket.capture, passive: bucket.passive });
 }
 
 function detachBucket(target: GlobalTarget, type: string, bucket: Bucket): void {

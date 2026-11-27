@@ -190,10 +190,11 @@ export class ClientCache {
   private releaseSnapshotLease?: () => void;
   private readonly messageCache = new ConversationMessageCache();
   private readonly messageEpochs = new Map<string, number>();
+  private epochSeq = 0;
   private globalMessageEpoch = 0;
   private messageChannel?: BroadcastChannel;
   private messageEpoch(conversationId: string): number {
-    return this.globalMessageEpoch + (this.messageEpochs.get(conversationId) ?? 0);
+    return Math.max(this.globalMessageEpoch, this.messageEpochs.get(conversationId) ?? 0);
   }
   private ensureMessageChannel(): void {
     if (this.closed || this.messageChannel || typeof BroadcastChannel === "undefined") return;
@@ -205,18 +206,18 @@ export class ClientCache {
   }
   private bumpMessageEpoch(conversationId?: string): void {
     if (conversationId === undefined) {
-      this.globalMessageEpoch++;
+      this.globalMessageEpoch = ++this.epochSeq;
       this.messageEpochs.clear();
       this.messageCache.invalidate();
       return;
     }
-    this.messageEpochs.set(conversationId, (this.messageEpochs.get(conversationId) ?? 0) + 1);
+    this.messageEpochs.set(conversationId, ++this.epochSeq);
     this.messageCache.invalidate(conversationId);
   }
-  private notifyMessageMutation(conversationId?: string, patched?: Message): void {
+  private notifyMessageMutation(conversationId?: string, patched?: Message, cursor?: number): void {
     if (patched && conversationId !== undefined) {
-      this.messageEpochs.set(conversationId, (this.messageEpochs.get(conversationId) ?? 0) + 1);
-      this.messageCache.patchMessage(conversationId, patched);
+      this.messageEpochs.set(conversationId, ++this.epochSeq);
+      this.messageCache.patchMessage(conversationId, patched, cursor);
     } else {
       this.bumpMessageEpoch(conversationId);
     }
@@ -285,7 +286,7 @@ export class ClientCache {
     // depend on mounting its ShareInbox. A closed app cleans up on next open.
     void this.identity().then(identity => identity ? this.pruneExpiredShareDrafts(identity) : undefined).catch(() => undefined);
   }
-  close(): void { this.closed = true; const siblings = siblingCaches.get(this.databaseName); siblings?.delete(this); if (siblings && !siblings.size) siblingCaches.delete(this.databaseName); this.messageChannel?.close(); this.messageChannel = undefined; this.messageCache.invalidate(); this.notifyDiffReviews(); this.diffReviewChannel?.close(); this.diffReviewChannel = undefined; this.workbenchChannel?.close(); this.workbenchChannel = undefined; this.designCommentChannel?.close(); this.designCommentChannel = undefined; this.releaseSnapshotLease?.(); void this.db.then((db) => db.close(), () => undefined); }
+  close(): void { this.closed = true; const siblings = siblingCaches.get(this.databaseName); siblings?.delete(this); if (siblings && !siblings.size) siblingCaches.delete(this.databaseName); this.messageChannel?.close(); this.messageChannel = undefined; this.bumpMessageEpoch(undefined); this.notifyDiffReviews(); this.diffReviewChannel?.close(); this.diffReviewChannel = undefined; this.workbenchChannel?.close(); this.workbenchChannel = undefined; this.designCommentChannel?.close(); this.designCommentChannel = undefined; this.releaseSnapshotLease?.(); void this.db.then((db) => db.close(), () => undefined); }
   private ownSnapshot(): Promise<void> {
     if (this.closed) return Promise.reject(new Error("local_cache_closed"));
     if (!navigator.locks) return Promise.resolve();
@@ -659,6 +660,7 @@ export class ClientCache {
     await settings.put(JSON.stringify({ ...(identity?.keyRef ? { keyRef: identity.keyRef } : {}) }), "pendingReset");
     await settings.put(crypto.randomUUID(), "cacheGeneration");
     await tx.done;
+    this.notifyMessageMutation(undefined);
     this.diffReviewsChanged();
     if (identity) clearNoteRecoveries(identity.deviceId);
     if (identity) this.clearSelectionHint(this.selectionHintKey(identity, await this.generation));
@@ -676,6 +678,7 @@ export class ClientCache {
       if (preferences) await settings.put(preferences, "preferences");
       if (generation) await settings.put(generation, "cacheGeneration");
       await tx.done;
+      this.notifyMessageMutation(undefined);
       this.diffReviewsChanged();
     } catch (error) { try { tx.abort(); } catch { /* Already aborted. */ } await tx.done.catch(() => undefined); throw error; }
   }
@@ -1279,11 +1282,23 @@ export class ClientCache {
     const cached = this.messageCache.peek(conversationId);
     if (cached) return cached.messages.slice();
     const epoch = this.messageEpoch(conversationId);
-    const loaded = (await (await this.db).getAllFromIndex("messages", "conversation", conversationId))
+    const tx = (await this.db).transaction(["messages", "cursors", "settings"]);
+    const [rawMessages, rawCursor, rawLineage] = await Promise.all([
+      tx.objectStore("messages").index("conversation").getAll(conversationId),
+      tx.objectStore("cursors").get(conversationId),
+      tx.objectStore("settings").get(`syncLineage:${conversationId}`),
+      tx.done,
+    ]);
+    const cursor = rawCursor ?? 0;
+    const lineage = typeof rawLineage === "string" ? rawLineage : undefined;
+    const loaded = rawMessages
       .sort((a, b) => a.createdAt - b.createdAt)
       .map(stripMessageMeta);
     if (!this.closed && this.messageEpoch(conversationId) === epoch) {
-      this.messageCache.set(conversationId, loaded);
+      const existing = this.messageCache.inspect(conversationId);
+      if (!existing || existing.lineage !== lineage || cursor >= existing.revision) {
+        this.messageCache.set(conversationId, loaded, cursor, lineage);
+      }
     }
     return loaded.slice();
   }
@@ -1420,7 +1435,7 @@ export class ClientCache {
           if (cursor !== state.after || lineage !== state.previousLineage) {
             // A different tab already committed this (or newer) history. Finish
             // our stream without overwriting it or starting a reconnect loop.
-            if (lineage === state.lineage && cursor >= state.seq) { await this.dropSnapshot(tx, this.snapshotOwner); await complete; return true; }
+            if (lineage === state.lineage && cursor >= state.seq) { await this.dropSnapshot(tx, this.snapshotOwner); await complete; this.bumpMessageEpoch(conversationId); return true; }
             throw new Error("snapshot_incomplete");
           }
           // No visible state changes until all frames are present. Replacing
@@ -1485,9 +1500,18 @@ export class ClientCache {
     // Observe transaction failure even when validation rejects before tx.done.
     const complete = tx.done; void complete.catch(() => undefined);
     try {
-      if (expected && await tx.objectStore("settings").get(`syncLineage:${event.conversationId}`) !== expected.lineage) throw new Error("sync_lineage_mismatch");
+      const rawLineage = await tx.objectStore("settings").get(`syncLineage:${event.conversationId}`);
+      const lineage = typeof rawLineage === "string" ? rawLineage : undefined;
+      if (expected && lineage !== expected.lineage) throw new Error("sync_lineage_mismatch");
       const last = await tx.objectStore("cursors").get(event.conversationId) ?? 0;
-      if (event.seq <= last) { await tx.done; return; }
+      if (event.seq <= last) {
+        await complete;
+        const cached = this.messageCache.inspect(event.conversationId);
+        if (!cached || cached.revision !== last || cached.lineage !== lineage) {
+          this.bumpMessageEpoch(event.conversationId);
+        }
+        return;
+      }
       if (event.seq !== last + 1) { tx.abort(); await tx.done.catch(() => undefined); throw new Error("sync_gap"); }
       let applied: Message | undefined, draftChanged = false;
       if (event.kind === "message.stream") {
@@ -1549,10 +1573,20 @@ export class ClientCache {
         if (activity) { const readSeq = event.payload.seq; activity.unread = Object.fromEntries(Object.entries(activity.unread).filter(([, seq]) => seq > readSeq)); await tx.objectStore("activity").put(activity, event.conversationId); }
       }
       await tx.objectStore("cursors").put(event.seq, event.conversationId); await complete;
+      const cached = this.messageCache.inspect(event.conversationId);
+      const cacheMatchesBase = cached !== undefined && cached.revision === last && cached.lineage === lineage;
       if (applied) {
         const clean = stripMessageMeta(applied as Cache["messages"]["value"]);
-        this.notifyMessageMutation(event.conversationId, clean);
+        if (cacheMatchesBase) {
+          this.notifyMessageMutation(event.conversationId, clean, event.seq);
+        } else {
+          this.notifyMessageMutation(event.conversationId);
+        }
         applied = clean;
+      } else if (cacheMatchesBase) {
+        this.messageCache.setRevision(event.conversationId, event.seq, lineage);
+      } else {
+        this.bumpMessageEpoch(event.conversationId);
       }
       if (draftChanged) this.draftsChanged(); return applied;
     } catch (error) { try { tx.abort(); } catch { /* Already completed or aborted. */ } await complete.catch(() => undefined); throw error; }
