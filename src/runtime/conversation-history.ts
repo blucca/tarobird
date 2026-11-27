@@ -59,8 +59,13 @@ export class ConversationHistoryController {
     return !!(this.adapter.getHistoryState && this.sessions.getHistoryBinding && this.sessions.reserveHistory && this.sessions.releaseHistory && this.sessions.finalizeHistory);
   }
 
-  async get(input: ConversationHistoryScope): Promise<HistoryInternalSnapshot> {
+  /** `turnPending`: a turn for this conversation is queued or running. Answer
+   * as when busy, from the binding and the capabilities last read, without the
+   * turn lock or a native read, so a slow read cannot delay that turn. Before
+   * anything is known in this process, read once as usual. */
+  async get(input: ConversationHistoryScope, options: { turnPending?: boolean } = {}): Promise<HistoryInternalSnapshot> {
     if (!this.supported()) return { supported: false };
+    if (options.turnPending && this.known.has(input.conversationKey)) return await this.busySnapshot(input);
     try {
       const snapshot = await this.idleLock(input, () => this.inspect(input));
       this.known.delete(input.conversationKey);
@@ -70,16 +75,18 @@ export class ConversationHistoryController {
       }
       return snapshot;
     } catch (error) {
-      if (error instanceof Error && error.message === "history_busy") {
-        const capabilities = this.known.get(input.conversationKey);
-        // The binding is a store read, not a turn. With it the Hub still lists
-        // this session's anchors, so message entries show disabled as well.
-        const binding = await this.sessions.getHistoryBinding!(input).catch(() => null);
-        return { supported: true, blocked: "busy", ...(capabilities ? { capabilities } : {}),
-          ...(binding?.record.historyGeneration ? { sourceSessionId: binding.record.codexSessionId, bindingGeneration: binding.record.historyGeneration } : {}) };
-      }
+      if (error instanceof Error && error.message === "history_busy") return await this.busySnapshot(input);
       throw error;
     }
+  }
+
+  private async busySnapshot(input: ConversationHistoryScope): Promise<HistoryInternalSnapshot> {
+    const capabilities = this.known.get(input.conversationKey);
+    // The binding is a store read, not a turn. With it the Hub still lists
+    // this session's anchors, so message entries show disabled as well.
+    const binding = await this.sessions.getHistoryBinding!(input).catch(() => null);
+    return { supported: true, blocked: "busy", ...(capabilities ? { capabilities } : {}),
+      ...(binding?.record.historyGeneration ? { sourceSessionId: binding.record.codexSessionId, bindingGeneration: binding.record.historyGeneration } : {}) };
   }
 
   private async inspect(input: ConversationHistoryScope): Promise<HistoryInternalSnapshot> {

@@ -106,7 +106,7 @@ export interface CoreRuntimeChannelLike extends CoreChannelLike {
 }
 
 export interface CoreBridgeLike {
-  getConversationHistory?(input: import("../runtime/conversation-history.js").ConversationHistoryScope): Promise<import("../client-protocol/conversation-history.js").HistoryInternalSnapshot>;
+  getConversationHistory?(input: import("../runtime/conversation-history.js").ConversationHistoryScope, options?: { turnPending?: boolean }): Promise<import("../client-protocol/conversation-history.js").HistoryInternalSnapshot>;
   applyConversationHistory?(input: import("../runtime/conversation-history.js").ConversationHistoryApply): Promise<import("../client-protocol/conversation-history.js").HistoryNativeResult>;
   finalizeConversationHistory?(input: import("../runtime/conversation-history.js").ConversationHistoryFinalize): Promise<{ revision: string }>;
   readAccountQuota?(options: import("../codex/adapter.js").EngineQuotaReadOptions): Promise<import("../codex/adapter.js").EngineQuotaReadResult | undefined>;
@@ -173,6 +173,7 @@ export interface CoreBridgeLike {
     abortSignal?: AbortSignal;
     disableRuntimeTimeout?: boolean;
     onTurnLockWait?: (event: BridgeTurnLockWaitEvent) => void | Promise<void>;
+    onTurnLockAcquired?: (event: { waitedMs: number }) => void | Promise<void>;
     turnPoolWaitNotifyAfterMs?: number;
     onTurnPoolWait?: (event: TurnPoolWaitEvent) => void | Promise<void>;
   }): Promise<{ text: string; nativeGoal?: ClaudeNativeGoalReceipt; appDeliveries?: AppDeliveryReceipt[]; usage?: { inputTokens: number; outputTokens: number; cachedTokens?: number; costUsd?: number } }>;

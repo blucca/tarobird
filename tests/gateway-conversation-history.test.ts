@@ -85,3 +85,29 @@ it("finalizes a release of an operation left unconfirmed, but not while this pro
   await restarted("history.apply", { ...input, operationId: "done" });
   await expect(restarted("history.finalize", { ...input, operationId: "done", result: cancelled })).rejects.toThrow("history_receipt_unconfirmed");
 }, 30_000);
+
+it("answers a snapshot without a native read while a turn is queued, and records it", async () => {
+  const read = { userId: "owner", botId: "bot", conversationId: "chat" };
+  let release!: () => void; const queue = runtime.chatQueue.enqueue(buildCoreConversationKey("chat"), () => new Promise<void>(resolve => { release = resolve; }));
+  await Promise.resolve();
+  bridge.getConversationHistory.mockImplementationOnce(async () => ({ supported: true, blocked: "busy" }) as never);
+  expect(await run("history.snapshot", read)).toMatchObject({ blocked: "busy" });
+  expect(bridge.getConversationHistory).toHaveBeenCalledOnce();
+  expect((bridge.getConversationHistory.mock.calls[0] as unknown[])[1]).toEqual({ turnPending: true });
+  release(); await queue;
+  const events = (await readFile(path.join(directory, "timeline.log.jsonl"), "utf8")).trim().split("\n").map(line => JSON.parse(line));
+  expect(events.map(event => [event.type, event.detail, event.outcome, event.metadata.turnPending])).toEqual([["history.read", "history.snapshot", "busy", true]]);
+});
+
+it("reads natively when idle and records only slow reads", async () => {
+  const read = { userId: "owner", botId: "bot", conversationId: "chat" };
+  expect(await run("history.snapshot", read)).toMatchObject({ supported: true, revision: "revision" });
+  expect((bridge.getConversationHistory.mock.calls[0] as unknown[])[1]).toBeUndefined();
+  const original = bridge.getConversationHistory.getMockImplementation()!;
+  bridge.getConversationHistory.mockImplementationOnce(async (...args: Parameters<typeof original>) => { await new Promise(resolve => setTimeout(resolve, 1_050)); return await original(...args); });
+  await run("history.snapshot", read);
+  const events = (await readFile(path.join(directory, "timeline.log.jsonl"), "utf8")).trim().split("\n").map(line => JSON.parse(line));
+  expect(events).toHaveLength(1);
+  expect(events[0]).toMatchObject({ type: "history.read", detail: "history.snapshot", outcome: "read", metadata: { source: "gateway.history", turnPending: false } });
+  expect(events[0].metadata.durationMs).toBeGreaterThanOrEqual(1_000);
+});

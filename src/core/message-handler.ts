@@ -2409,6 +2409,15 @@ async function runNormalizedCoreMessage(
         }
         await handleEngineEvent(event);
       };
+      const handleTurnLockAcquired = async (event: { waitedMs: number }): Promise<void> => {
+        // Only waits worth explaining; most turns get the lock at once.
+        if (event.waitedMs < 1_000) return;
+        await appendCoreTimelineEvent(input.stateDir, normalized, {
+          type: "engine.lock.acquired",
+          detail: "acquired shared engine session lock",
+          metadata: { waitedMs: event.waitedMs },
+        });
+      };
       const handleTurnLockWait = async (event: BridgeTurnLockWaitEvent): Promise<void> => {
         await appendCoreTimelineEvent(input.stateDir, normalized, {
           type: "engine.lock.waiting",
@@ -2567,6 +2576,7 @@ async function runNormalizedCoreMessage(
           },
           onEngineEvent: handleInitialEngineEvent,
           onTurnLockWait: handleTurnLockWait,
+          onTurnLockAcquired: handleTurnLockAcquired,
           turnPoolWaitNotifyAfterMs: 10_000,
           onTurnPoolWait: handleTurnPoolWait,
           instructions: larkAgentInstructions({

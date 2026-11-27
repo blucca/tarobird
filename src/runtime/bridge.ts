@@ -145,6 +145,8 @@ export interface BridgeAuthorizedMessageInput {
   sessionIdOverride?: string;
   turnLockWaitNotifyAfterMs?: number;
   onTurnLockWait?: (event: BridgeTurnLockWaitEvent) => void | Promise<void>;
+  /** Called once the conversation's turn lock is held, with how long it took. */
+  onTurnLockAcquired?: (event: { waitedMs: number }) => void | Promise<void>;
   turnPoolWaitNotifyAfterMs?: number;
   onTurnPoolWait?: (event: TurnPoolWaitEvent) => void | Promise<void>;
 }
@@ -292,7 +294,7 @@ export class Bridge {
     return surface;
   }
 
-  getConversationHistory(input: ConversationHistoryScope) { return this.history.get(input); }
+  getConversationHistory(input: ConversationHistoryScope, options?: { turnPending?: boolean }) { return this.history.get(input, options); }
   applyConversationHistory(input: ConversationHistoryApply) { return this.history.apply(input); }
   finalizeConversationHistory(input: ConversationHistoryFinalize) { return this.history.finalize(input); }
 
@@ -473,9 +475,15 @@ export class Bridge {
     // the old session id while a chat turn is rebinding it, then run a second turn
     // against the stale id after the existing session lock is released.
     const scopeLockId = bridgeConversationLockId(sessionScope, await this.sessionManager.getLockNamespace?.());
+    const lockRequestedAt = Date.now();
     return await withBridgeTurnLock(
       scopeLockId,
-      async () => await this.handleAuthorizedTurn(input, turnStartedAt, sessionScope, scopeLockId),
+      async () => {
+        // An observer only records timing; it never delays or fails the turn.
+        const waitedMs = Date.now() - lockRequestedAt;
+        void Promise.resolve().then(() => input.onTurnLockAcquired?.({ waitedMs })).catch(() => undefined);
+        return await this.handleAuthorizedTurn(input, turnStartedAt, sessionScope, scopeLockId);
+      },
       {
         signal: input.abortSignal,
         waitNotifyAfterMs: input.turnLockWaitNotifyAfterMs,

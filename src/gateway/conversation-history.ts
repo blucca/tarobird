@@ -13,7 +13,7 @@ import { appendTimelineEventBestEffort } from "../runtime/timeline-events.js";
 
 type Scope = { chatId: number; conversationKey: string; workspaceOverride?: string; isCurrentSession: () => Promise<boolean> };
 type HistoryBridge = CoreBridgeLike & {
-  getConversationHistory?(input: Scope): Promise<HistoryInternalSnapshot>;
+  getConversationHistory?(input: Scope, options?: { turnPending?: boolean }): Promise<HistoryInternalSnapshot>;
   applyConversationHistory?(input: Scope & { operationId: string; expectedRevision: string; action: HistoryAction; nativeAnchor?: Json }): Promise<HistoryNativeResult>;
   finalizeConversationHistory?(input: Scope & { operationId: string; expectedRevision: string; action: HistoryAction; result: HistoryNativeResult; destination?: { conversationId: string; chatId: number; conversationKey: string } }): Promise<{ revision: string }>;
 };
@@ -23,6 +23,8 @@ const applySchema = readSchema.extend({ operationId: idSchema, expectedRevision:
 }).strict();
 const finalizeSchema = applySchema.extend({ result: historyNativeResultSchema, destinationConversationId: idSchema.optional() }).strict();
 const unknown: HistoryNativeResult = { outcome: "unknown", reason: "uncertain" };
+/** Native snapshot reads slower than this are recorded in the timeline. */
+const HISTORY_READ_LOG_AFTER_MS = 1_000;
 const reservationSchema = z.object({ identity: z.string(), workspaceOverride: z.string().optional(), workspaceUnreadable: z.literal(true).optional() }).strict();
 const toolsSchema = z.object({ sourceSessionId: z.string().min(1).max(4096), toolVersion: z.string().min(1).max(256).nullable() }).strict();
 
@@ -51,7 +53,18 @@ export function gatewayConversationHistory(bridge: HistoryBridge, channel: Gatew
       // fallback is resolved by the controller, not copied into every request.
       const workspaceOverride = (await channel.conversationWorkspace?.(p.conversationId))?.trim() || config.workspacePath?.trim();
       if (workspaceOverride) scope.workspaceOverride = workspaceOverride;
-      const result = historyInternalSnapshotSchema.parse(await bridge.getConversationHistory(scope));
+      // A turn already queued or running here takes the same conversation lock
+      // and would wait behind a native read for its whole length; on a large
+      // Claude session under load that is over a minute. Answer busy from what
+      // is known instead. The client reads again once the conversation is idle.
+      const turnPending = busy(), startedAt = Date.now();
+      const result = historyInternalSnapshotSchema.parse(await (turnPending ? bridge.getConversationHistory(scope, { turnPending }) : bridge.getConversationHistory(scope)));
+      const durationMs = Date.now() - startedAt;
+      if (turnPending || durationMs >= HISTORY_READ_LOG_AFTER_MS) {
+        await appendTimelineEventBestEffort(stateDir, { type: "history.read", channel: "gateway", conversationKey, chatId: scope.chatId,
+          outcome: result.revision ? "read" : result.blocked ?? "unavailable", detail: "history.snapshot",
+          metadata: { source: "gateway.history", turnPending, durationMs } }, "history timeline event");
+      }
       if (!await authorized()) throw new Error("history_forbidden");
       if (busy()) result.blocked = "busy"; else if (sideBusy(p.conversationId)) result.blocked = "side_session";
       return z.json().parse(result);
