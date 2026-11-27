@@ -182,7 +182,7 @@ export class HubConnection {
       this.preferred = undefined;
       // A new foreground after a real background transition gets a fresh probe;
       // an earlier wake's timer must not consume that opportunity to answer.
-      if (nativePlatform() === "ios" || nativePlatform() === "android") { this.clearForegroundProbe(); this.awaitingForegroundProbe = false; }
+      if (nativePlatform() === "ios") { this.clearForegroundProbe(); this.awaitingForegroundProbe = false; }
     }
     else if (event?.type === "visibilitychange" || event?.type === "focus") this.resume();
   };
@@ -354,7 +354,7 @@ export class HubConnection {
       // foreground/online signal. Only incoming traffic proves this link alive.
       if (!this.awaitingForegroundProbe) {
         this.lastPong = performance.now(); this.awaitingForegroundProbe = true;
-        if (nativePlatform() === "ios" || nativePlatform() === "android") {
+        if (nativePlatform() === "ios") {
           const ws = this.ws, generation = this.generation, started = performance.now();
           const probe = setTimeout(() => {
             if (this.foregroundProbe !== probe) return;
