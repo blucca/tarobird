@@ -1,6 +1,7 @@
 import { CONVERSATION_HISTORY_CAPABILITY } from "../client-protocol/conversation-history.js";
 import { BOT_MESSAGE_STEER_CAPABILITY, supportsBotMessageSteerEngine } from "../client-protocol/bot-message-delivery.js";
 import { ENGINE_QUOTA_CAPABILITY } from "../client-protocol/engine-quota.js";
+import { ENGINE_QUOTA_ACCOUNT_MATCH_CAPABILITY, QUOTA_ACCOUNT_KEY_HEX } from "../runtime/engine-quota-scope.js";
 import { CONTEXT_USAGE_CAPABILITY } from "../client-protocol/context-usage.js";
 import { workbenchContextSchema, workbenchContextOmittedSchema, type WorkbenchContext, type WorkbenchContextOmitted } from "../client-protocol/workbench.js";
 import { WORKBENCH_DESIGN_OPEN_CAPABILITY } from "../client-protocol/workbench-design.js";
@@ -32,18 +33,19 @@ const READY_TIMEOUT_MS = 15_000;
 const HEARTBEAT_MS = 30_000;
 type Request = z.infer<typeof requestSchema>;
 const inboundSchema = z.discriminatedUnion("type", [
-  z.object({ v: z.literal(1), type: z.literal("instance.ready"), capabilities: z.array(z.string()).optional() }),
+  z.object({ v: z.literal(1), type: z.literal("instance.ready"), capabilities: z.array(z.string()).optional(), quotaProofKey: z.string().regex(QUOTA_ACCOUNT_KEY_HEX).optional() }),
   z.object({ v: z.literal(1), type: z.literal("instance.queue"), conversationId: idSchema }),
   z.object({ v: z.literal(1), type: z.literal("instance.result"), id: idSchema, result: jsonSchema.optional(), error: z.string().optional() }),
   z.object({ v: z.literal(1), type: z.literal("instance.message"), workbench: workbenchContextSchema.optional(), workbenchContextOmitted: workbenchContextOmittedSchema.optional(), message: messageSchema, conversation: conversationSchema, ticketNotice: z.boolean().optional(), agentBus: agentBusDispatchSchema.optional(), groupDiscussion: groupDiscussionDispatchSchema.optional() }),
   z.object({ v: z.literal(1), type: z.literal("instance.call"), id: idSchema, method: z.string(), params: jsonSchema }),
   z.object({ v: z.literal(1), type: z.literal("pong") }),
 ]);
-export interface GatewayTransportOptions { url: string; botId: string; secret: string; stateDir: string; engine?: string; model?: string; effort?: string; onWarning?: (code: string) => void }
+export interface GatewayTransportOptions { url: string; botId: string; secret: string; stateDir: string; engine?: string; model?: string; effort?: string; engineQuotaAccountMatch?: boolean; onWarning?: (code: string) => void }
 export class GatewayTransport {
   private ws?: WebSocket; private stopped = false; private ready = false; private attempt = 0;
   private fragments = false;
   capabilities: readonly string[] = [];
+  quotaProofKey?: Uint8Array;
   private readonly replayed = new WeakMap<WebSocket, Set<string>>();
   private replay: Promise<void> = Promise.resolve();
   private boot?: Promise<void>;
@@ -105,7 +107,7 @@ export class GatewayTransport {
         await this.readStatus();
         // Standalone/manual workers without a Host binding still use their own
         // environment; do not claim that the Host's voice settings apply.
-        if (this.ws === ws && !this.stopped) this.send({ v: 1, type: "instance.hello", capabilities: [ENGINE_QUOTA_CAPABILITY, CONTEXT_USAGE_CAPABILITY, CONVERSATION_HISTORY_CAPABILITY, ...(this.status.engine === "pi" ? [PI_SESSION_CAPABILITY] : []), ...(this.status.engine === "claude" ? [NATIVE_INPUT_CAPABILITY, NATIVE_REVIEW_INPUT_CAPABILITY] : []), ...(process.env.TAROBOT_HOST_DIR ? [VOICE_POLICY_CAPABILITY, WIDGET_POLICY_CAPABILITY] : []), FRAGMENT_CAPABILITY, WORKBENCH_DESIGN_OPEN_CAPABILITY, "conversations.tasks.v1", "bot-messages.v1", ...(supportsBotMessageSteerEngine(this.status.engine) ? [BOT_MESSAGE_STEER_CAPABILITY] : []), AGENT_BUS_WORKER_CAPABILITY, AGENT_BUS_LEGACY_WORKER_CAPABILITY, GROUP_DISCUSSION_WORKER_CAPABILITY, ...((PROMPT_QUEUE_ENGINES as readonly string[]).includes(this.status.engine) ? [PROMPT_QUEUE_CAPABILITY, ...(this.onQueue ? [PROMPT_QUEUE_PULL_CAPABILITY] : [])] : [])], botId: this.options.botId, secret: this.options.secret, ...this.status });
+        if (this.ws === ws && !this.stopped) this.send({ v: 1, type: "instance.hello", capabilities: [ENGINE_QUOTA_CAPABILITY, ...(this.options.engineQuotaAccountMatch ? [ENGINE_QUOTA_ACCOUNT_MATCH_CAPABILITY] : []), CONTEXT_USAGE_CAPABILITY, CONVERSATION_HISTORY_CAPABILITY, ...(this.status.engine === "pi" ? [PI_SESSION_CAPABILITY] : []), ...(this.status.engine === "claude" ? [NATIVE_INPUT_CAPABILITY, NATIVE_REVIEW_INPUT_CAPABILITY] : []), ...(process.env.TAROBOT_HOST_DIR ? [VOICE_POLICY_CAPABILITY, WIDGET_POLICY_CAPABILITY] : []), FRAGMENT_CAPABILITY, WORKBENCH_DESIGN_OPEN_CAPABILITY, "conversations.tasks.v1", "bot-messages.v1", ...(supportsBotMessageSteerEngine(this.status.engine) ? [BOT_MESSAGE_STEER_CAPABILITY] : []), AGENT_BUS_WORKER_CAPABILITY, AGENT_BUS_LEGACY_WORKER_CAPABILITY, GROUP_DISCUSSION_WORKER_CAPABILITY, ...((PROMPT_QUEUE_ENGINES as readonly string[]).includes(this.status.engine) ? [PROMPT_QUEUE_CAPABILITY, ...(this.onQueue ? [PROMPT_QUEUE_PULL_CAPABILITY] : [])] : [])], botId: this.options.botId, secret: this.options.secret, ...this.status });
       }).catch(() => undefined);
     });
     ws.on("message", (data) => {
@@ -126,7 +128,7 @@ export class GatewayTransport {
       // A hello followed immediately by Hub-side dispatch failure is not a
       // recovered connection. Retain backoff across these rapid attachments.
       if (this.ready && !this.deliveryRecoveryAttempt && Date.now() - this.readyAt >= 30_000) this.attempt = 0;
-      this.ready = false; if (this.heartbeat) clearInterval(this.heartbeat);
+      this.ready = false; this.quotaProofKey = undefined; if (this.heartbeat) clearInterval(this.heartbeat);
       if (this.readyTimeout) clearTimeout(this.readyTimeout);
       if (!this.stopped) { this.reconnect = setTimeout(() => this.open(), Math.min(15_000, 250 * 2 ** Math.min(this.attempt++, 6))); this.reconnect.unref(); }
     });
@@ -171,6 +173,7 @@ export class GatewayTransport {
       if (this.ready) return;
       if (this.readyTimeout) clearTimeout(this.readyTimeout);
       this.capabilities = frame.capabilities ?? [];
+      this.quotaProofKey = frame.quotaProofKey ? Buffer.from(frame.quotaProofKey, "hex") : undefined;
       this.ready = true; this.readyAt = Date.now(); this.fragments = frame.capabilities?.includes(FRAGMENT_CAPABILITY) ?? false;
       if (ws) this.replayed.set(ws, new Set());
       this.replay = (async () => { if (ws) for (const request of [...this.journal]) {
@@ -319,7 +322,7 @@ export class GatewayTransport {
   }
   deliverySettled(): void { this.deliveryRecoveryAttempt = 0; this.attempt = 0; }
   async disconnect(): Promise<void> {
-    this.stopped = true; this.ready = false; if (this.reconnect) clearTimeout(this.reconnect); if (this.heartbeat) clearInterval(this.heartbeat);
+    this.stopped = true; this.ready = false; this.quotaProofKey = undefined; if (this.reconnect) clearTimeout(this.reconnect); if (this.heartbeat) clearInterval(this.heartbeat);
     if (this.readyTimeout) clearTimeout(this.readyTimeout);
     this.ws?.terminate(); for (const p of this.pending.values()) p.reject(new Error("gateway_stopped")); this.pending.clear(); this.transient.clear(); await this.boot; await this.diskTail; await this.statusTail;
   }

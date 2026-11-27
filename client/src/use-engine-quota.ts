@@ -3,8 +3,12 @@ import { Capacitor } from "@capacitor/core";
 import { ENGINE_QUOTA_HUB_REFRESH_MS, quotaReadingExpired, type QuotaDirectory, type QuotaScope } from "../../src/client-protocol/engine-quota.js";
 import type { HubConnection } from "./connection.js";
 import { HubHttpError } from "./http-error.js";
+import { groupQuotaScopesByAccount } from "./quota-ui.js";
 
-export const MAX_CONCURRENT_QUOTA_REFRESH = 8;
+/** How many native reads this page runs at once, the automatic ones on opening and manual refreshes together.
+ * Two, as in 1.6.0: a read can start a helper process on the Host, which sets no limit of its own. The queue
+ * below still reads every card without a click; it only takes them two at a time. */
+export const MAX_CONCURRENT_QUOTA_REFRESH = 2;
 const LATE_POLL_INTERVAL_MS = 2_500;
 const LATE_POLL_MAX_MS = 90_000;
 const LATE_POLL_REQUEST_MS = 10_000;
@@ -19,6 +23,31 @@ const request = (timeoutMs = ENGINE_QUOTA_HUB_REFRESH_MS + 2_000): Request => {
 };
 const finish = (value: Request) => clearTimeout(value.timer);
 const cancel = (value: Request) => { finish(value); value.controller.abort(); };
+
+const canonicalGroup = (item: Pick<QuotaScope, "sharing" | "botIds">) =>
+  item.sharing === "verified" ? `verified:${[...new Set(item.botIds)].sort().join(",")}` : "unverified";
+
+function propagateSharedSnapshot(sibling: QuotaScope, refreshed: QuotaScope): QuotaScope {
+  return {
+    id: sibling.id,
+    revision: sibling.revision,
+    engine: sibling.engine,
+    label: sibling.label,
+    botIds: sibling.botIds,
+    sharing: sibling.sharing,
+    capability: sibling.capability,
+    authMode: refreshed.authMode,
+    state: refreshed.state,
+    availability: refreshed.availability,
+    pools: refreshed.pools,
+    constraints: refreshed.constraints,
+    ...(refreshed.reason !== undefined ? { reason: refreshed.reason } : {}),
+    ...(refreshed.observedAt !== undefined ? { observedAt: refreshed.observedAt } : {}),
+    ...(refreshed.lastAttemptAt !== undefined ? { lastAttemptAt: refreshed.lastAttemptAt } : {}),
+    ...(refreshed.nextRefreshAt !== undefined ? { nextRefreshAt: refreshed.nextRefreshAt } : {}),
+    ...(refreshed.help !== undefined ? { help: refreshed.help } : {}),
+  };
+}
 
 export function shouldAutoRefreshScope(scope: QuotaScope, now: number): boolean {
   if (scope.capability.mode !== "active") return false;
@@ -74,6 +103,14 @@ export async function drainBoundedQueue<T>(
     }
   };
   await Promise.all(Array.from({ length: workers }, () => worker()));
+}
+
+/** One automatic read per card that lacks fresh data. A card is what the page shows: Bots confirmed to share an
+ * account are one card, read once through the reading the card displays, exactly as its Refresh button does. */
+export function autoRefreshQueue(scopes: readonly QuotaScope[], now: number): { scope: QuotaScope; group: string[] }[] {
+  return groupQuotaScopesByAccount(scopes, { now })
+    .filter(card => shouldAutoRefreshScope(card.primary, now))
+    .map(card => ({ scope: card.primary, group: card.scopes.map(item => item.id) }));
 }
 
 /** Quota values live only in the currently authorized settings view. Opening
@@ -180,7 +217,7 @@ export function useEngineQuota(connection: HubConnection, options: { userId?: st
     poll.timer = setTimeout(() => void tick(), LATE_POLL_INTERVAL_MS);
   }, [connection, userId, clearLatePoll, stop]);
 
-  const refreshRef = useRef<(scope: QuotaScope) => Promise<void>>(async () => undefined);
+  const refreshRef = useRef<(scope: QuotaScope, groupScopeIds?: readonly string[]) => Promise<void>>(async () => undefined);
 
   const readDirectory = useCallback(async (notice?: string) => {
     if (!current.current.allowed) return;
@@ -201,11 +238,10 @@ export function useEngineQuota(connection: HubConnection, options: { userId?: st
     } finally { finish(operation); if (directoryRequest.current === operation) directoryRequest.current = undefined; }
     if (loaded && notice !== "changed" && generation === version.current && current.current.allowed) {
       const now = Date.now() + (connection.state.serverTimeOffset ?? 0);
-      const queue = loaded.scopes.filter(scope => shouldAutoRefreshScope(scope, now));
       void drainBoundedQueue(
-        queue,
+        autoRefreshQueue(loaded.scopes, now),
         MAX_CONCURRENT_QUOTA_REFRESH,
-        scope => refreshRef.current(scope),
+        item => refreshRef.current(item.scope, item.group),
         () => generation === version.current && current.current.allowed,
       );
     }
@@ -215,19 +251,53 @@ export function useEngineQuota(connection: HubConnection, options: { userId?: st
     if (allowed) void readDirectory();
     return stop;
   }, [connection, userId, owner, supported, active, visible, online, allowed, stop, readDirectory]);
-  async function refresh(scope: QuotaScope) {
-    if (!current.current.allowed || directoryRequest.current || scopes.current.has(scope.id) || scopes.current.size >= MAX_CONCURRENT_QUOTA_REFRESH) return;
+  async function refresh(scope: QuotaScope, groupScopeIds?: readonly string[]) {
+    const memberIds = groupScopeIds?.length ? [...new Set([scope.id, ...groupScopeIds])] : [scope.id];
+    if (!current.current.allowed || directoryRequest.current || memberIds.some(id => scopes.current.has(id)) || scopes.current.size >= MAX_CONCURRENT_QUOTA_REFRESH) return;
     const before = viewRef.current;
     if (before.connection !== connection || before.userId !== userId || before.error === "permission" || before.directory?.scopes.find(value => value.id === scope.id)?.revision !== scope.revision) return;
-    clearLatePoll(scope.id);
+    for (const id of memberIds) clearLatePoll(id);
     const generation = version.current, operation = request(); scopes.current.set(scope.id, operation);
-    setView(previous => ({ ...previous, busy: [...previous.busy, scope.id], waitingLate: previous.waitingLate.filter(id => id !== scope.id), errors: { ...previous.errors, [scope.id]: "" }, notice: undefined }));
+    setView(previous => {
+      const nextErrors = { ...previous.errors };
+      for (const id of memberIds) nextErrors[id] = "";
+      return { ...previous, busy: [...previous.busy, scope.id], waitingLate: previous.waitingLate.filter(id => !memberIds.includes(id)), errors: nextErrors, notice: undefined };
+    });
     try {
       const value = await connection.refreshEngineQuota(scope, operation.controller.signal);
       if (generation !== version.current || scopes.current.get(scope.id) !== operation) return;
+      const wasMerged = memberIds.length > 1 || (scope.sharing === "verified" && scope.botIds.length > 1);
+      const membershipChanged = canonicalGroup(scope) !== canonicalGroup(value);
+      const nowMerged = value.sharing === "verified" && value.botIds.length > 1;
+      if (wasMerged && value.reason === "auth_changed") {
+        // Reload the directory so every sibling Bot re-verifies its auth revision and sharing.
+        void readDirectory("changed");
+        return;
+      }
+      if ((wasMerged && (value.state === "login_required" || membershipChanged)) || (!wasMerged && nowMerged)) {
+        setView(previous => previous.directory?.scopes.find(item => item.id === scope.id)?.revision !== scope.revision ? previous
+          : { ...previous, directory: { ...previous.directory, scopes: previous.directory.scopes.map(item => item.id === scope.id ? value : item) } });
+        void readDirectory();
+        return;
+      }
+      const peerIds = new Set(memberIds.filter(id => id !== scope.id));
       // A directory refresh or authorization change can retire this exact card.
-      setView(previous => previous.directory?.scopes.find(item => item.id === scope.id)?.revision !== scope.revision ? previous
-        : { ...previous, directory: { ...previous.directory, scopes: previous.directory.scopes.map(item => item.id === scope.id ? value : item) } });
+      setView(previous => {
+        if (previous.directory?.scopes.find(item => item.id === scope.id)?.revision !== scope.revision) return previous;
+        return {
+          ...previous,
+          directory: {
+            ...previous.directory,
+            scopes: previous.directory.scopes.map(item => {
+              if (item.id === scope.id) return value;
+              if (wasMerged && peerIds.has(item.id) && canonicalGroup(item) === canonicalGroup(value)) {
+                return propagateSharedSnapshot(item, value);
+              }
+              return item;
+            }),
+          },
+        };
+      });
       // Slow Claude `get_usage` keeps running in the background and saves its late answer on the Host.
       // Watch the cache briefly instead of showing a timeout error right away.
       if (value.reason === "timeout" && value.engine === "claude" && value.revision === scope.revision) {

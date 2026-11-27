@@ -95,10 +95,11 @@ test("desktop: ring and battery sit left of the model controls, each only when r
     const context = panel.getByRole("region", { name: "上下文", exact: true }), limits = panel.getByRole("region", { name: "额度 · Codex", exact: true });
     await expect(context).toContainText("62%"); await expect(context).toContainText("已用 76k / 200k"); await expect(context).toContainText("用到约 84% 时自动压缩");
     await expect(limits.locator(".usage-window")).toHaveCount(2);
-    await expect(limits.locator(".usage-window").nth(0)).toContainText("2 小时"); await expect(limits.locator(".usage-window").nth(0)).toContainText("80%");
-    await expect(limits.locator(".usage-window").nth(1)).toContainText("5 天"); await expect(limits.locator(".usage-window").nth(1)).toContainText("90%");
-    await expect(limits.locator(".usage-window").nth(1)).not.toContainText("7 天");
-    await expect(limits.locator(".usage-window").nth(0)).toContainText(/\d{2}:\d{2} 重置/); await expect(limits.locator(".usage-window").nth(1)).toContainText(/\d+月\d+日 \d{2}:\d{2} 重置/);
+    // The window keeps its name (#77); the time left is a row of its own, counted from the reset stamp (5 days here, not the window's 7).
+    await expect(limits.locator(".usage-window").nth(0)).toContainText("5 小时窗口"); await expect(limits.locator(".usage-window").nth(0)).toContainText("80%");
+    await expect(limits.locator(".usage-window").nth(1)).toContainText("周额度（7 天）"); await expect(limits.locator(".usage-window").nth(1)).toContainText("90%");
+    await expect(limits.locator(".usage-window").nth(0)).toContainText(/小时.*重置|分钟后重置/); await expect(limits.locator(".usage-window").nth(1)).toContainText(/\d+ 天(?:\s*\d+\s*小时)?后重置/);
+    await expect(limits.locator(".usage-window").nth(1).locator(".usage-reset-row")).toContainText("5 天后重置");
     await expect(panel.getByRole("meter", { name: "上下文可用", exact: true })).toHaveAttribute("aria-valuenow", "62");
     await expect(panel).toContainText(/\d{2}:\d{2} 读取/);
     expect(`${await indicators.innerText()}${await panel.innerText()}`).not.toContain("剩");
@@ -228,7 +229,7 @@ test("phone: nothing beside the composer and no context; quota in the more sheet
     await row.click();
     const details = page.getByRole("dialog", { name: "额度", exact: true });
     await expect(details.getByRole("region", { name: "额度 · Codex", exact: true }).locator(".usage-window")).toHaveCount(2);
-    await expect(details).toContainText("2 小时"); await expect(details).toContainText("5 天"); await expect(details).not.toContainText("7 天"); await expect(details).not.toContainText("上下文");
+    await expect(details).toContainText("5 小时窗口"); await expect(details).toContainText("周额度（7 天）"); await expect(details.locator(".usage-reset-row").nth(1)).toContainText("5 天后重置"); await expect(details).not.toContainText("上下文");
     expect(await details.innerText()).not.toContain("剩");
     await page.screenshot({ path: info.outputPath("phone-details.png"), animations: "disabled" });
     await details.getByRole("button", { name: "关闭额度", exact: true }).click(); await expect(details).toBeHidden();
@@ -413,12 +414,47 @@ test("Kimi conversation UsageDetails separates Monthly vs Coding 30-day rows and
     const panel = page.getByRole("group", { name: "上下文与额度", exact: true });
     const rows = panel.getByRole("region", { name: "额度 · Kimi Code", exact: true }).locator(".usage-window");
     await expect(rows).toHaveCount(4);
-    await expect(rows.nth(0)).toContainText("5 小时");
-    await expect(rows.nth(1)).toContainText("7 天");
-    await expect(rows.nth(2)).toContainText("30 天");
-    await expect(rows.nth(2)).not.toContainText("编程 · 30 天");
-    await expect(rows.nth(3)).toContainText("编程 · 30 天");
+    // Window names after #77; the monthly total and the coding window stay two rows with two names.
+    await expect(rows.locator(".usage-window-label")).toHaveText(["5 小时窗口", "周额度（7 天）", "30 天窗口", "编程 · 30 天窗口"]);
   } finally {
     await page.close(); await gateway.disconnect(); await hub.close(); await rm(root, { recursive: true, force: true });
   }
+});
+
+test("in-chat quota details tick live countdowns and honor serverTimeOffset", async ({ page }) => {
+  // Simulate Host clock 1 hour ahead of browser clock
+  const hostAheadMs = 3_600_000;
+  await page.routeWebSocket("**/ws", socket => {
+    const upstream = socket.connectToServer();
+    upstream.onMessage(message => {
+      if (typeof message !== "string") return socket.send(message);
+      const frame = JSON.parse(message);
+      if (frame.type === "ready" && typeof frame.serverTime === "number") {
+        frame.serverTime += hostAheadMs;
+      }
+      socket.send(JSON.stringify(frame));
+    });
+  });
+  const f = await fixture(page);
+  try {
+    // Primary resets at browserNow + 1h + 64.5s => Host remaining is ~64.5s ("2 分钟后重置", ticking to "1 分钟后重置" within 8s)
+    // Secondary resets at browserNow + 3h => Host remaining is ~2h ("2 小时后重置", not skewed "3 小时后重置")
+    f.readings.value = {
+      limits: [
+        { id: "primary", used: 20, period: 18_000, resetHours: (hostAheadMs + 64_500) / 3_600_000 },
+        { id: "secondary", used: 10, period: 604_800, resetHours: (hostAheadMs + 2 * 3_600_000) / 3_600_000 },
+      ],
+    };
+    const ws = workspace(page), indicators = ws.locator(".usage-indicators");
+    await selectConversation(page, "有读数");
+    await expect(indicators.locator("[data-usage=quota]")).toHaveText("80%");
+    await indicators.click();
+    const panel = page.getByRole("group", { name: "上下文与额度", exact: true });
+    await expect(panel).toBeVisible();
+    const windows = panel.locator(".usage-window");
+    await expect(windows.nth(0)).toContainText("2 分钟后重置");
+    await expect(windows.nth(1)).toContainText("2 小时后重置");
+    // While the popover stays open, its live timer ticks down from 2 min to 1 min without reopening
+    await expect(windows.nth(0)).toContainText("1 分钟后重置", { timeout: 8_000 });
+  } finally { await f.dispose(); }
 });

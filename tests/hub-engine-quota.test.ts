@@ -228,3 +228,105 @@ it("CLI notes explain why each Bot has no current reading, how to refresh it and
   expect(notes.filter(line => line.includes("官方查看")).length).toBeGreaterThan(0);
   expect(notes.at(-1)).toMatch(/^kimi Bot, kimi_key Bot, kimi_404 Bot: 官方查看/);
 });
+
+it("matches same-account Bots via Hub-private accountProof without leaking proofs or overloading revision", async () => {
+  const keyA = {}, keyB = {}, keyC = {};
+  const proofA = "1".repeat(64), proofC = "2".repeat(64);
+  const proofs = new Map<string, string | undefined>([["bot_a", proofA], ["bot_b", proofA], ["bot_c", proofC]]);
+  const proofStore = new Map();
+  let botBOnline = true;
+  const quotas = hubEngineQuotas({
+    bots: async () => [
+      { id: "bot_a", name: "Bot A", engine: "codex" },
+      { id: "bot_b", name: "Bot B", engine: "codex" },
+      { id: "bot_c", name: "Bot C", engine: "codex" },
+    ],
+    connection: id => id === "bot_a"
+      ? { key: keyA, supported: true, ready: true }
+      : id === "bot_b"
+        ? (botBOnline ? { key: keyB, supported: true, ready: true } : undefined)
+        : { key: keyC, supported: true, ready: true },
+    validate: async () => undefined,
+    call: async id => ({
+      scopeId: id,
+      revision: `rev_${id}`,
+      value: {
+        ...unavailableQuota("codex", "not_loaded"),
+        state: "ready",
+        reason: undefined,
+        observedAt: new Date(2000).toISOString(),
+        id,
+        revision: `rev_${id}`,
+        engine: "codex",
+        label: id,
+        botIds: [id],
+        sharing: "unverified",
+      },
+    }),
+    accountProof: async id => proofs.get(id),
+    proofStore,
+  });
+
+  const directory = await quotas.directory();
+  expect(JSON.stringify(directory)).not.toContain(proofA);
+  expect(JSON.stringify(directory)).not.toContain(proofC);
+  expect(directory.scopes.map(s => ({ id: s.id, revision: s.revision, sharing: s.sharing, botIds: s.botIds }))).toEqual([
+    { id: "bot_a", revision: "rev_bot_a", sharing: "verified", botIds: ["bot_a", "bot_b"] },
+    { id: "bot_b", revision: "rev_bot_b", sharing: "verified", botIds: ["bot_a", "bot_b"] },
+    { id: "bot_c", revision: "rev_bot_c", sharing: "verified", botIds: ["bot_c"] },
+  ]);
+
+  // Single-scope refresh preserves verified peer membership while peer stays connected, and drops it if peer disconnects
+  const refreshed = await quotas.scope("bot_a", true, "rev_bot_a");
+  expect(refreshed).toMatchObject({ id: "bot_a", sharing: "verified", botIds: ["bot_a", "bot_b"] });
+  botBOnline = false;
+  const afterDisconnect = await quotas.scope("bot_a", true, "rev_bot_a");
+  expect(afterDisconnect).toMatchObject({ id: "bot_a", sharing: "verified", botIds: ["bot_a"] });
+});
+
+it("keeps verified sharing when a worker returns stale+timeout with an unchanged valid proof, and clears it on auth_changed", async () => {
+  const keyA = {}, keyB = {};
+  const sharedProof = "3".repeat(64);
+  const proofStore = new Map();
+  let mode: "ready" | "timeout" | "auth_changed" = "ready";
+  const quotas = hubEngineQuotas({
+    bots: async () => [
+      { id: "bot_a", name: "Bot A", engine: "codex" },
+      { id: "bot_b", name: "Bot B", engine: "codex" },
+    ],
+    connection: id => ({ key: id === "bot_a" ? keyA : keyB, supported: true, ready: true }),
+    validate: async () => undefined,
+    call: async id => {
+      const base = {
+        ...unavailableQuota("codex", "not_loaded"),
+        state: "ready" as const,
+        reason: undefined,
+        observedAt: new Date(2000).toISOString(),
+        id,
+        revision: `rev_${id}`,
+        engine: "codex" as const,
+        label: id,
+        botIds: [id],
+        sharing: "unverified" as const,
+      };
+      if (id === "bot_a" && mode === "timeout") {
+        return { scopeId: id, revision: `rev_${id}`, value: { ...base, state: "stale" as const, reason: "timeout" as const } };
+      }
+      if (id === "bot_a" && mode === "auth_changed") {
+        return { scopeId: id, revision: "rev_bot_a_new", value: { ...unavailableQuota("codex", "auth_changed"), id, revision: "rev_bot_a_new", engine: "codex" as const, label: id, botIds: [id], sharing: "unverified" as const } };
+      }
+      return { scopeId: id, revision: `rev_${id}`, value: base };
+    },
+    accountProof: async () => sharedProof,
+    proofStore,
+  });
+
+  await quotas.directory();
+  mode = "timeout";
+  const timedOut = await quotas.scope("bot_a", true, "rev_bot_a");
+  expect(timedOut).toMatchObject({ id: "bot_a", state: "stale", reason: "timeout", sharing: "verified", botIds: ["bot_a", "bot_b"] });
+
+  mode = "auth_changed";
+  const changed = await quotas.scope("bot_a", true, "rev_bot_a");
+  expect(changed).toMatchObject({ id: "bot_a", reason: "auth_changed", sharing: "unverified", botIds: ["bot_a"] });
+});

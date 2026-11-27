@@ -1742,7 +1742,7 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
   const [quotaDetails, setQuotaDetails] = useState(false);
   useEffect(() => { setQuotaDetails(false); }, [current?.id]);
   const openQuotaDetails = () => { setChatActions(false); usage.readForDetails(); setQuotaDetails(true); };
-  const usageIndicators = !phone && usageBot && <UsageIndicators key={`usage:${connection.identity.hubPublicKey}:${current?.id}:${usageBot.id}`} context={usage.context} quota={usage.quota} onOpen={usage.readForDetails}/>;
+  const usageIndicators = !phone && usageBot && <UsageIndicators key={`usage:${connection.identity.hubPublicKey}:${current?.id}:${usageBot.id}`} context={usage.context} quota={usage.quota} serverTimeOffset={state.serverTimeOffset} onOpen={usage.readForDetails}/>;
   // Phone: nothing beside the composer. The battery alone, without a number, sits in the header whenever the
   // quota can be read: under the computer's name when several are paired, by itself otherwise.
   const phoneQuota = phone ? usage.quota : undefined;
@@ -2126,7 +2126,7 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
   {turnStop.dialog}
   <ConversationHistoryDialog history={history}/>
   {quotaDetails && <CreationDialog title={t("额度")} closeLabel={t("关闭额度")} returnFocus={chatMoreTrigger} close={() => setQuotaDetails(false)}>
-    <div className="usage-sheet">{usage.quota ? <UsageDetails quota={usage.quota}/> : <p className="usage-note" role="status">{t("现在读不到额度")}</p>}</div>
+    <div className="usage-sheet">{usage.quota ? <UsageDetails quota={usage.quota} serverTimeOffset={state.serverTimeOffset}/> : <p className="usage-note" role="status">{t("现在读不到额度")}</p>}</div>
   </CreationDialog>}
   {chatActions && <CreationDialog title={t("聊天操作")} closeLabel={t("关闭聊天操作")} returnFocus={chatMoreTrigger} close={() => setChatActions(false)}>
     {!!replying && phoneTurnActions}

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { QuotaScope } from "../../src/client-protocol/engine-quota.js";
 import { ENGINE_QUOTA_UI, engineQuotaPageVisible, startingSettingsSection } from "../src/engine-quota-feature.js";
-import { drainBoundedQueue, evaluateLatePoll, MAX_CONCURRENT_QUOTA_REFRESH, shouldAutoRefreshScope } from "../src/use-engine-quota.js";
+import { autoRefreshQueue, drainBoundedQueue, evaluateLatePoll, MAX_CONCURRENT_QUOTA_REFRESH, shouldAutoRefreshScope } from "../src/use-engine-quota.js";
 
 const BASE_NOW = Date.parse("2026-11-26T10:00:00Z");
 const iso = (deltaMs: number) => new Date(BASE_NOW + deltaMs).toISOString();
@@ -63,6 +63,28 @@ describe("shouldAutoRefreshScope", () => {
     expect(shouldAutoRefreshScope(makeScope({ state: "offline", reason: "offline" }), BASE_NOW)).toBe(false);
     expect(shouldAutoRefreshScope(makeScope({ state: "login_required", reason: "login_required" }), BASE_NOW)).toBe(false);
     expect(shouldAutoRefreshScope(makeScope({ state: "unavailable", reason: "host_upgrade_required" }), BASE_NOW)).toBe(false);
+  });
+});
+
+describe("autoRefreshQueue", () => {
+  it("starts one read per card: Bots confirmed on one account are read once, through the reading their card shows", () => {
+    const shared = { engine: "codex" as const, sharing: "verified" as const, botIds: ["coder", "reviewer"], reason: undefined };
+    const scopes = [
+      makeScope({ ...shared, id: "coder", revision: "coder_rev", state: "stale", observedAt: iso(-3_600_000) }),
+      makeScope({ ...shared, id: "reviewer", revision: "reviewer_rev", state: "stale", observedAt: iso(-1_800_000) }),
+      makeScope({ id: "writer" }),
+      makeScope({ id: "fresh", revision: "fresh_rev", state: "ready", reason: undefined, observedAt: iso(-10_000) }),
+      makeScope({ id: "research", revision: "research_rev", engine: "kimi", capability: { mode: "unsupported" }, state: "unsupported", reason: "not_adapted" }),
+    ];
+    expect(autoRefreshQueue(scopes, BASE_NOW).map(item => [item.scope.id, item.group])).toEqual([
+      ["reviewer", ["coder", "reviewer"]],
+      ["writer", ["writer"]],
+    ]);
+    // A shared card whose newest reading is still fresh is not read again for its older member.
+    const settled = [scopes[0]!, makeScope({ ...shared, id: "reviewer", revision: "reviewer_rev", state: "ready", observedAt: iso(-10_000) })];
+    expect(autoRefreshQueue(settled, BASE_NOW)).toEqual([]);
+    // The page takes the queue two at a time.
+    expect(MAX_CONCURRENT_QUOTA_REFRESH).toBe(2);
   });
 });
 

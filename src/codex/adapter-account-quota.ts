@@ -7,7 +7,7 @@ import type { QuotaAccountProof } from "../runtime/engine-quota-scope.js";
 import { QUOTA_TTL_MS, unavailableQuota } from "./account-quota.js";
 
 const ANTIGRAVITY_SIGN_IN_RETRY_MS = 30 * 60_000;
-export type EngineQuotaReadOptions = { refresh: boolean; expectedRevision?: string; signal?: AbortSignal; timeoutMs?: number };
+export type EngineQuotaReadOptions = { refresh: boolean; expectedRevision?: string; signal?: AbortSignal; timeoutMs?: number; accountProofKey?: Uint8Array };
 export type EngineQuotaReadResult = { revision: string; snapshot: QuotaSnapshot; proof?: QuotaAccountProof };
 export type AdapterQuotaScope = { revision: string; credentialRevision: string; verifiable: boolean; authMode: QuotaAuthMode };
 
@@ -151,7 +151,7 @@ function fingerprintKimiDir(dir: string, depth = 0): { meta: string; entries: un
 /** Private in-memory scope guard. No credential values, hashes or file paths are emitted to logs/public DTOs. */
 export class AdapterQuotaCache {
   readonly proofKey = randomBytes(32);
-  private cached?: { revision: string; snapshot: QuotaSnapshot; proof?: QuotaAccountProof };
+  private cached?: { revision: string; snapshot: QuotaSnapshot; proof?: QuotaAccountProof; proofKeyHex?: string };
   constructor(private readonly engine: "codex" | "claude" | "antigravity" | "kimi", private readonly executable: string, private readonly env: NodeJS.ProcessEnv, private readonly cwd?: string, private readonly configPath?: string, private readonly platform: NodeJS.Platform = process.platform) {}
 
   capture(workerGeneration: string): AdapterQuotaScope {
@@ -296,9 +296,13 @@ export class AdapterQuotaCache {
     if (!this.cached) return this.failure(scope, this.engine === "claude" ? "no_passive_event" : "not_loaded");
     const value = structuredClone(this.cached);
     if (value.snapshot.observedAt && Date.now() - Date.parse(value.snapshot.observedAt) >= QUOTA_TTL_MS) value.snapshot.state = "stale";
-    return value;
+    const { proofKeyHex, ...result } = value;
+    if (options.accountProofKey && result.proof && proofKeyHex !== Buffer.from(options.accountProofKey).toString("hex")) {
+      delete result.proof;
+    }
+    return result;
   }
-  store(scope: AdapterQuotaScope, value: { snapshot: QuotaSnapshot; proof?: QuotaAccountProof }): EngineQuotaReadResult {
+  store(scope: AdapterQuotaScope, value: { snapshot: QuotaSnapshot; proof?: QuotaAccountProof }, proofKey?: Uint8Array): EngineQuotaReadResult {
     // One-shot only: no cache and no account proof for a credential source this Host cannot verify.
     // The native reply must then identify the account itself: a stable user id and the billed account id
     // (both optional upstream). Type, plan or email alone cannot separate two accounts. Native
@@ -310,11 +314,13 @@ export class AdapterQuotaCache {
       if (carriesValues && !value.proof) return this.failure(scope, "scope_unverifiable");
       return { revision: scope.revision, snapshot: structuredClone(snapshot) };
     }
+    const proofKeyHex = value.proof && proofKey ? Buffer.from(proofKey).toString("hex") : undefined;
     const same = this.cached?.revision === scope.revision ? this.cached : undefined;
     if (same && same.snapshot.observedAt && ["unavailable", "offline"].includes(value.snapshot.state)) {
       this.cached = { ...same, snapshot: { ...same.snapshot, state: "stale", reason: value.snapshot.reason, lastAttemptAt: value.snapshot.lastAttemptAt } };
-    } else this.cached = { revision: scope.revision, snapshot: structuredClone(value.snapshot), ...(value.proof ? { proof: structuredClone(value.proof) } : {}) };
-    return structuredClone(this.cached);
+    } else this.cached = { revision: scope.revision, snapshot: structuredClone(value.snapshot), ...(value.proof ? { proof: structuredClone(value.proof), ...(proofKeyHex ? { proofKeyHex } : {}) } : {}) };
+    const { proofKeyHex: _ignored, ...stored } = structuredClone(this.cached);
+    return stored;
   }
   failure(scope: AdapterQuotaScope, reason: Parameters<typeof unavailableQuota>[1]): EngineQuotaReadResult {
     return { revision: scope.revision, snapshot: unavailableQuota(this.engine, reason, Date.now(), scope.authMode) };
