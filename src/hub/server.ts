@@ -92,6 +92,8 @@ import { workspaceChangesQuerySchema, workspaceFileDiffQuerySchema } from "../cl
 import { SavedWorkspaces, resolveExistingWorkspaceDirectory } from "./saved-workspaces.js";
 import { botWorkspacePatchSchema, botWorkspaceResultSchema, type BotWorkspacePatch } from "../client-protocol/saved-workspaces.js";
 import { workspaceSettings } from "../runtime/workspace-settings.js";
+import { HubWorkspaceFiles } from "./workspace-files.js";
+import { workspacePreviewQuerySchema, workspaceTreeQuerySchema } from "../client-protocol/workspace-files.js";
 import { nodeFrameReader, writeFrame } from "../client-protocol/fragments-node.js";
 import { linkUrlSchema } from "../client-protocol/links.js";
 import { HubLinkPreviews } from "./link-previews.js";
@@ -172,6 +174,7 @@ export class HubServer {
   readonly fileCenter: HubFileCenter;
   readonly workspaceDiff: HubWorkspaceDiff;
   readonly savedWorkspaces: SavedWorkspaces;
+  readonly workspaceFiles: HubWorkspaceFiles;
   readonly runChanges: HubRunChanges;
   readonly engineSettings: HubEngineSettings;
   readonly widgetSettings: HubWidgetSettings;
@@ -405,11 +408,15 @@ export class HubServer {
     this.avatars = new HubAvatars(store);
     this.linkPreviews = new HubLinkPreviews(store, attachments);
     this.savedWorkspaces = new SavedWorkspaces(store);
-    this.workspaceDiff = new HubWorkspaceDiff(async (botId, remainingMs) => {
+    const resolveBotStateDir = async (botId: string, remainingMs: number) => {
       const deadline = Date.now() + remainingMs;
       if (this.botManager && await this.botManager.owns(botId)) return path.join(options.stateDir, "bots", botId);
       return z.object({ stateDir: z.string().refine(path.isAbsolute) }).parse(await this.callBot(botId, "files.root", {}, Math.max(1, deadline - Date.now()))).stateDir;
-    }, { conversationWorkspace: conversationId => store.conversationWorkspacePath(conversationId) });
+    };
+    // A conversation may use its own folder (saved workspaces). The diff viewer and the Files panel must agree on it.
+    const conversationWorkspace = (conversationId: string) => store.conversationWorkspacePath(conversationId);
+    this.workspaceDiff = new HubWorkspaceDiff(resolveBotStateDir, { conversationWorkspace });
+    this.workspaceFiles = new HubWorkspaceFiles(resolveBotStateDir, this.workspaceDiff, conversationWorkspace);
     this.fileCenter = new HubFileCenter(options.stateDir, async () => {
       const result: FileCenterRoots = { instances: [], warnings: [] };
       for (const bot of await store.bots("owner")) {
@@ -1831,6 +1838,28 @@ export class HubServer {
           const result = fileQuery
             ? await this.workspaceDiff.file(scope, fileQuery.path, fileQuery.preview === "1", controller.signal, authorize)
             : await this.workspaceDiff.list(scope, controller.signal, authorize);
+          await authorize(); await reply(200, result);
+        } finally { res.off("close", cancel); this.downloads.delete(controller); }
+        return;
+      }
+      const workspaceFilesRoute = route.match(/^\/api\/conversations\/([A-Za-z0-9_-]+)\/workspace-files\/(tree|preview)$/);
+      if (workspaceFilesRoute && req.method === "GET") {
+        await requireOwner();
+        if ([...url.searchParams.keys()].length !== new Set(url.searchParams.keys()).size) throw new HubError("invalid_request", 400);
+        const mode = workspaceFilesRoute[2]!;
+        const treeQuery = mode === "tree" ? workspaceTreeQuerySchema.parse(Object.fromEntries(url.searchParams)) : undefined;
+        const previewQuery = mode === "preview" ? workspacePreviewQuerySchema.parse(Object.fromEntries(url.searchParams)) : undefined;
+        const botId = (treeQuery ?? previewQuery)!.botId;
+        const scope = { conversationId: workspaceFilesRoute[1]!, botId };
+        const authorize = () => serial(async () => { await this.store.requireMember(userId, scope.conversationId); await this.store.requireBot(scope.botId, scope.conversationId); });
+        await authorize();
+        const controller = new AbortController(); this.downloads.set(controller, session);
+        const cancel = () => controller.abort(new HubError("request_aborted", 499));
+        res.once("close", cancel); if (res.destroyed) cancel();
+        try {
+          const result = treeQuery
+            ? await this.workspaceFiles.list(scope, treeQuery.path, controller.signal, authorize, { includeChanges: treeQuery.changes !== "0" })
+            : await this.workspaceFiles.preview(scope, previewQuery!.path, previewQuery!.reveal === "1", controller.signal, authorize);
           await authorize(); await reply(200, result);
         } finally { res.off("close", cancel); this.downloads.delete(controller); }
         return;
