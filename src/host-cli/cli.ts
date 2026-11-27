@@ -939,6 +939,9 @@ export async function runHostCli(argv: string[]): Promise<void> {
           const nextGen = (own.generation ?? 1) + 1;
           if (own.reinstated !== nextGen) throw new Error("协调主机尚未允许这台主机重新加入。请先在协调主机执行 tarobot network reinstate PUBLIC_KEY --yes --out OFFER。");
           action = { operation: "propose", networkId: offer.manifest.id, authorityKey: offer.manifest.authorityKey, seenManifestHash: hashSecret(networkCanonical(offer.manifest)), generation: nextGen, recover: true };
+        } else if (own?.state === "pending" && (own.generation ?? 1) > 1) {
+          if (!v.recover) throw new Error("这台主机正在恢复加入此网络。请使用 tarobot network propose --from OFFER --out PROPOSAL --recover --yes 重新发起恢复申请。");
+          action = { operation: "propose", networkId: offer.manifest.id, authorityKey: offer.manifest.authorityKey, seenManifestHash: hashSecret(networkCanonical(offer.manifest)), generation: own.generation!, recover: true };
         } else {
           action = { operation: "propose", networkId: offer.manifest.id, authorityKey: offer.manifest.authorityKey, seenManifestHash: hashSecret(networkCanonical(offer.manifest)) };
         }

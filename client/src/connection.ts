@@ -1215,9 +1215,11 @@ export class HubConnection {
   private async performNetworkCommand(raw: NetworkCommandInput): Promise<{ view: NetworkView; membership?: SignedNetworkManifest; proposal?: SignedNetworkProposal }> {
     const command = networkCommandSchema.parse(["routes", "attest", "reinstate", "remove", "leave"].includes(raw.operation) ? {networkId: this.networkPin?.id ?? "", ...(["remove", "leave"].includes(raw.operation) ? {expectedState: this.state.network?.membership?.manifest.hosts.find(h => h.publicKey === (raw.operation === "remove" ? raw.publicKey : this.identity.hubPublicKey))?.state ?? "standalone"} : {}), ...raw} : raw), token = this.token, epoch = this.httpEpoch;
     let revision = this.networkRevision;
+    const explicit = ["create", "join", "leave"].includes(command.operation)
+      || (command.operation === "propose" && command.recover === true);
     const current = () => { if (!token || this.closed || this.token !== token || epoch !== this.httpEpoch || epoch.signal.aborted || revision !== this.networkRevision) throw new HubHttpError(409, "device_action_cancelled"); };
     current();
-    if (["create", "join", "leave"].includes(command.operation)) revision = ++this.networkRevision;
+    if (explicit) revision = ++this.networkRevision;
     const action = deviceActionSchema.parse({ operation: "network", target: bytesToHex(sha256(new TextEncoder().encode(networkCanonical(command)))) });
     const statement = boundDeviceActionStatement(await this.httpRequest("/api/devices/challenge", { method: "POST", body: JSON.stringify(action) }), {
       action, hubPublicKey: this.identity.hubPublicKey ?? "", deviceId: this.identity.deviceId, sessionHash: bytesToHex(sha256(new TextEncoder().encode(token!))),
@@ -1254,7 +1256,7 @@ export class HubConnection {
         if (!expected || !result.membership?.manifest.hosts.some(host => host.publicKey === this.identity.hubPublicKey && host.revoked)
           || view.membership || view.sync !== "standalone") throw new Error("network_departure_unconfirmed");
       }
-      await this.acceptNetworkView(view, ["create", "join", "leave"].includes(command.operation), () => {
+      await this.acceptNetworkView(view, explicit, () => {
         try { stillCurrent(); return true; } catch { return false; }
       });
       stillCurrent(); if (departure) this.networkDeparture = result.membership;

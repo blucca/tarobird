@@ -16,7 +16,7 @@ import { hostNameSchema, hostProfileSchema, type HostProfileState } from "../../
 import { connectedHostName, type ConnectedHost } from "./host-connections.js";
 import type { HubConnection } from "./connection.js";
 import { CreationDialog } from "./CreationDialog.js";
-import { joinNetworkHosts, reviewedNetworkHash, type NetworkJoinAttempt } from "./network-join.js";
+import { isOnlyReinstatementChange, joinNetworkHosts, reviewedNetworkHash, type NetworkJoinAttempt } from "./network-join.js";
 import { clearNetworkJoinAttempt, loadNetworkJoinAttempt, saveNetworkJoinAttempt } from "./network-join-storage.js";
 import { t, useLocale } from "./i18n.js";
 import "./network-manager.css";
@@ -70,7 +70,7 @@ const errorText = (error: unknown) => {
   if (error instanceof Error && error.message === "host_profile_changed") return t("主机名称已被其他设备修改，请重新打开名称编辑后保存。");
   if (error instanceof Error && error.message === "network_host_unavailable") return t("主机状态已变化，请刷新后重试。");
   if (error instanceof Error && error.message === "network_join_recovery_unavailable") return t("无法保存加入进度，请检查设备存储空间后重试。");
-  if (error instanceof Error && ["network_change_review_stale", "network_change_review_changed", "network_identity_mismatch"].includes(error.message)) return t("网络信息又有变化，请返回重新查看后确认。");
+  if (error instanceof Error && ["network_change_review_stale", "network_change_review_changed", "network_identity_mismatch", "network_membership_changed"].includes(error.message)) return t("网络信息又有变化，请返回重新查看后确认。");
   if (error instanceof Error && error.message === "network_host_state_changed") return t("主机加入状态已变化，请查看最新状态后再确认。");
   if (error instanceof Error && error.message === "network_devices_not_ready") return t("请先让手机打开 App，连接网络中的其他主机，再退出此主机。");
   if (error instanceof Error && error.message === "network_upgrade_required") return t("请先将网络内的所有主机升级到支持独立设备成员的版本，再重试。");
@@ -168,12 +168,15 @@ export function NetworkManager({ entries, close, addHost, manageConnections, con
   const authorityName = authority ? hostName(authority) : network?.hosts.find(host => host.publicKey === network.authorityKey)?.name ?? t("协调主机");
   const authorityNotice = network ? managementNotice(authority, authorityName) : "";
   const standalone = entries.filter(entry => !entry.host.networkBlocked && !currentNetwork(entry));
-  const eligible = (entry: ConnectedHost, destination: NetworkManifest) => {
-    if (entry.host.networkBlocked || !canManage(entry) || !connectionOf(entry)?.state.network || entry.host.publicKey === destination.authorityKey || destination.hosts.some(host => host.publicKey === entry.host.publicKey && (host.revoked || host.state === "active"))) return false;
+  const canLeaveCurrentFor = (entry: ConnectedHost, destination: NetworkManifest) => {
     const current = currentNetwork(entry);
     if (!current) return true;
     if (current.id === destination.id && current.authorityKey === destination.authorityKey) return false;
     return current.authorityKey === entry.host.publicKey && current.hosts.filter(host => !host.revoked && (host.state === "active" || host.expiresAt! > Date.now())).length === 1;
+  };
+  const eligible = (entry: ConnectedHost, destination: NetworkManifest) => {
+    if (entry.host.networkBlocked || !canManage(entry) || !connectionOf(entry)?.state.network || entry.host.publicKey === destination.authorityKey || destination.hosts.some(host => host.publicKey === entry.host.publicKey && (host.revoked || host.state === "active"))) return false;
+    return canLeaveCurrentFor(entry, destination);
   };
   const candidates = network ? entries.filter(entry => eligible(entry, network)) : [];
   // Standalone hosts that cannot join right now stay visible with a reason.
@@ -233,7 +236,7 @@ export function NetworkManager({ entries, close, addHost, manageConnections, con
     if (member?.state === "pending" && currentNetwork(source)?.id === manifest.id) { initialJoinApplied.current = `${initialJoin.hostId}:${initialJoin.networkHostId}`; setDetails(source.host.publicKey); return; }
     const revokedMember = manifest.hosts.find(host => host.publicKey === source.host.publicKey && host.revoked);
     if (revokedMember) {
-      if (!canManage(source) || (currentNetwork(source) && currentNetwork(source)!.id !== manifest.id)) {
+      if (!canManage(source) || !canLeaveCurrentFor(source, manifest)) {
         setError(!canManage(source) ? t("主机当前不可用，请恢复连接或管理权限后再恢复加入。") : t("这台主机已属于另一个网络。请先在原网络处理成员关系，再发起加入。"));
         return;
       }
@@ -252,8 +255,14 @@ export function NetworkManager({ entries, close, addHost, manageConnections, con
     initialJoinApplied.current = `${initialJoin.hostId}:${initialJoin.networkHostId}`;
     setSelectedNetwork(`${manifest.authorityKey}:${manifest.id}`);
     setError("");
+    const pendingRecoverGen = member?.state === "pending" && hostGen(member) > 1 ? hostGen(member) : undefined;
     const saved = loadNetworkJoinAttempt(manifest.id, manifest.authorityKey, source.host.publicKey);
-    const value = saved?.proposal && saved.proposal.proposal.expiresAt > Date.now() ? saved : newJoinAttempt(manifest, source.host.publicKey);
+    const matchesSaved = pendingRecoverGen
+      ? saved?.recover && saved.generation === pendingRecoverGen
+      : !saved?.recover;
+    const value = matchesSaved && saved?.proposal && saved.proposal.proposal.expiresAt > Date.now()
+      ? saved
+      : newJoinAttempt(manifest, source.host.publicKey, pendingRecoverGen ? { generation: pendingRecoverGen } : undefined);
     attempt.current = value; setJoining(value); setConsent(false);
   }, [initialJoin?.hostId, initialJoin?.networkHostId, snapshot, entries]);
   const initialTarget = entries.find(entry => entry.host.id === initialJoin?.networkHostId);
@@ -298,21 +307,25 @@ export function NetworkManager({ entries, close, addHost, manageConnections, con
   }, [snapshot]);
   function startJoin(entry: ConnectedHost) {
     if (!network) return;
+    const pendingMember = network.hosts.find(host => host.publicKey === entry.host.publicKey && !host.revoked && host.state === "pending");
+    if (pendingMember && hostGen(pendingMember) > 1) {
+      startRecover(pendingMember, entry, hostGen(pendingMember));
+      return;
+    }
     setRoutesSuccess(undefined);
     const local = attempt.current;
     const prior = local?.networkId === network.id && local.authorityKey === network.authorityKey && local.sourceKey === entry.host.publicKey && !local.recover ? local : loadNetworkJoinAttempt(network.id, network.authorityKey, entry.host.publicKey);
     const value = prior?.networkId === network.id && prior.authorityKey === network.authorityKey && prior.sourceKey === entry.host.publicKey && !prior.recover && (!prior.proposal || prior.proposal.proposal.expiresAt > Date.now()) ? prior : newJoinAttempt(network, entry.host.publicKey);
     attempt.current = value; setJoining(value); setConsent(false); setError("");
   }
-  function startRecover(host: NetworkHost, entry: ConnectedHost) {
+  function startRecover(host: NetworkHost, entry: ConnectedHost, generation = hostGen(host) + 1) {
     if (!network) return;
     setRoutesSuccess(undefined);
-    const nextGen = hostGen(host) + 1;
     const local = attempt.current;
-    const prior = local?.networkId === network.id && local.authorityKey === network.authorityKey && local.sourceKey === entry.host.publicKey && local.recover && local.generation === nextGen
+    const prior = local?.networkId === network.id && local.authorityKey === network.authorityKey && local.sourceKey === entry.host.publicKey && local.recover && local.generation === generation
       ? local : loadNetworkJoinAttempt(network.id, network.authorityKey, entry.host.publicKey);
-    const value = prior?.networkId === network.id && prior.authorityKey === network.authorityKey && prior.sourceKey === entry.host.publicKey && prior.recover && prior.generation === nextGen && (!prior.proposal || prior.proposal.proposal.expiresAt > Date.now())
-      ? prior : newJoinAttempt(network, entry.host.publicKey, { generation: nextGen });
+    const value = prior?.networkId === network.id && prior.authorityKey === network.authorityKey && prior.sourceKey === entry.host.publicKey && prior.recover && prior.generation === generation && (!prior.proposal || prior.proposal.proposal.expiresAt > Date.now())
+      ? prior : newJoinAttempt(network, entry.host.publicKey, { generation });
     attempt.current = value; setJoining(value); setConsent(false); setError("");
   }
   function openDetails(key: string) { initialHostApplied.current = true; setDetails(key); setRename(undefined); setRoutesSuccess(undefined); setError(""); }
@@ -340,43 +353,50 @@ export function NetworkManager({ entries, close, addHost, manageConnections, con
   }, [details]);
   async function completeJoin() {
     if (!source || !attempt.current || !canManage(source) || !canManage(joinAuthority)) throw new Error("network_host_unavailable");
-    if (attempt.current.recover && !attempt.current.proposal) {
-      const latest = currentNetwork(joinAuthority!);
-      const target = latest?.hosts.find(host => host.publicKey === source.host.publicKey);
-      if (target?.revoked && target.reinstated !== attempt.current.generation) {
-        const reinstated = await connectionOf(joinAuthority)!.networkCommand({
-          operation: "reinstate", networkId: attempt.current.networkId, publicKey: source.host.publicKey, expectedGeneration: hostGen(target),
-        });
-        const nextManifest = reinstated.view.membership?.manifest ?? currentNetwork(joinAuthority!);
-        if (!nextManifest) throw new Error("network_host_unavailable");
-        attempt.current = {
-          ...attempt.current,
-          seenManifestHash: reviewedNetworkHash(nextManifest),
-          reviewedManifest: structuredClone(nextManifest),
-        };
-        setJoining(attempt.current);
-      }
-    }
-    if (attempt.current.proposal && attempt.current.proposal.proposal.expiresAt <= Date.now()) {
-      const updated = await connectionOf(source)!.refreshNetwork();
-      const own = updated?.membership?.manifest.hosts.find(host => host.publicKey === source.host.publicKey);
-      if (updated?.membership?.manifest.id === attempt.current.networkId && own?.state === "pending") {
-        setJoining(undefined); attempt.current = undefined; setDetails(source.host.publicKey);
-        throw new Error("network_request_expired");
-      }
-    }
-    const wasRecover = !!attempt.current.recover;
+    const activeAttempt = attempt.current;
+    const wasRecover = !!activeAttempt.recover;
     try {
+      if (attempt.current.recover && !attempt.current.proposal) {
+        const latest = currentNetwork(joinAuthority!);
+        if (latest && reviewedNetworkHash(latest) !== attempt.current.seenManifestHash) throw new Error("network_review_changed");
+        const target = latest?.hosts.find(host => host.publicKey === source.host.publicKey);
+        if (target?.revoked && target.reinstated !== attempt.current.generation) {
+          const reviewed = attempt.current.reviewedManifest;
+          const reinstated = await connectionOf(joinAuthority)!.networkCommand({
+            operation: "reinstate", networkId: attempt.current.networkId, publicKey: source.host.publicKey,
+            expectedGeneration: hostGen(target), seenManifestHash: attempt.current.seenManifestHash,
+          });
+          const nextManifest = reinstated.view.membership?.manifest ?? currentNetwork(joinAuthority!);
+          if (!nextManifest) throw new Error("network_host_unavailable");
+          if (reviewed && !isOnlyReinstatementChange(reviewed, nextManifest, source.host.publicKey, attempt.current.generation!)) {
+            throw new Error("network_review_changed");
+          }
+          attempt.current = {
+            ...attempt.current,
+            seenManifestHash: reviewedNetworkHash(nextManifest),
+            reviewedManifest: structuredClone(nextManifest),
+          };
+          setJoining(attempt.current);
+        }
+      }
+      if (attempt.current.proposal && attempt.current.proposal.proposal.expiresAt <= Date.now()) {
+        const updated = await connectionOf(source)!.refreshNetwork();
+        const own = updated?.membership?.manifest.hosts.find(host => host.publicKey === source.host.publicKey);
+        if (updated?.membership?.manifest.id === attempt.current.networkId && own?.state === "pending") {
+          setJoining(undefined); attempt.current = undefined; setDetails(source.host.publicKey);
+          throw new Error("network_request_expired");
+        }
+      }
       await joinNetworkHosts(connectionOf(source)!, connectionOf(joinAuthority)!, attempt.current, value => { saveNetworkJoinAttempt(value); attempt.current = value; setJoining(value); });
     } catch (cause) {
       if (cause instanceof Error && ["network_review_changed", "network_request_expired"].includes(cause.message)) {
         setConsent(false);
         const updated = await connectionOf(joinAuthority)!.refreshNetwork().catch(() => undefined);
         const manifest = updated?.membership?.manifest;
-        if (manifest && manifest.id === joining?.networkId && manifest.authorityKey === joining.authorityKey) {
+        if (manifest && manifest.id === activeAttempt.networkId && manifest.authorityKey === activeAttempt.authorityKey) {
           clearNetworkJoinAttempt(manifest.id, manifest.authorityKey, source.host.publicKey);
           const target = manifest.hosts.find(host => host.publicKey === source.host.publicKey);
-          const recover = joining?.recover ? { generation: target?.revoked ? hostGen(target) + 1 : (joining.generation ?? 2) } : undefined;
+          const recover = activeAttempt.recover ? { generation: target?.revoked ? hostGen(target) + 1 : target?.state === "pending" && hostGen(target) > 1 ? hostGen(target) : (activeAttempt.generation ?? 2) } : undefined;
           const value = newJoinAttempt(manifest, source.host.publicKey, recover); attempt.current = value; setJoining(value);
         }
       }
@@ -490,9 +510,11 @@ export function NetworkManager({ entries, close, addHost, manageConnections, con
     return <p className="network-note">{t("需要这台主机或协调主机在线，且此设备有管理权限，才能让它离开网络。")}</p>;
   })();
   const troubleshootEntry = confirm ? ([entryOf(confirm.publicKey), entryOf(confirm.authorityKey)].find(entry => !!entry?.connection && !entry.host.networkBlocked)) : undefined;
-  const canRecoverEntry = (entry: ConnectedHost | undefined): entry is ConnectedHost => !!network && !!entry && !entry.host.networkBlocked && !!canManage(entry) && !currentNetwork(entry);
-  const joiningRevokedHost = joining?.recover ? joiningNetwork?.hosts.find(host => host.publicKey === joining.sourceKey && host.revoked) : undefined;
-  const joiningReinstated = !!joiningRevokedHost && joiningRevokedHost.reinstated === joining?.generation;
+  const canRecoverEntry = (entry: ConnectedHost | undefined): entry is ConnectedHost => !!network && !!entry && !entry.host.networkBlocked && !!canManage(entry) && canLeaveCurrentFor(entry, network);
+  const joiningTargetHost = joining?.recover ? joiningNetwork?.hosts.find(host => host.publicKey === joining.sourceKey) : undefined;
+  const joiningRevokedHost = joiningTargetHost?.revoked ? joiningTargetHost : undefined;
+  const joiningReinstated = (!!joiningRevokedHost && joiningRevokedHost.reinstated === joining?.generation)
+    || (joiningTargetHost?.state === "pending" && !joiningTargetHost.revoked && hostGen(joiningTargetHost) === joining?.generation);
   const connectionButton = (entry: ConnectedHost) => <button type="button" className="network-option" disabled={busy || preparingLocal || !entry.connection || entry.host.networkBlocked} onClick={() => setConnectionFor(entry.host.publicKey)}>
     <SlidersHorizontal size={18} aria-hidden="true"/><span><strong>{t("连接状态与线路")}</strong><small>{entry.host.publicKey === localHostKey ? t("本机的局域网、Tailscale 和 VPS 中转") : t("此设备访问这台主机的直连和中转线路")}</small></span><ChevronRight size={15} aria-hidden="true"/>
   </button>;
@@ -542,11 +564,15 @@ export function NetworkManager({ entries, close, addHost, manageConnections, con
       </section>
       {!!candidates.length && <section className="network-members network-candidates" aria-label={t("可加入的主机")}>
         <header><h3>{t("可加入的主机")}</h3></header>
-        <div className="network-member-list">{candidates.map(entry => <div className="network-candidate" key={entry.host.publicKey}>
-          <span className="network-member-icon"><Monitor size={18} aria-hidden="true"/></span>
-          <span className="network-member-name"><span className="network-member-title"><strong>{hostName(entry)}</strong>{tags(entry.host.publicKey)}</span>{duplicateName(hostName(entry)) && <small>{fingerprint(entry.host.publicKey)}</small>}</span>
-          <button type="button" className="network-secondary" disabled={busy || !canManage(authority)} aria-describedby={authorityNotice ? authorityNoticeId : undefined} onClick={() => startJoin(entry)}>{t("加入网络")}</button>
-        </div>)}</div>
+        <div className="network-member-list">{candidates.map(entry => {
+          const pendingMember = network.hosts.find(host => host.publicKey === entry.host.publicKey && !host.revoked && host.state === "pending");
+          const isPendingRecover = !!pendingMember && hostGen(pendingMember) > 1;
+          return <div className="network-candidate" key={entry.host.publicKey}>
+            <span className="network-member-icon"><Monitor size={18} aria-hidden="true"/></span>
+            <span className="network-member-name"><span className="network-member-title"><strong>{hostName(entry)}</strong>{tags(entry.host.publicKey)}</span>{duplicateName(hostName(entry)) && <small>{fingerprint(entry.host.publicKey)}</small>}</span>
+            <button type="button" className="network-secondary" disabled={busy || !canManage(authority)} aria-describedby={authorityNotice ? authorityNoticeId : undefined} onClick={() => startJoin(entry)}>{isPendingRecover ? t("恢复加入") : t("加入网络")}</button>
+          </div>;
+        })}</div>
       </section>}
       {!!unjoined.length && <section className="network-members" aria-label={t("未加入网络")}>
         <header><h3>{t("未加入网络")}</h3></header>

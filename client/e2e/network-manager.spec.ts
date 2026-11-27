@@ -971,3 +971,55 @@ test("leave/remove warning surfaces coordinator recovery first with second confi
     expect((await inspectCalls(page)).map(call => call.command.operation)).toEqual(["leave", "reinstate", "propose", "admit", "join"]);
   } finally { await page.close(); await vite.close(); }
 });
+
+test("recovery triggers network_review_changed when directory changes between consent and confirm", async ({ page }) => {
+  const vite = await fixture(page);
+  try {
+    await page.evaluate(() => (window as any).networkFixture.overview(["macmini", "studio-b"], "Home Lab"));
+    await overview(page).locator(".network-member").nth(1).click();
+    await page.getByRole("dialog", { name: "studio-b", exact: true }).getByRole("button", { name: "退出网络", exact: true }).click();
+    const leave = page.getByRole("dialog", { name: "让「studio-b」退出网络？", exact: true });
+    await leave.getByRole("checkbox").check();
+    await leave.getByRole("button", { name: "退出网络", exact: true }).click();
+    await expect(leave).toHaveCount(0);
+
+    await overview(page).getByRole("region", { name: "曾退出或移出的主机", exact: true }).getByRole("button", { name: "恢复加入", exact: true }).click();
+    const recover = page.getByRole("dialog", { name: "恢复加入网络", exact: true });
+    await recover.getByRole("checkbox").check();
+    await page.evaluate(() => (window as any).networkFixture.changeDirectory());
+    await recover.getByRole("button", { name: "确认恢复加入", exact: true }).click();
+    await expect(recover.getByRole("alert")).toContainText("网络成员已变化");
+    await expect(recover.getByRole("checkbox")).not.toBeChecked();
+    await recover.locator(".network-review-members summary").click();
+    await expect(recover.locator(".network-review-members")).toContainText("刚加入的另一台主机");
+    // No reinstate or propose was issued before re-review.
+    expect((await inspectCalls(page)).map(call => call.command.operation)).toEqual(["leave"]);
+
+    await recover.getByRole("checkbox").check();
+    await recover.getByRole("button", { name: "确认恢复加入", exact: true }).click();
+    await expect(recover).toHaveCount(0);
+    expect((await inspectCalls(page)).map(call => call.command.operation)).toEqual(["leave", "reinstate", "propose", "admit", "join"]);
+  } finally { await page.close(); await vite.close(); }
+});
+
+test("cancelling a pending gen-2 recovery admission lets the user retry recovery to completion", async ({ page }) => {
+  const vite = await fixture(page);
+  try {
+    await expect(overview(page)).toBeVisible();
+    await page.evaluate(() => { (window as any).networkFixture.pendingSource(2); (window as any).networkFixture.allowJoin(); });
+    await overview(page).locator(".network-member").filter({ hasText: "待完成加入" }).click();
+    await page.getByRole("dialog", { name: "同名主机", exact: true }).getByRole("button", { name: "取消加入", exact: true }).click();
+    await page.getByRole("dialog", { name: "取消「同名主机」的加入申请？", exact: true }).getByRole("button", { name: "取消加入", exact: true }).click();
+    await expect(page.getByRole("dialog", { name: "取消「同名主机」的加入申请？", exact: true })).toHaveCount(0);
+
+    await overview(page).getByRole("region", { name: "可加入的主机", exact: true }).getByRole("button", { name: "恢复加入", exact: true }).click();
+    const recover = page.getByRole("dialog", { name: "恢复加入网络", exact: true });
+    await expect(recover).toContainText("协调主机「同名主机」已允许这台主机重新加入");
+    await recover.getByRole("checkbox").check();
+    await recover.getByRole("button", { name: "确认恢复加入", exact: true }).click();
+    await expect(recover).toHaveCount(0);
+    const commands = (await inspectCalls(page)).map(call => call.command);
+    expect(commands.map(c => c.operation)).toEqual(["leave", "propose", "admit", "join"]);
+    expect(commands[1]).toMatchObject({ operation: "propose", generation: 2, recover: true });
+  } finally { await page.close(); await vite.close(); }
+});

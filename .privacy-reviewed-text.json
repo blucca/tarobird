@@ -78,6 +78,18 @@
       ]
     },
     {
+      "path": "client/e2e/fixtures/network-manager.tsx",
+      "sha256": "1009c401bbe7c502cee4247d87e1f8cef76d507ff69aa2bc1c3cb15626922c6a",
+      "reviewer": "codex",
+      "note": "Reviewed synthetic test identities, addresses and negative-case data; no owner deployment or contact information.",
+      "findings": [
+        {
+          "kind": "non-example-public-ip",
+          "fingerprint": "8308f3a233cf4bd3987f20880945ac60b08eacaa9e85391fd66c5919780196e3"
+        }
+      ]
+    },
+    {
       "path": "client/e2e/fixtures/tailscale-pairing.tsx",
       "sha256": "343f0a46089e4e179efa0fccdd146d27c21b82cdf1917284c68408b275e14f99",
       "reviewer": "codex",
@@ -168,6 +180,18 @@
     {
       "path": "client/e2e/network-manager.spec.ts",
       "sha256": "ce5a948b7138f9beff1ce7095ef7c485be40eb0ee70c5e7754c991a1b659716b",
+      "reviewer": "codex",
+      "note": "Reviewed synthetic test identities, addresses and negative-case data; no owner deployment or contact information.",
+      "findings": [
+        {
+          "kind": "non-example-public-ip",
+          "fingerprint": "8308f3a233cf4bd3987f20880945ac60b08eacaa9e85391fd66c5919780196e3"
+        }
+      ]
+    },
+    {
+      "path": "client/e2e/network-manager.spec.ts",
+      "sha256": "bada024dc287536a7f0160b966685662117dfa98b679b89d0dad155458d6a1a7",
       "reviewer": "codex",
       "note": "Reviewed synthetic test identities, addresses and negative-case data; no owner deployment or contact information.",
       "findings": [
@@ -1332,6 +1356,18 @@
     {
       "path": "tests/host-cli-network-command.test.ts",
       "sha256": "27cec0645a339fb3b12275eabdded0da2eb3115d1d8d211f59a677d87294ee31",
+      "reviewer": "codex",
+      "note": "Reviewed synthetic CGNAT addresses in isolated Tailscale route fixtures and negative cases; no owner deployment addresses or credentials.",
+      "findings": [
+        {
+          "kind": "non-example-public-ip",
+          "fingerprint": "dacf3f4d33be55bca20361714d8f6e4a056ad3d217dc7ed70fb3d373c3dfc32f"
+        }
+      ]
+    },
+    {
+      "path": "tests/host-cli-network-command.test.ts",
+      "sha256": "af6ee10eaa7c70aa55a5b0c2187336639a5df8bac0d0c2fda0a6e4cac48808a1",
       "reviewer": "codex",
       "note": "Reviewed synthetic CGNAT addresses in isolated Tailscale route fixtures and negative cases; no owner deployment addresses or credentials.",
       "findings": [

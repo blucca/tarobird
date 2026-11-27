@@ -262,11 +262,11 @@ it("recovers a departed or removed host over signed TLS while keeping its Bots, 
 
   // 1. Device revocation on B (while in network) preserves host membership, Bots, chats & files, and recovers via normal fresh pairing.
   const phone1 = await device(b.hub, "phone_revoke_test");
-  await b.hub.auth.revoke(phone1.id, "local-owner", b.owner.session, await (async () => {
-    const c = await http(b.hub, "/api/devices/challenge", { operation: "revoke", target: phone1.id }, b.owner.token);
-    const s = deviceActionStatementSchema.parse(c.body);
-    return { nonce: s.nonce, signature: sign(null, Buffer.from(deviceActionProofText(s)), b.owner.privateKey).toString("base64") };
-  })());
+  const revokeChallenge = await http(b.hub, "/api/devices/challenge", { operation: "revoke", target: phone1.id }, b.owner.token);
+  expect(revokeChallenge.status).toBe(200);
+  const revokeStatement = deviceActionStatementSchema.parse(revokeChallenge.body);
+  const revokeProof = { nonce: revokeStatement.nonce, signature: sign(null, Buffer.from(deviceActionProofText(revokeStatement)), b.owner.privateKey).toString("base64") };
+  expect((await http(b.hub, "/api/devices/revoke", { deviceId: phone1.id, proof: revokeProof }, b.owner.token)).status).toBe(200);
   expect((await http(b.hub, "/api/network", undefined, phone1.token)).status).toBe(401);
   expect((await view(b)).sync).toBe("current");
   const phone2 = await device(b.hub, "phone_repair_test");

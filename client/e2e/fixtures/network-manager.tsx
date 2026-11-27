@@ -18,6 +18,7 @@ import "../../src/porcelain-details.css";
 const key = (byte: number) => btoa(String.fromCharCode(48,42,48,5,6,3,43,101,112,3,33,0,...new Array(32).fill(byte)));
 const keys = [key(1), key(2), key(3)];
 let failParentRefresh = false;
+let proposalSeq = 0;
 const calls: Array<{ host: number; command: NetworkCommand }> = [];
 const initial: SignedNetworkManifest = { signature: "A".repeat(86) + "==", manifest: { v: 1, id: "network-fixture", name: "工作网络", authorityKey: keys[0]!, genesisNonce: "g".repeat(43), revokedMembers: [], blockedBindings: [], revision: 1, devices: [], hosts: [
   { publicKey: keys[0]!, name: "同名主机", routes: [{ name: "Direct", url: "https://host-a.test" }], state: "active" as const, revoked: false },
@@ -66,10 +67,12 @@ class FixtureConnection {
     }
     if (command.operation === "propose") {
       const gen = command.generation;
-      const proposal: SignedNetworkProposal = { signature: "A".repeat(86) + "==", proposal: { v: 1, host: { publicKey: this.state.network.host.publicKey, name: this.state.network.host.name, routes: this.state.network.host.routes, ...(gen ? { generation: gen, protocol: 2 as const } : {}) }, devices: [], authorityKey: command.authorityKey, networkId: command.networkId, seenManifestHash: command.seenManifestHash, nonce: "n".repeat(43), expiresAt: Date.now() + 60_000 } };
+      const nonce = String(++proposalSeq).padStart(43, "n");
+      const proposal: SignedNetworkProposal = { signature: "A".repeat(86) + "==", proposal: { v: 1, host: { publicKey: this.state.network.host.publicKey, name: this.state.network.host.name, routes: this.state.network.host.routes, ...(gen ? { generation: gen, protocol: 2 as const } : {}) }, devices: [], authorityKey: command.authorityKey, networkId: command.networkId, seenManifestHash: command.seenManifestHash, nonce, expiresAt: Date.now() + 60_000 } };
       return { view: this.state.network, proposal };
     }
     if (command.operation === "reinstate") {
+      if (command.seenManifestHash && command.seenManifestHash !== reviewedNetworkHash(this.state.network.membership!.manifest)) throw new Error("network_review_changed");
       const membership = structuredClone(this.state.network.membership!);
       membership.manifest.v = 2;
       membership.manifest.revision++;
@@ -105,7 +108,11 @@ class FixtureConnection {
     }
     if (command.operation === "remove") {
       const membership = structuredClone(this.state.network.membership!); membership.manifest.revision++;
-      membership.manifest.hosts = membership.manifest.hosts.map(host => host.publicKey === command.publicKey ? { ...host, revoked: true } : host);
+      membership.manifest.hosts = membership.manifest.hosts.map(host => {
+        if (host.publicKey !== command.publicKey) return host;
+        const { reinstated: _reinstated, ...rest } = host;
+        return { ...rest, revoked: true };
+      });
       this.state.network = { ...this.state.network, membership };
     }
     if (command.operation === "leave") {
@@ -115,10 +122,15 @@ class FixtureConnection {
       if (this.index === 1 && connections[0]!.state.network.membership) {
         const membership = structuredClone(connections[0]!.state.network.membership);
         membership.manifest.revision++;
-        membership.manifest.hosts = membership.manifest.hosts.map(host => host.publicKey === this.state.network.host.publicKey ? { ...host, revoked: true } : host);
+        membership.manifest.hosts = membership.manifest.hosts.map(host => {
+          if (host.publicKey !== this.state.network.host.publicKey) return host;
+          if (command.expectedState === "pending") return { ...host, expiresAt: 1 };
+          const { reinstated: _reinstated, ...rest } = host;
+          return { ...rest, revoked: true };
+        });
         connections[0]!.state.network = { ...connections[0]!.state.network, membership }; connections[0]!.emit();
       }
-      this.state.network = { host: { ...this.state.network.host, state: "active" }, sync: "standalone", lastSyncedAt: Date.now() };
+      this.state.network = { host: { publicKey: this.state.network.host.publicKey, name: this.state.network.host.name, routes: this.state.network.host.routes, state: "active", revoked: false }, sync: "standalone", lastSyncedAt: Date.now() };
     }
     if ((command.operation === "remove" || command.operation === "leave") && this.failAfterDeparture) this.failRefresh = true;
     this.emit(); return { view: this.state.network };
@@ -180,9 +192,13 @@ const entries = connections.map((connection, index) => ({ host: { id: runtimeHos
   failRefreshAfterJoin() { connections[1]!.failJoin = false; connections[1]!.failAfterJoin = true; },
   allowJoin() { connections[1]!.failJoin = false; },
   ownMultiHostNetwork() { const membership = structuredClone(initial); membership.manifest.id = "other-network"; membership.manifest.authorityKey = keys[1]!; membership.manifest.hosts[0] = { ...connections[1]!.state.network.host }; connections[1]!.state.network = { ...connections[1]!.state.network, membership, sync: "current" }; connections[1]!.emit(); },
-  pendingSource() {
+  pendingSource(generation?: number) {
     const membership = structuredClone(initial); membership.manifest.revision++;
-    const host = { ...connections[1]!.state.network.host, state: "pending" as const, proposalNonce: "p".repeat(43), expiresAt: Date.now() + 60_000 };
+    if (generation && generation > 1) {
+      membership.manifest.v = 2;
+      membership.manifest.hosts = membership.manifest.hosts.map(h => ({ ...h, protocol: 2 as const }));
+    }
+    const host = { ...connections[1]!.state.network.host, ...(generation && generation > 1 ? { generation, protocol: 2 as const } : {}), state: "pending" as const, proposalNonce: "p".repeat(43), expiresAt: Date.now() + 60_000 };
     membership.manifest.hosts.push(host);
     connections[0]!.state.network = { ...connections[0]!.state.network, membership };
     connections[1]!.state.network = { host, membership, sync: "waiting", lastSyncedAt: Date.now() };

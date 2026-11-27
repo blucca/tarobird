@@ -196,7 +196,15 @@ it("supports CLI reinstate and propose --recover after a host leaves, keeping Bo
   const proposal = path.join(b.directory, "recover-proposal.json"), admission = path.join(a.directory, "recover-admission.json");
   await run(b, "network", "propose", "--from", offerReinstated, "--out", proposal, "--recover", "--yes");
   await run(a, "network", "admit", "--from", proposal, "--out", admission, "--yes");
-  await run(b, "network", "join", "--from", admission, "--yes");
+
+  // Re-proposing while the gen-2 recovery admission is still pending (e.g. after timeout or cancel) must keep recovery at generation 2.
+  const offerPending = path.join(a.directory, "offer-pending-gen2.json");
+  await run(a, "network", "offer", "--out", offerPending);
+  await expect(run(b, "network", "propose", "--from", offerPending, "--out", path.join(b.directory, "bad-pending.json"), "--yes")).rejects.toThrow("--recover");
+  const proposal2 = path.join(b.directory, "recover-proposal-2.json"), admission2 = path.join(a.directory, "recover-admission-2.json");
+  await run(b, "network", "propose", "--from", offerPending, "--out", proposal2, "--recover", "--yes");
+  await run(a, "network", "admit", "--from", proposal2, "--out", admission2, "--yes");
+  await run(b, "network", "join", "--from", admission2, "--yes");
   expect((await b.hub.network.view()).host).toMatchObject({ state: "active", revoked: false, generation: 2 });
   expect((await b.hub.store.bots("owner")).map(bot => bot.id)).toEqual(["peer_bot"]);
 }, 20_000);

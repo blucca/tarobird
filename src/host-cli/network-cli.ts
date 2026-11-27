@@ -12,14 +12,21 @@ const CLI_OPERATIONS = new Set(["create", "routes", "propose", "admit", "join", 
 export function verifyCliNetworkMembership(raw: unknown, expectedHostKey?: string, pin?: { id: string; authorityKey: string }): SignedNetworkManifest {
   const signed = signedNetworkManifestSchema.parse(raw), manifest = signed.manifest;
   const blocked = new Set(manifest.blockedKeys ?? []);
-  const origins = new Map(manifest.devices.filter(device => device.memberId === `pm_${createHash("sha256").update(networkMemberText(device.host, device.id, device.generation ?? 1)).digest("base64url")}` && device.originHost === device.host && device.attestedBy === device.host).map(device => [device.memberId, device.host]));
+  const origins = new Map(manifest.devices.filter(device => device.memberId === `pm_${createHash("sha256").update(networkMemberText(device.host, device.id, device.originGeneration ?? 1)).digest("base64url")}`
+    && device.originHost === device.host && device.attestedBy === device.host
+    && (device.originGeneration ?? 1) === (device.generation ?? 1) && (device.attestedGeneration ?? 1) === (device.generation ?? 1))
+    .map(device => [device.memberId, { host: device.host, generation: device.originGeneration ?? 1 }]));
   for (const host of manifest.hosts) parsePublicKey(host.publicKey);
   for (const device of manifest.devices) parsePublicKey(device.publicKey);
   if (networkCanonical(raw) !== networkCanonical(signed)
     || manifest.id !== `net_${hashSecret(networkGenesisText(manifest.authorityKey, manifest.genesisNonce))}`
     || pin && (manifest.id !== pin.id || manifest.authorityKey !== pin.authorityKey)
     || !verify(null, Buffer.from(networkManifestProof(manifest)), parsePublicKey(manifest.authorityKey), Buffer.from(signed.signature, "base64"))
-    || manifest.devices.some(device => !device.revoked && (origins.get(device.memberId) !== device.originHost || blocked.has(hashSecret(device.publicKey))))
+    || manifest.devices.some(device => {
+      if (device.revoked) return false;
+      const origin = origins.get(device.memberId);
+      return !origin || origin.host !== device.originHost || origin.generation !== (device.originGeneration ?? 1) || blocked.has(hashSecret(device.publicKey));
+    })
     || expectedHostKey && !manifest.hosts.some(host => host.publicKey === expectedHostKey)) throw new HostCliError("network_membership_invalid");
   return signed;
 }
