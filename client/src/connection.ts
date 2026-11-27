@@ -30,7 +30,8 @@ import { conversationFoldersSchema, emptyConversationFolders, type ConversationF
 import { connectionTiming } from "./connection-timing.js";
 import { RoutePerformance, ROUTE_OBSERVATION_MS, ROUTE_DWELL_MS, ROUTE_STABLE_PROBE_MS, ROUTE_CANDIDATE_PROBE_MS } from "./route-performance.js";
 import { rememberRouteTrust } from "./route-trust.js";
-import { connectionErrorMessage, connectionVerificationFailure, connectionVerificationMessage, preferredVerificationFailure } from "./connection-verification.js";
+import { connectionErrorMessage, connectionVerificationFailure, nativeLifecycleErrorCode } from "./connection-verification.js";
+import { classifyRouteTransportFailure, diagnoseRouteFailures, type RouteDiagnosis } from "./route-diagnostics.js";
 import { runtimeHostId } from "./host-registry.js";
 import { orderedRoutes, localRoutesSchema, deploymentSchema, deploymentMatchesRoutes, type Deployment, type RouteHealth } from "../../src/client-protocol/routes.js";
 import { avatarSchema, avatarKey, profileUserSchema, type ProfileAvatar, type ProfileCache, type AvatarTarget } from "../../src/client-protocol/avatars.js";
@@ -79,7 +80,12 @@ const readySchema = z.object({ serverCapabilities: z.array(z.string()).default([
 const frameConversation = (frame: ClientFrame): string | undefined => "conversationId" in frame ? frame.conversationId : "groupId" in frame ? frame.groupId : undefined;
 export type RouteSyncSource = "host" | "network";
 export type RouteSyncResult = { limited: boolean };
-export type ConnectionState = ProfileCache & { savedWorkspacesAvailable?: boolean; dispatchAvailable?: boolean; screenAvailable?: boolean; /** Host accepts `screenOpen({ flight })` and an `ack` with `heldMs`. */ screenFlightAvailable?: boolean; /** Host accepts `screenOpen({ quality })`; the target may still refuse (`screen_quality_unsupported`). */ screenQualityAvailable?: boolean; /** Host accepts `screenConfigure({ udpBoost })` and `includeUdpStatus=1`. */ screenUdpBoostAvailable?: boolean; workbenchAvailable?: boolean; workbenchMarkdownAvailable?: boolean; workbenchDesignAvailable?: boolean; workbenchDesignOpenAvailable?: boolean; workbenchSlidesAvailable?: boolean; workbenchDesignCommentsAvailable?: boolean; workbenchDesignHistoryAvailable?: boolean; workbenchDesignShareAvailable?:boolean; pairingInvitesAvailable?: boolean; conversationBatchAvailable?: boolean; routeSync?: Partial<Record<RouteSyncSource, RouteSyncResult>>; engineTasksAvailable?: boolean; botCommsAvailable?: boolean; historyAvailable?: boolean; piSessionAvailable?: boolean; sideAvailable?: boolean; syncProgress?: { completed: number; total: number; indeterminate?: boolean }; groupDiscussionAvailable?: boolean; groupDiscussionComposerAvailable?: boolean; groupDiscussionRecoveryAvailable?: boolean; groupReplyGuardAvailable?: boolean; groupParallelAvailable?: boolean; voiceSettingsAvailable?: boolean; widgetSettingsAvailable?: boolean; engineSettingsAvailable?: boolean; engineQuotaAvailable?: boolean; /** Host serves a conversation's context usage. */ contextUsageAvailable?: boolean; backupSettingsAvailable?: boolean; routeSelection?: { reason: "initial" | "reconnected" | "failover" | "quality"; changedAt: number }; hostRoutesAvailable?: boolean; hostLanSelectionAvailable?: boolean; /** Host serves owner File Center › 附件管理 (`attachments.admin.v1`). */ attachmentAdminAvailable?: boolean; /** Bumped when this device deleted host attachments. */ attachmentDeletions?: number; workspaceDiffAvailable?: boolean; workspaceFilesAvailable?: boolean; runChangesAvailable?: boolean; asrSetupAvailable?: boolean; navigationGraceUntil?: number; serverTimeOffset?: number; network?: NetworkView; networkChange?: NetworkView; networkAvailable?: boolean; hostProfile?: HostProfileState; conversationFolders?: ConversationFoldersState; foldersAvailable?: boolean; runScopesAvailable?: boolean; runGroupsAvailable?: boolean; runTailAvailable?: boolean; folderReorderAvailable?: boolean; folderPinAvailable?: boolean; conversationAvatarsAvailable?: boolean; cacheRevision: number; notifications?: NotificationState; routeHealth?: RouteHealth[]; maxFileBytes?: number; status: "offline" | "connecting" | "online"; route?: Route; latency?: number; error?: string; awaitingApproval?: boolean; bots: Bot[]; deletedBots?: Bot[]; /** A dispatcher's hidden engine workers: named in their ticket chats, never listed. */ dispatchWorkers?: Bot[]; botDeletionAvailable?: boolean; promptQueueAvailable?: boolean; messageDeletionAvailable?: boolean; messageClearAvailable?: boolean; outbox: number };
+export type ConnectionState = ProfileCache & { savedWorkspacesAvailable?: boolean; dispatchAvailable?: boolean; screenAvailable?: boolean; /** Host accepts `screenOpen({ flight })` and an `ack` with `heldMs`. */ screenFlightAvailable?: boolean; /** Host accepts `screenOpen({ quality })`; the target may still refuse (`screen_quality_unsupported`). */ screenQualityAvailable?: boolean; /** Host accepts `screenConfigure({ udpBoost })` and `includeUdpStatus=1`. */ screenUdpBoostAvailable?: boolean; workbenchAvailable?: boolean; workbenchMarkdownAvailable?: boolean; workbenchDesignAvailable?: boolean; workbenchDesignOpenAvailable?: boolean; workbenchSlidesAvailable?: boolean; workbenchDesignCommentsAvailable?: boolean; workbenchDesignHistoryAvailable?: boolean; workbenchDesignShareAvailable?:boolean; pairingInvitesAvailable?: boolean; conversationBatchAvailable?: boolean; routeSync?: Partial<Record<RouteSyncSource, RouteSyncResult>>; engineTasksAvailable?: boolean; botCommsAvailable?: boolean; historyAvailable?: boolean; piSessionAvailable?: boolean; sideAvailable?: boolean; syncProgress?: { completed: number; total: number; indeterminate?: boolean }; groupDiscussionAvailable?: boolean; groupDiscussionComposerAvailable?: boolean; groupDiscussionRecoveryAvailable?: boolean; groupReplyGuardAvailable?: boolean; groupParallelAvailable?: boolean; voiceSettingsAvailable?: boolean; widgetSettingsAvailable?: boolean; engineSettingsAvailable?: boolean; engineQuotaAvailable?: boolean; /** Host serves a conversation's context usage. */ contextUsageAvailable?: boolean; backupSettingsAvailable?: boolean; routeSelection?: { reason: "initial" | "reconnected" | "failover" | "quality"; changedAt: number }; hostRoutesAvailable?: boolean; hostLanSelectionAvailable?: boolean; /** Host serves owner File Center › 附件管理 (`attachments.admin.v1`). */ attachmentAdminAvailable?: boolean; /** Bumped when this device deleted host attachments. */ attachmentDeletions?: number; workspaceDiffAvailable?: boolean; workspaceFilesAvailable?: boolean; runChangesAvailable?: boolean; asrSetupAvailable?: boolean; navigationGraceUntil?: number; serverTimeOffset?: number; network?: NetworkView; networkChange?: NetworkView; networkAvailable?: boolean; hostProfile?: HostProfileState; conversationFolders?: ConversationFoldersState; foldersAvailable?: boolean; runScopesAvailable?: boolean; runGroupsAvailable?: boolean; runTailAvailable?: boolean; folderReorderAvailable?: boolean; folderPinAvailable?: boolean; conversationAvatarsAvailable?: boolean; cacheRevision: number; notifications?: NotificationState; routeHealth?: RouteHealth[]; routeDiagnosis?: RouteDiagnosis; maxFileBytes?: number; status: "offline" | "connecting" | "online"; route?: Route; latency?: number; error?: string; awaitingApproval?: boolean; bots: Bot[]; deletedBots?: Bot[]; /** A dispatcher's hidden engine workers: named in their ticket chats, never listed. */ dispatchWorkers?: Bot[]; botDeletionAvailable?: boolean; promptQueueAvailable?: boolean; messageDeletionAvailable?: boolean; messageClearAvailable?: boolean; outbox: number };
+class RouteDiagnosisError extends Error {
+  constructor(readonly diagnosis: RouteDiagnosis) {
+    super(diagnosis.message);
+  }
+}
 export type OutboxSettlement = { entry: OutboxEntry; revision: number; messageAccepted: boolean };
 export class HubConnection {
   state: ConnectionState = { cacheRevision: 0, status: "offline", bots: [], outbox: 0, avatars: [] };
@@ -163,7 +169,7 @@ export class HubConnection {
   private pairingRequired = false;
   private networkRevision = 0;
   pinNetwork(id:string, authorityKey:string): void { this.networkPin = {id, authorityKey}; }
-  suspendNetwork(): void { this.networkBlocked = true; this.close(true); this.update({error:t("网络授权已失效")}); }
+  suspendNetwork(): void { this.networkBlocked = true; this.close(true); this.update({error:t("网络授权已失效"), routeDiagnosis: undefined}); }
   get isNetworkBlocked(): boolean { return this.networkBlocked; }
   get isRevoked(): boolean { return this.deviceRevoked; }
   get isReadOnly(): boolean { return this.networkBlocked || this.deviceRevoked || this.pairingRequired; }
@@ -307,7 +313,7 @@ export class HubConnection {
       }
       this.activeMessages = new Set(active); this.update({ ...profiles, conversationFolders, outbox: outbox.length, ...(cachedNetwork ? { network: cachedNetwork } : {}) }, true);
       if (this.networkBlocked) { this.suspendNetwork(); return; }
-      if (revoked) { this.deviceRevoked = true; if (this.networkPin) this.networkBlocked = true; this.close(); this.update({ error: t("此设备已被吊销，请重新配对") }); return; }
+      if (revoked) { this.deviceRevoked = true; if (this.networkPin) this.networkBlocked = true; this.close(); this.update({ error: t("此设备已被吊销，请重新配对"), routeDiagnosis: undefined }); return; }
       void this.downloadCheckpoints.sweep().catch(() => undefined);
       void sweepTemporaryDownloads().catch(() => undefined);
       await this.connect();
@@ -315,7 +321,7 @@ export class HubConnection {
     this.starting = work.catch((error: unknown) => {
       if (lifecycle === this.lifecycle) {
         if (this.cache.isClosed) { this.cacheUnavailable(); throw new Error(connectionErrorMessage("local_cache_unavailable")); }
-        else { this.close(); this.update({ error: error instanceof Error ? error.message : t("连接失败") }); }
+        else { this.close(); this.update({ error: error instanceof Error ? error.message : t("连接失败"), routeDiagnosis: undefined }); }
       }
       throw error;
     }).finally(() => { if (lifecycle === this.lifecycle) this.starting = undefined; });
@@ -383,7 +389,7 @@ export class HubConnection {
   private cacheUnavailable(): void {
     if (this.closed) return;
     this.close(true);
-    this.update({ error: connectionErrorMessage("local_cache_unavailable") });
+    this.update({ error: connectionErrorMessage("local_cache_unavailable"), routeDiagnosis: undefined });
   }
   private async selectRoute(allowCooldown = false, generation = this.generation): Promise<{ route: Route; latency: number }> {
     rememberRouteTrust(this.identity.routes, this.identity.hubPublicKey);
@@ -400,6 +406,7 @@ export class HubConnection {
     if (!current()) throw new Error("route_probe_superseded");
     const controller = new AbortController(); this.probeAbort = controller;
     const settled: (RouteHealth | undefined)[] = [];
+    const attemptErrors = new Map<string, unknown>();
     let localFailure: string | undefined, cursor = 0;
     let release: (() => void) | undefined, grace: ReturnType<typeof setTimeout> | undefined;
     const early = allowCooldown ? new Promise<void>(resolve => { release = resolve; }) : undefined;
@@ -409,13 +416,18 @@ export class HubConnection {
         const response = await hubFetch(route.url, "/health", this.identity.hubPublicKey, { signal: anySignal([controller.signal, timeoutSignal(connectionTiming(route, usesPinnedTransport()).probeMs)]), cache: "no-store" });
         const result = z.object({ publicKey: z.string(), ok: z.literal(true) }).parse(await response.json());
         if (!response.ok) throw new Error("route_unavailable");
-        if (result.publicKey !== this.identity.hubPublicKey) return { url: route.url, status: "wrong-hub", failure: "identity-mismatch" };
+        if (result.publicKey !== this.identity.hubPublicKey) {
+          attemptErrors.set(route.url, "tls_identity_mismatch");
+          return { url: route.url, status: "wrong-hub", failure: "identity-mismatch" };
+        }
         return { url: route.url, status: (this.failedRoutes.get(route.url)?.until ?? 0) > Date.now() ? "cooldown" : "reachable", latency: Math.round(performance.now() - started) };
       } catch (error) {
-        const code = error instanceof Error ? error.message : typeof error === "string" ? error : "";
-        if (["native_document_retired", "native_document_unavailable", "native_view_unavailable"].includes(code)) localFailure = connectionErrorMessage(code);
+        attemptErrors.set(route.url, error);
+        const localCode = nativeLifecycleErrorCode(error);
+        if (localCode) localFailure = connectionErrorMessage(localCode);
         const failure = connectionVerificationFailure(error);
-        return { url: route.url, status: failure === "identity-mismatch" ? "wrong-hub" : "unreachable", ...(failure ? { failure } : {}) };
+        const reason = failure ? undefined : classifyRouteTransportFailure(error, route);
+        return { url: route.url, status: failure === "identity-mismatch" ? "wrong-hub" : "unreachable", ...(failure ? { failure } : {}), ...(reason ? { reason } : {}) };
       }
     };
     const worker = async () => {
@@ -440,8 +452,13 @@ export class HubConnection {
       ?? (allowCooldown ? probes.filter(probe => probe.status === "cooldown")
         .sort((a, b) => (this.failedRoutes.get(a.url)?.until ?? 0) - (this.failedRoutes.get(b.url)?.until ?? 0))[0] : undefined);
     if (!candidate) {
-      const name = this.hostName?.()?.trim() || this.state.hostProfile?.name || this.state.network?.host.name || t("此主机");
-      throw new Error(localFailure ?? connectionVerificationMessage(preferredVerificationFailure(probes.map(probe => probe.failure)), "paired") ?? t("暂时无法连接「{0}」，正在自动重试。", name));
+      if (localFailure) throw new Error(localFailure);
+      const name = this.hostName?.()?.trim() || this.state.hostProfile?.name || this.state.network?.host.name || undefined;
+      const diagnosis = diagnoseRouteFailures(
+        probes.map(probe => ({ route: routes.find(route => route.url === probe.url)!, error: attemptErrors.get(probe.url) ?? probe.failure ?? probe.reason ?? "unreachable" })),
+        { context: "paired", hostName: name, configuredRoutes },
+      );
+      throw new RouteDiagnosisError(diagnosis);
     }
     return { route: routes.find(route => route.url === candidate.url)!, latency: candidate.latency! };
   }
@@ -461,7 +478,7 @@ export class HubConnection {
       // A system credential prompt can outlive its socket. Wait for that one
       // operation instead of issuing another native read on every reconnect.
       if (this.signing) {
-        this.update({ error: connectionErrorMessage("device_signature_pending") });
+        this.update({ error: connectionErrorMessage("device_signature_pending"), routeDiagnosis: undefined });
         await this.signing.catch(() => undefined);
         if (generation !== this.generation || this.closed) return;
       }
@@ -474,12 +491,12 @@ export class HubConnection {
         ? { route: handoff.route, latency: handoff.latency } : await this.selectRoute(true, generation);
       if (generation !== this.generation || this.closed) return;
       const handshakeStarted = performance.now();
-      this.update(chosen); const ws = hubSocket(chosen.route.url, this.identity.hubPublicKey); this.ws = ws;
+      this.update({ ...chosen, routeDiagnosis: undefined, ...(this.state.routeDiagnosis ? { error: undefined } : {}) }); const ws = hubSocket(chosen.route.url, this.identity.hubPublicKey); this.ws = ws;
       let preparation: "socket" | "cache" | "host" | "signature" = "socket";
       this.handshake = setTimeout(() => {
         if (generation !== this.generation || this.closed) return;
         if (this.cache.isClosed) { this.cacheUnavailable(); return; }
-        this.update({ error: connectionErrorMessage(preparation === "signature" ? "device_signature_pending" : preparation === "cache" ? "local_cache_preparation_timeout" : "connection_handshake_timeout") });
+        this.update({ error: connectionErrorMessage(preparation === "signature" ? "device_signature_pending" : preparation === "cache" ? "local_cache_preparation_timeout" : "connection_handshake_timeout"), routeDiagnosis: undefined });
         this.abandon(ws, generation, preparation !== "signature" && preparation !== "cache");
       }, connectionTiming(chosen.route, usesPinnedTransport()).handshakeMs);
       const nonce = randomNonce(); let chain = Promise.resolve(), renewing = false, receiveFailed = false, localFailure = false, signingWait = 0, pendingFrames = 0;
@@ -499,7 +516,7 @@ export class HubConnection {
         // Cache preparation can fail before hello is sent. Surface that failure
         // instead of presenting an endless, unexplained network reconnect.
         this.cacheFull = error instanceof Error && error.name === "QuotaExceededError";
-        this.update({ error: connectionErrorMessage(error) });
+        this.update({ error: connectionErrorMessage(error), routeDiagnosis: undefined });
         this.abandon(ws, generation, preparation !== "cache");
       }); };
       ws.onmessage = (event) => {
@@ -559,7 +576,7 @@ export class HubConnection {
           if (this.lastConnectedUrl !== chosen.route.url) this.lastRouteChange = Date.now();
           this.lastConnectedUrl = chosen.route.url;
           this.update({ routeSelection: { reason, changedAt: Date.now() } });
-          this.update({ dispatchAvailable: ready.serverCapabilities.includes(DISPATCH_CAPABILITY), screenAvailable: ready.serverCapabilities.includes("desktop.screen.v1"), pairingInvitesAvailable: ready.serverCapabilities.includes(PAIRING_INVITES_CAPABILITY), conversationBatchAvailable: ready.serverCapabilities.includes(CONVERSATION_BATCH_CAPABILITY), groupReplyGuardAvailable: ready.serverCapabilities.includes("groups.reply-guard.v1"), groupDiscussionAvailable: ready.serverCapabilities.includes("groups.discussion.v1"), groupDiscussionComposerAvailable: ready.serverCapabilities.includes("groups.discussion.composer.v1"), groupDiscussionRecoveryAvailable: ready.serverCapabilities.includes("groups.discussion.recovery.v1"), groupParallelAvailable: ready.serverCapabilities.includes("groups.parallel.v1"), voiceSettingsAvailable: ready.serverCapabilities.includes("integrations.voice.v2"), widgetSettingsAvailable: ready.serverCapabilities.includes("widgets.settings.v1"), engineSettingsAvailable: ready.serverCapabilities.includes("engines.settings.v1"), engineQuotaAvailable: ready.serverCapabilities.includes(ENGINE_QUOTA_CAPABILITY), contextUsageAvailable: ready.serverCapabilities.includes(CONTEXT_USAGE_CAPABILITY), backupSettingsAvailable: ready.serverCapabilities.includes("backups.settings.v1"), hostRoutesAvailable: ready.serverCapabilities.includes("host-routes.v1"), hostLanSelectionAvailable: ready.serverCapabilities.includes("host-routes.select-lan.v1"), attachmentAdminAvailable: ready.serverCapabilities.includes("attachments.admin.v1"), asrSetupAvailable: ready.serverCapabilities.includes("integrations.asr.v1"), workspaceDiffAvailable: ready.serverCapabilities.includes("workspace.diff.v1"), workspaceFilesAvailable: ready.serverCapabilities.includes(WORKSPACE_FILES_CAPABILITY), runChangesAvailable: ready.serverCapabilities.includes("runs.changes.v1"), runScopesAvailable: ready.serverCapabilities.includes(RUN_SCOPES_CAPABILITY), runGroupsAvailable: ready.serverCapabilities.includes(BACKGROUND_TASK_GROUP_CAPABILITY), runTailAvailable: ready.serverCapabilities.includes(RUN_TAIL_CAPABILITY), serverTimeOffset: (ready.serverTime ?? Date.now()) - Date.now(), networkAvailable: ready.serverCapabilities.includes(PRIVATE_NETWORK_CAPABILITY), folderReorderAvailable: ready.serverCapabilities.includes("conversation-folders.reorder.v1"), folderPinAvailable: ready.serverCapabilities.includes("conversation-folders.pin.v1"), conversationAvatarsAvailable: ready.serverCapabilities.includes("conversation-avatars.v1"), foldersAvailable: !!ready.conversationFolders, user: ready.user, avatars: ready.avatars, status: "online", bots: ready.bots.filter(bot => !bot.deletedAt && bot.role !== "worker"), deletedBots: ready.bots.filter(bot => !!bot.deletedAt && bot.role !== "worker"), dispatchWorkers: ready.bots.filter(bot => !bot.deletedAt && bot.role === "worker"), botDeletionAvailable: ready.serverCapabilities.includes("bots.delete.v1"), promptQueueAvailable: ready.serverCapabilities.includes("prompt-queue.v1"), messageDeletionAvailable: ready.serverCapabilities.includes(MESSAGE_DELETE_CAPABILITY), messageClearAvailable: ready.serverCapabilities.includes(MESSAGE_CLEAR_CAPABILITY), maxFileBytes: ready.uploadLimits?.maxFileBytes ?? MAX_FILE_BYTES, error: undefined }, true); void rememberGroupReplyCapabilities(this).catch(() => undefined); void syncShareUploadLimit(this.state.maxFileBytes ?? MAX_FILE_BYTES).catch(() => console.warn("share_limit_cache_failed")); this.lastPong = performance.now(); this.presence(); void this.refreshNotificationPreferences().catch(() => undefined);
+          this.update({ dispatchAvailable: ready.serverCapabilities.includes(DISPATCH_CAPABILITY), screenAvailable: ready.serverCapabilities.includes("desktop.screen.v1"), pairingInvitesAvailable: ready.serverCapabilities.includes(PAIRING_INVITES_CAPABILITY), conversationBatchAvailable: ready.serverCapabilities.includes(CONVERSATION_BATCH_CAPABILITY), groupReplyGuardAvailable: ready.serverCapabilities.includes("groups.reply-guard.v1"), groupDiscussionAvailable: ready.serverCapabilities.includes("groups.discussion.v1"), groupDiscussionComposerAvailable: ready.serverCapabilities.includes("groups.discussion.composer.v1"), groupDiscussionRecoveryAvailable: ready.serverCapabilities.includes("groups.discussion.recovery.v1"), groupParallelAvailable: ready.serverCapabilities.includes("groups.parallel.v1"), voiceSettingsAvailable: ready.serverCapabilities.includes("integrations.voice.v2"), widgetSettingsAvailable: ready.serverCapabilities.includes("widgets.settings.v1"), engineSettingsAvailable: ready.serverCapabilities.includes("engines.settings.v1"), engineQuotaAvailable: ready.serverCapabilities.includes(ENGINE_QUOTA_CAPABILITY), contextUsageAvailable: ready.serverCapabilities.includes(CONTEXT_USAGE_CAPABILITY), backupSettingsAvailable: ready.serverCapabilities.includes("backups.settings.v1"), hostRoutesAvailable: ready.serverCapabilities.includes("host-routes.v1"), hostLanSelectionAvailable: ready.serverCapabilities.includes("host-routes.select-lan.v1"), attachmentAdminAvailable: ready.serverCapabilities.includes("attachments.admin.v1"), asrSetupAvailable: ready.serverCapabilities.includes("integrations.asr.v1"), workspaceDiffAvailable: ready.serverCapabilities.includes("workspace.diff.v1"), workspaceFilesAvailable: ready.serverCapabilities.includes(WORKSPACE_FILES_CAPABILITY), runChangesAvailable: ready.serverCapabilities.includes("runs.changes.v1"), runScopesAvailable: ready.serverCapabilities.includes(RUN_SCOPES_CAPABILITY), runGroupsAvailable: ready.serverCapabilities.includes(BACKGROUND_TASK_GROUP_CAPABILITY), runTailAvailable: ready.serverCapabilities.includes(RUN_TAIL_CAPABILITY), serverTimeOffset: (ready.serverTime ?? Date.now()) - Date.now(), networkAvailable: ready.serverCapabilities.includes(PRIVATE_NETWORK_CAPABILITY), folderReorderAvailable: ready.serverCapabilities.includes("conversation-folders.reorder.v1"), folderPinAvailable: ready.serverCapabilities.includes("conversation-folders.pin.v1"), conversationAvatarsAvailable: ready.serverCapabilities.includes("conversation-avatars.v1"), foldersAvailable: !!ready.conversationFolders, user: ready.user, avatars: ready.avatars, status: "online", bots: ready.bots.filter(bot => !bot.deletedAt && bot.role !== "worker"), deletedBots: ready.bots.filter(bot => !!bot.deletedAt && bot.role !== "worker"), dispatchWorkers: ready.bots.filter(bot => !bot.deletedAt && bot.role === "worker"), botDeletionAvailable: ready.serverCapabilities.includes("bots.delete.v1"), promptQueueAvailable: ready.serverCapabilities.includes("prompt-queue.v1"), messageDeletionAvailable: ready.serverCapabilities.includes(MESSAGE_DELETE_CAPABILITY), messageClearAvailable: ready.serverCapabilities.includes(MESSAGE_CLEAR_CAPABILITY), maxFileBytes: ready.uploadLimits?.maxFileBytes ?? MAX_FILE_BYTES, error: undefined, routeDiagnosis: undefined }, true); void rememberGroupReplyCapabilities(this).catch(() => undefined); void syncShareUploadLimit(this.state.maxFileBytes ?? MAX_FILE_BYTES).catch(() => console.warn("share_limit_cache_failed")); this.lastPong = performance.now(); this.presence(); void this.refreshNotificationPreferences().catch(() => undefined);
           const timing = connectionTiming(chosen.route, usesPinnedTransport());
           let heartbeatAt = performance.now();
           this.heartbeat = setInterval(() => {
@@ -716,13 +733,13 @@ export class HubConnection {
             // This is a local installation boundary, not a signed Host revocation
             // or network outage. Keep cached drafts/history, stop automatic retry
             // and never drain this identity's outbox into a fresh pairing.
-            this.pairingRequired = true; this.close(); this.update({ error: connectionErrorMessage(error) }); return;
+            this.pairingRequired = true; this.close(); this.update({ error: connectionErrorMessage(error), routeDiagnosis: undefined }); return;
           }
           if (this.cache.isClosed) { this.cacheUnavailable(); return; }
           this.cacheFull = error instanceof Error && error.name === "QuotaExceededError";
           localFailure = this.cacheFull || error instanceof Error && ["local_reset_in_progress", "sync_lineage_mismatch", "snapshot_lineage_mismatch"].includes(error.message)
             || preparation === "signature";
-          this.update({ error: connectionErrorMessage(error) });
+          this.update({ error: connectionErrorMessage(error), routeDiagnosis: undefined });
         }
         ws.close();
       }).finally(() => { pendingFrames--; }); };
@@ -745,8 +762,13 @@ export class HubConnection {
         };
         void chain.then(drained, drained);
       };
-      ws.onerror = (event) => { if (generation === this.generation && !this.closed) this.update({ error: connectionErrorMessage(event instanceof ErrorEvent ? event.message : undefined) }); this.abandon(ws, generation); };
-    } catch (error) { if (generation !== this.generation || this.closed) return; this.update({ error: connectionErrorMessage(error) }); this.offline(); }
+      ws.onerror = (event) => { if (generation === this.generation && !this.closed) this.update({ error: connectionErrorMessage(event instanceof ErrorEvent ? event.message : undefined), routeDiagnosis: undefined }); this.abandon(ws, generation); };
+    } catch (error) {
+      if (generation !== this.generation || this.closed) return;
+      if (error instanceof RouteDiagnosisError) this.update({ error: error.diagnosis.message, routeDiagnosis: error.diagnosis });
+      else this.update({ error: connectionErrorMessage(error), routeDiagnosis: undefined });
+      this.offline();
+    }
   }
   private abandon(ws: HubSocket, generation: number, failed = true): void {
     if (generation !== this.generation) return;
@@ -1043,7 +1065,7 @@ export class HubConnection {
       await this.flush();
     }
   }
-  clearError(): void { this.update({ error: undefined }); }
+  clearError(): void { this.update({ error: undefined, routeDiagnosis: undefined }); }
   async retryFailed(id: string): Promise<void> {
     if (await this.cache.retryFailed(id)) {
       const entry = (await this.cache.outbox()).find(item => item.id === id);
@@ -1116,7 +1138,7 @@ export class HubConnection {
       for (const url of this.failedRoutes.keys()) if (!routes.some(route => route.url === url)) this.failedRoutes.delete(url);
       this.preferredProbeAt = 0;
       const current = routes.find(route => route.url === this.state.route?.url);
-      this.update({ routeSync: undefined, route: current ?? this.state.route, routeHealth: this.state.routeHealth?.filter(health => routes.some(route => route.url === health.url)) });
+      this.update({ routeSync: undefined, route: current ?? this.state.route, routeHealth: this.state.routeHealth?.filter(health => routes.some(route => route.url === health.url)), routeDiagnosis: undefined, ...(this.state.routeDiagnosis ? { error: undefined } : {}) });
       if (this.state.status !== "online" || !current) this.resume(true);
       else void this.pollPreferredRoute(this.generation, true);
     });
@@ -1485,7 +1507,7 @@ export class HubConnection {
   private async acceptRevocation(): Promise<void> {
     this.deviceRevoked = true;
     if (this.networkPin) this.networkBlocked = true;
-    this.close(true); this.update({ error: t("此设备已被吊销，请重新配对") });
+    this.close(true); this.update({ error: t("此设备已被吊销，请重新配对"), routeDiagnosis: undefined });
     await this.cache.markIdentityRevoked(this.identity).catch(() => console.warn("device_revocation_cache_failed"));
   }
   close(preserveDeparture = false): void { this.clearForegroundProbe(); this.probeAbort?.abort(); if (!preserveDeparture) this.departureRequest?.abort(); this.inflightEntry = undefined; window.removeEventListener("online", this.networkOnline); document.removeEventListener("visibilitychange", this.presence); window.removeEventListener("focus", this.presence); window.removeEventListener("blur", this.presence); window.removeEventListener(NATIVE_ACTIVE_EVENT, this.presence); this.started = false; this.starting = undefined; ++this.lifecycle; this.closed = true; this.passiveAttachments.cancelAll(new Error(t("连接已关闭，下载已停止。"))); if (this.outboxRetry) clearTimeout(this.outboxRetry); this.httpEpoch.abort(); this.update({ status: "offline", syncProgress: undefined, routeSync: undefined }); ++this.generation; if (this.reconnect) clearTimeout(this.reconnect); if (this.heartbeat) clearInterval(this.heartbeat); if (this.renewal) clearTimeout(this.renewal); if (this.probeTimer) clearInterval(this.probeTimer); if (this.handshake) clearTimeout(this.handshake); this.ws?.close(); }

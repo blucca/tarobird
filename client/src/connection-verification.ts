@@ -10,6 +10,19 @@ export function deviceStorageErrorMessage(error: unknown): string | undefined {
   return undefined;
 }
 
+const NATIVE_LIFECYCLE_ERRORS = new Set([
+  "native_document_retired",
+  "native_document_unavailable",
+  "native_view_unavailable",
+  "native_transport_unavailable",
+]);
+
+/** Return the machine-readable code if `error` is a local native lifecycle failure. */
+export function nativeLifecycleErrorCode(error: unknown): string | undefined {
+  const code = error instanceof Error ? error.message : typeof error === "string" ? error : "";
+  return NATIVE_LIFECYCLE_ERRORS.has(code) ? code : undefined;
+}
+
 /** Native IPC rejects with strings as well as Errors. Never expose a raw
  * implementation code (or validation dump) as the user's recovery guidance. */
 export function connectionErrorMessage(error: unknown): string {
@@ -25,8 +38,9 @@ export function connectionErrorMessage(error: unknown): string {
   if (code === "local_cache_preparation_timeout") return t("本地消息缓存准备超时，请退出并重新打开 TaroBird。历史消息和草稿仍保留。");
   if (["local_cache_unavailable", "local_cache_closed"].includes(code)) return t("本地消息缓存已关闭，自动重连已停止。请关闭其他 TaroBird 窗口后重新打开应用；不要清除应用数据。");
   if (["device_key_unavailable", "device_key_invalid", "system_keychain_unavailable"].includes(code)) return t("无法读取此设备的配对密钥，请解锁系统钥匙串后重试；仍无法连接时，请重新配对。");
-  if (["native_document_retired", "native_document_unavailable", "native_view_unavailable"].includes(code)) return t("连接组件已失效，请重新打开 TaroBird。配对信息和草稿仍保留。");
+  if (NATIVE_LIFECYCLE_ERRORS.has(code)) return t("连接组件已失效，请重新打开 TaroBird。配对信息和草稿仍保留。");
   if (["native_socket_timeout", "native_request_timeout", "connection_handshake_timeout"].includes(code)) return t("主机响应超时，正在自动重试。请确认主机仍在运行。");
+  if (code === "local_network_permission_denied") return t("TaroBird 没有获得“本地网络”权限，无法访问局域网主机。请在设备的「设置 → 隐私与安全性 → 本地网络」中允许 TaroBird，然后重试。");
   if (code && code.length < 240 && !/^[a-z_]+$/.test(code) && !code.startsWith("[")) return code;
   return t("连接中断，正在自动重试。请检查主机和网络状态。");
 }

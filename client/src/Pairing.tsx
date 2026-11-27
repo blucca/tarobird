@@ -14,7 +14,8 @@ import { cache, type Route, type Identity, type PendingPairing } from "./storage
 import { nativePlatform, deleteNativeIdentity } from "./native.js";
 import { t, useLocale } from "./i18n.js";
 import { hubFetch, usesPinnedTransport } from "./transport.js";
-import { connectionVerificationFailure, connectionVerificationMessage, preferredVerificationFailure, validHubPublicKey } from "./connection-verification.js";
+import { connectionErrorMessage, connectionVerificationFailure, connectionVerificationMessage, nativeLifecycleErrorCode, validHubPublicKey } from "./connection-verification.js";
+import { classifyRouteKind, diagnoseRouteFailures, routeDiagnosisMessage, type RouteDiagnosis, type RouteFailureAttempt } from "./route-diagnostics.js";
 import { pairingInviteError } from "./pairing-invite-errors.js";
 import { inspectBrowserPairingHash, stripBrowserPairingHash, type ConnectPayload } from "./web-browser.js";
 
@@ -25,7 +26,7 @@ const DesktopWelcome = lazy(() => import("./DesktopWelcome.js").then(module => (
 const RepairHostRoute = lazy(() => import("./RepairHostRoute.js").then(module => ({ default: module.RepairHostRoute })));
 
 class PairingRequestError extends Error { constructor(readonly code: string, message: string) { super(message); } }
-const idle = { status: "offline" as const, error: undefined as string | undefined, awaitingApproval: false };
+const idle = { status: "offline" as const, error: undefined as string | undefined, routeDiagnosis: undefined as RouteDiagnosis | undefined, awaitingApproval: false };
 const noopSubscribe = () => () => undefined;
 export function Pairing({ connected, save, beforePair, discard, cancel, pendingConnection, manage, manageConnections, existingHostStatus, browserImport, consumeBrowserImport, localHostReady = false }: PairingProps) {
   useLocale();
@@ -55,11 +56,14 @@ export function Pairing({ connected, save, beforePair, discard, cancel, pendingC
     });
     return () => cancelAnimationFrame(frame);
   }, [scan, expectedKey, invite, fromBrowserLink]);
-  const [createdIdentity, setIdentity] = useState<Identity>(), [error, setError] = useState(""), [busy, setBusy] = useState(false);
-  // On a short phone screen the action sits at the bottom edge, so a refusal
-  // below it would look like nothing happened. Reveal it; focus stays put.
-  const revealFailure = () => { if (phone) failure.current?.scrollIntoView({ block: "nearest", behavior: "instant" }); };
-  useEffect(() => { if (error) revealFailure(); }, [phone, error]);
+  const [createdIdentity, setIdentity] = useState<Identity>(), [error, setError] = useState(""), [routeFailure, setRouteFailure] = useState<{ attempts: RouteFailureAttempt[]; configuredRoutes: Route[]; online: boolean; pendingConfirm?: boolean }>(), [busy, setBusy] = useState(false);
+  const displayedError = routeFailure
+    ? `${routeFailure.pendingConfirm ? `${t("配对申请结果待确认，请核对上次申请，不要重复创建设备。")} ` : ""}${diagnoseRouteFailures(routeFailure.attempts, { context: "pairing", configuredRoutes: routeFailure.configuredRoutes, online: routeFailure.online }).message}`
+    : error;
+  // On a short phone screen or desktop viewport the action sits near the bottom edge,
+  // so a refusal below it would look like nothing happened. Reveal it; focus stays put.
+  const revealFailure = () => { failure.current?.scrollIntoView({ block: "nearest", behavior: "instant" }); };
+  useEffect(() => { if (displayedError) revealFailure(); }, [displayedError]);
   // "Connect a different host" sets the unanswered request aside without
   // touching it; the page only uses a pending connection of the shown identity.
   const [another, setAnother] = useState(false);
@@ -70,23 +74,28 @@ export function Pairing({ connected, save, beforePair, discard, cancel, pendingC
   // Native phones: connection details were read, nothing is connected yet.
   // Derived only; the user still starts pairing and approves it elsewhere.
   const reviewing = phone && !!expectedKey && !pending;
-  const directHost = (() => { try { return address ? new URL(address).hostname : ""; } catch { return ""; } })();
+  const trimmedAddress = address.trim();
+  const parsedAddress = (() => { try { return trimmedAddress ? new URL(trimmedAddress) : undefined; } catch { return undefined; } })();
+  const matchedLegacyDirect = legacyDirect && parsedAddress && legacyDirect.url === parsedAddress.origin ? legacyDirect : undefined;
+  const directHost = parsedAddress?.hostname ?? "";
+  const directRouteKind = trimmedAddress ? classifyRouteKind({ name: matchedLegacyDirect?.name ?? "Direct", url: trimmedAddress }) : undefined;
   const routeHosts = [
     ...(address ? [directHost || address] : []),
     ...relays.map((route) => { try { return new URL(route.url).hostname || route.url; } catch { return route.url; } }).filter(Boolean),
   ].filter((host, index, all) => all.indexOf(host) === index);
   const routeSummary = routeHosts.length ? routeHosts.join(" · ") : t("VPS 中转");
   const existingStatus = expectedKey && !pending ? existingHostStatus?.(expectedKey) : undefined;
-  const tailscaleRoute = legacyDirect?.name === "Tailscale" || directHost.endsWith(".ts.net") || /^100\.(?:6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\./.test(directHost);
-  const lanRoute = /^(?:192\.168\.|10\.|172\.(?:1[6-9]|2[0-9]|3[01])\.)/.test(directHost);
+  const tailscaleRoute = matchedLegacyDirect?.name === "Tailscale" || directRouteKind === "tailscale";
+  const lanRoute = directRouteKind === "lan";
   const status = useSyncExternalStore(connection ? (notify) => connection.subscribe(notify) : noopSubscribe, () => connection?.state ?? idle);
+  const statusError = routeDiagnosisMessage(status.routeDiagnosis) ?? status.error;
   const [now, setNow] = useState(Date.now), completing = useRef(false), admission = useRef(false);
   const remaining = pending ? pairingRemaining(pending.expiresAt, now, pending.serverTimeOffset) : 0;
   useEffect(() => { if (!pending) return; const timer = setInterval(() => setNow(Date.now()), 1000); return () => clearInterval(timer); }, [pending]);
   const renewPendingConnection = (targetConnection: HubConnection, targetPending: PendingPairing, payload: ConnectPayload) => {
     if (payload.hubPublicKey !== targetConnection.identity.hubPublicKey) throw new Error(t("这不是当前主机的二维码。请扫描此主机显示的连接二维码。"));
     if (admission.current) throw new Error(t("正在核对上一份申请，请稍候。"));
-    admission.current = true; setBusy(true); setError(""); setRequestError(undefined);
+    admission.current = true; setBusy(true); setError(""); setRouteFailure(undefined); setRequestError(undefined);
     const next: PendingPairing = { code: "", expiresAt: 0, request: { invite: payload.invite!, requestId: randomNonce() } };
     void (async () => {
       const snapshot = { ...targetConnection.identity };
@@ -181,7 +190,7 @@ export function Pairing({ connected, save, beforePair, discard, cancel, pendingC
     return { code: result.code, expiresAt: result.expiresAt, request: { requestId: request.requestId }, serverTimeOffset: Number.isFinite(result.serverTime) ? result.serverTime! - Date.now() : pairingClockOffset(response.headers.get("date"), Date.now()) };
   };
   const pair = async (event: FormEvent) => {
-    event.preventDefault(); if (admission.current) return; admission.current = true; setBusy(true); setError(""); let created: Identity | undefined, persisted = false;
+    event.preventDefault(); if (admission.current) return; admission.current = true; setBusy(true); setError(""); setRouteFailure(undefined); let created: Identity | undefined, persisted = false;
     try {
       if (!invite) throw new Error(pairingInviteError("invite_required"));
       const { routes, deployment: routeDeployment } = connectionConfiguration(address, relays, deployment, legacyDirect);
@@ -189,14 +198,14 @@ export function Pairing({ connected, save, beforePair, discard, cancel, pendingC
       if (usesPinnedTransport() && trustedKey && !validHubPublicKey(trustedKey)) throw new Error("invalid_hub_key");
       rememberRouteTrust(routes, trustedKey);
       const pageOrigin = platform === "web" && location.origin.startsWith("http") ? location.origin : undefined;
-      const ordered = orderedRoutes(routes);
+      const ordered = orderedRoutes(routes), probedRoutes = ordered;
       const pageOriginIndex = pageOrigin ? ordered.findIndex((route) => {
         try { return new URL(route.url).origin === pageOrigin; } catch { return false; }
       }) : -1;
       if (fromBrowserLink && (!pageOrigin || pageOriginIndex < 0)) {
         throw new Error(t("此浏览器配对链接与当前访问地址不匹配，请使用目标主机生成的链接。"));
       }
-      const probes = await Promise.allSettled(ordered.map(async (route) => {
+      const probes = await Promise.allSettled(probedRoutes.map(async (route) => {
         const response = await hubFetch(route.url, "/health", trustedKey, { signal: timeoutSignal(usesPinnedTransport() ? 6000 : 2000), cache: "no-store" });
         const health = await response.json() as { ok?: boolean; publicKey?: string; pairingInvites?: number };
         if (!response.ok || health.ok !== true || typeof health.publicKey !== "string") throw new Error("hub_unavailable");
@@ -217,8 +226,16 @@ export function Pairing({ connected, save, beforePair, discard, cancel, pendingC
       const available = (pageOriginIndex >= 0 && probes[pageOriginIndex]?.status === "fulfilled" ? probes[pageOriginIndex] : undefined)
         ?? probes.find((result) => result.status === "fulfilled");
       if (!available || available.status !== "fulfilled") {
-        const failure = preferredVerificationFailure(probes.map((result) => result.status === "rejected" ? connectionVerificationFailure(result.reason) : undefined));
-        throw new Error(connectionVerificationMessage(failure) ?? t("没有可用且身份匹配的线路，请检查地址后重试。"));
+        const attempts: RouteFailureAttempt[] = probedRoutes.map((route, index) => ({
+          route,
+          error: probes[index]?.status === "rejected" ? probes[index].reason : "hub_unavailable",
+        }));
+        const localCode = attempts.map((attempt) => nativeLifecycleErrorCode(attempt.error)).find(Boolean);
+        if (localCode) throw new Error(connectionErrorMessage(localCode));
+        const online = typeof navigator === "undefined" ? true : navigator.onLine;
+        const diagnosis = diagnoseRouteFailures(attempts, { context: "pairing", configuredRoutes: routes, online });
+        setRouteFailure({ attempts, configuredRoutes: routes, online });
+        throw new Error(diagnosis.message);
       }
       if (!available.value.supportsInvites) throw new Error(t("请先更新此主机，才能使用限时连接码配对新设备。"));
       await beforePair?.(available.value.publicKey);
@@ -237,14 +254,15 @@ export function Pairing({ connected, save, beforePair, discard, cancel, pendingC
     if (!identity?.hubPublicKey || !pendingConnection || admission.current || pendingConnection.identity.deviceId !== identity.deviceId || pendingConnection.identity.hubPublicKey !== identity.hubPublicKey) return;
     const request = identity.pendingPairing?.request; if (!request) return;
     const expected = { requestId: request.requestId, code: identity.pendingPairing!.code };
-    admission.current = true; setBusy(true); setError(""); setRequestError(undefined);
+    admission.current = true; setBusy(true); setError(""); setRouteFailure(undefined); setRequestError(undefined);
+    const failedAttempts: RouteFailureAttempt[] = [];
     try {
       const active = identity.routes.find(route => route.url === pendingConnection.state.route?.url && route.certificateAuthority === pendingConnection.state.route?.certificateAuthority);
       const routes = [active, ...orderedRoutes(identity.routes)].filter((route): route is Route => !!route);
       let next: PendingPairing | undefined, failure: unknown;
       for (const route of routes.filter((route, index) => routes.findIndex(other => other.url === route.url) === index)) {
         try { next = await requestPair(identity, route, identity.hubPublicKey, request); break; }
-        catch (e) { if (e instanceof PairingRequestError) throw e; failure = e; }
+        catch (e) { if (e instanceof PairingRequestError) throw e; failure = e; failedAttempts.push({ route, error: e }); }
       }
       if (!next) throw failure ?? new Error("pairing_response_unknown");
       await pendingConnection.cache.savePendingPairing(identity, next, expected);
@@ -262,7 +280,22 @@ export function Pairing({ connected, save, beforePair, discard, cancel, pendingC
           } catch { return; /* A newer request or approval must never be overwritten. */ }
         }
         setRequestError(e instanceof PairingRequestError ? e.code : undefined);
-        setError(connectionVerificationMessage(connectionVerificationFailure(e)) ?? (e instanceof PairingRequestError ? e.message : t("配对申请结果待确认，请核对上次申请，不要重复创建设备。")));
+        const verification = connectionVerificationMessage(connectionVerificationFailure(e));
+        if (verification) setError(verification);
+        else if (e instanceof PairingRequestError) setError(e.message);
+        else if (failedAttempts.length) {
+          const localCode = failedAttempts.map((attempt) => nativeLifecycleErrorCode(attempt.error)).find(Boolean);
+          if (localCode) {
+            setError(connectionErrorMessage(localCode));
+          } else {
+            const online = typeof navigator === "undefined" ? true : navigator.onLine;
+            const diagnosis = diagnoseRouteFailures(failedAttempts, { context: "pairing", configuredRoutes: identity.routes, online });
+            setRouteFailure({ attempts: failedAttempts, configuredRoutes: identity.routes, online, pendingConfirm: true });
+            setError(`${t("配对申请结果待确认，请核对上次申请，不要重复创建设备。")} ${diagnosis.message}`);
+          }
+        } else {
+          setError(t("配对申请结果待确认，请核对上次申请，不要重复创建设备。"));
+        }
       }
     } finally { admission.current = false; setBusy(false); }
   };
@@ -276,7 +309,7 @@ export function Pairing({ connected, save, beforePair, discard, cancel, pendingC
   // A different host starts from an empty form: details read for this request
   // (its invite, address and key) must not be submitted for another host.
   const startAnother = () => {
-    setAnother(true); setIdentity(undefined); setError(""); setRequestError(undefined);
+    setAnother(true); setIdentity(undefined); setError(""); setRouteFailure(undefined); setRequestError(undefined);
     setFromBrowserLink(false);
     setInvite(undefined); setExpectedKey(undefined); setManualKey(""); setDeployment(undefined); setLegacyDirect(undefined); setRelays([]);
     setAddress(nativePlatform() === "web" && location.origin.startsWith("http") ? location.origin : ""); setManual(platform === "web"); setOptionsOpen(false); setHostName(t("我的主机"));
@@ -285,8 +318,8 @@ export function Pairing({ connected, save, beforePair, discard, cancel, pendingC
   if (desktop && !remote) return <Suspense fallback={<div className="loading-screen"><BrandMark/><LoaderCircle className="spin" size={16}/></div>}><DesktopWelcome localHostReady={localHostReady || !!preparedLocal} connected={connected} save={saveLocal} beforePair={beforePair} discard={discard} cancel={cancel ?? (preparedLocal ? () => { void Promise.resolve(connected(preparedLocal)).catch(e => setError(String(e))); } : undefined)} pending={!!pending} remote={() => setRemote(true)}/></Suspense>;
   return <main className="pairing-page"><div className="pairing-layout"><div className={`pairing-card${!pending && phone ? " pairing-phone-welcome" : ""}`}>
     {(desktop || cancel || another && !createdIdentity && !!pendingConnection?.identity.pendingPairing) && <nav className="pairing-navigation">
-      {desktop && <button type="button" className="pairing-host-cancel" disabled={busy} onClick={() => { setRemote(false); setError(""); }}><ChevronLeft size={16}/>{t("返回开始")}</button>}
-      {another && !createdIdentity && pendingConnection?.identity.pendingPairing && <button type="button" className="pairing-host-cancel" disabled={busy} onClick={() => { setAnother(false); setError(""); }}><ChevronLeft size={16}/>{t("返回配对申请")}</button>}
+      {desktop && <button type="button" className="pairing-host-cancel" disabled={busy} onClick={() => { setRemote(false); setError(""); setRouteFailure(undefined); }}><ChevronLeft size={16}/>{t("返回开始")}</button>}
+      {another && !createdIdentity && pendingConnection?.identity.pendingPairing && <button type="button" className="pairing-host-cancel" disabled={busy} onClick={() => { setAnother(false); setError(""); setRouteFailure(undefined); }}><ChevronLeft size={16}/>{t("返回配对申请")}</button>}
       {cancel && <button type="button" className="pairing-host-cancel pairing-return-conversations" disabled={busy} onClick={cancel}><ArrowLeft size={16} aria-hidden="true"/>{t("返回会话")}</button>}
     </nav>}
     <BrandMark/>{joiningDesktop && <ol className="pairing-journey" aria-label={t("加入步骤")}><li>{t("准备电脑")}</li><li aria-current="step">{t("手机确认连接")}</li><li>{t("确认加入网络")}</li></ol>}<h1>{pending ? t("用已配对设备确认") : t("连接你的 TaroBird")}</h1>
@@ -296,9 +329,10 @@ export function Pairing({ connected, save, beforePair, discard, cancel, pendingC
       <p className="muted">{t("新设备：{0}", identity?.name ?? name)}</p>
       {pending.code && <><div className="pair-code" aria-label={t("配对码")}>{pending.code}</div>
       <p className="pairing-countdown">{remaining ? t("有效时间 {0}:{1}", Math.floor(remaining / 60), String(remaining % 60).padStart(2, "0")) : t("配对码已过期，请扫描新的限时连接码。")}</p></>}
-      <div role="status" className="pairing-connection-status">{remaining > 0 && <LoaderCircle className="spin" size={18}/>}<span>{status.status === "online" ? joiningDesktop ? t("已连接，正在继续加入网络…") : t("已连接，正在打开聊天…") : !pending.code ? busy ? t("正在核对申请…") : t("配对申请结果待确认，请核对上次申请。") : !remaining ? t("配对码已过期，请扫描新的限时连接码。") : status.awaitingApproval ? t("等待已配对设备确认…") : t("正在连接主机…")}</span></div>
-      {status.error && <p className="error-text" role="alert">{status.error}</p>}
-      <button className="secondary full" disabled={busy || status.status === "connecting"} onClick={() => { setError(""); completing.current = false; connection?.resume(true); }}>{t("重新检查连接")}</button>
+      <div role="status" className="pairing-connection-status">{remaining > 0 && <LoaderCircle className="spin" size={18}/>}<span>{status.status === "online" ? joiningDesktop ? t("已连接，正在继续加入网络…") : t("已连接，正在打开聊天…") : !pending.code ? busy ? t("正在核对申请…") : ["pairing_invite_invalid", "pairing_invite_expired", "pairing_invite_used", "pairing_invite_required"].includes(requestError ?? "") ? t("连接码无效或已过期，请重新获取。") : t("配对申请结果待确认，请核对上次申请。") : !remaining ? t("配对码已过期，请扫描新的限时连接码。") : status.awaitingApproval ? t("等待已配对设备确认…") : t("正在连接主机…")}</span></div>
+      {statusError && <p className="error-text" role="alert">{statusError}</p>}
+      {displayedError && <p ref={failure} role="alert" className="error-text">{displayedError}</p>}
+      <button className="secondary full" disabled={busy || status.status === "connecting"} onClick={() => { setError(""); setRouteFailure(undefined); completing.current = false; connection?.resume(true); }}>{t("重新检查连接")}</button>
       {!pending.code && pending.request && <button className="primary full" disabled={busy} onClick={() => void submitPending()}>{busy ? t("正在核对申请…") : t("核对上次申请")}</button>}
       {((!!pending.code && !remaining) || ["pairing_invite_invalid", "pairing_invite_expired", "pairing_invite_used", "pairing_invite_required"].includes(requestError ?? "")) && <>
         <button className="secondary full" disabled={busy} onClick={() => { setInputMode("scan"); setScan(true); }}>{t("扫描新的连接码")}</button>
@@ -347,8 +381,8 @@ export function Pairing({ connected, save, beforePair, discard, cancel, pendingC
         {!manual && !expectedKey && <button type="button" className="pairing-manual full" disabled={busy} onClick={() => setManual(true)}>{t("手动连接与高级选项")}</button>}
       </form>
     </>}
-    {error && <p ref={failure} role="alert" className="error-text">{error}</p>}
-    {reviewing && routeHint}
+    {!pending && displayedError && <p ref={failure} role="alert" className="error-text">{displayedError}</p>}
+    {!pending && reviewing && !displayedError && routeHint}
     <footer><ShieldCheck size={13} aria-hidden="true"/>{t("只有经过你确认的设备才能访问 Bot。")}</footer>
   </div>{!pending && <PairingIntro/>}</div>
   {scan && <Suspense fallback={null}><PairingScanner initialMode={inputMode} close={() => setScan(false)} receive={(payload) => {
@@ -362,6 +396,6 @@ export function Pairing({ connected, save, beforePair, discard, cancel, pendingC
     imported.current = true;
     setFromBrowserLink(false);
     setInvite(payload.invite);
-    setDeployment(payload.deployment); setLegacyDirect(payload.routes.find((r) => r.name !== "VPS")); setAddress(payload.routes.find((r) => r.name !== "VPS")?.url ?? ""); setRelays(payload.routes.filter((r) => r.name === "VPS")); setExpectedKey(payload.hubPublicKey); setManual(false); setOptionsOpen(false); setError("");
+    setDeployment(payload.deployment); setLegacyDirect(payload.routes.find((r) => r.name !== "VPS")); setAddress(payload.routes.find((r) => r.name !== "VPS")?.url ?? ""); setRelays(payload.routes.filter((r) => r.name === "VPS")); setExpectedKey(payload.hubPublicKey); setManual(false); setOptionsOpen(false); setError(""); setRouteFailure(undefined);
   }}/></Suspense>}</main>;
 }
