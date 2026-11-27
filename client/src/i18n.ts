@@ -59,6 +59,17 @@ export function useLocale(): SupportedLocale {
   );
 }
 
+/**
+ * The UI locale to put in a request a Host validates. Hosts up to 1.6.0 accept only
+ * "zh" or "en" there and answer 400 otherwise, so any other UI locale (such as "ja")
+ * is sent as "en" unless the Host announced REQUEST_LOCALES_CAPABILITY.
+ */
+export function hostRequestLocale(active: Locale, hostAcceptsLocales: boolean | undefined): Locale {
+  const resolved = normalizeLocale(active, "en");
+  if (resolved === "zh" || resolved === "en") return resolved;
+  return hostAcceptsLocales ? resolved : "en";
+}
+
 /** Only application-owned strings are translated. Bot output stays verbatim. */
 export function t(key: string, ...values: (string | number | undefined)[]): string {
   return translateFromCatalogs(locale, UI_CATALOGS, key, values);

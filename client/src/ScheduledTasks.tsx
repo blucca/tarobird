@@ -8,7 +8,7 @@ import { Avatar } from "./Avatar.js";
 import { useBotLabels } from "./BotReferences.js";
 import { scheduleCadence } from "./schedule-cadence.js";
 import { HubHttpError } from "./http-error.js";
-import { localeIntlTag, t, useLocale } from "./i18n.js";
+import { hostRequestLocale, localeIntlTag, t, useLocale } from "./i18n.js";
 import "./scheduled-tasks.css";
 
 type Frequency = "daily" | "weekdays" | "weekly" | "once" | "custom";
@@ -126,7 +126,8 @@ export function ScheduledTasks({ connection, bots, conversations, initialBot, in
     wasOffline.current = !hostOnline;
   }, [hostOnline]);
   const request = async (mutation: ScheduleMutation, targetBotId = botId) => {
-    await connection.http(`/api/bots/${targetBotId}/schedules`, { method: "POST", body: JSON.stringify({ mutation, locale }) });
+    // A 1.6.0 Host rejects any locale but "zh"/"en" with 400; see hostRequestLocale.
+    await connection.http(`/api/bots/${targetBotId}/schedules`, { method: "POST", body: JSON.stringify({ mutation, locale: hostRequestLocale(locale, connection.state.requestLocalesAvailable) }) });
   };
   const save = async () => {
     if (!draft || busy || !online) return;
