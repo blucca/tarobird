@@ -12,7 +12,8 @@ import { checkBudgetAvailability, recordBridgeTurnUsage, recordFailedTurnUsage }
 import { applyConversationResumeScope } from "../runtime/conversation-resume.js";
 import { CronAccessDeniedError } from "../runtime/cron-errors.js";
 import { createFreshCronSessionId } from "../runtime/cron-session.js";
-import type { CronExecutor } from "../runtime/cron-scheduler.js";
+import type { CronExecutionResult, CronExecutor } from "../runtime/cron-scheduler.js";
+import { appendTimelineEventBestEffort } from "../runtime/timeline-events.js";
 import type { CronJobRecord } from "../state/cron-store-schema.js";
 import { loadInstanceConfig, resolveInstanceWorkspacePath } from "../state/instance-config.js";
 import { larkAgentInstructions, larkMediaTaskInstruction, type LarkAgentInstructionOptions } from "./agent-instructions.js";
@@ -60,6 +61,7 @@ export function buildCoreCronExecutor(input: {
   bridge: CoreBridgeLike;
   runtime: CoreServiceRuntime;
   stateDir: string;
+  instanceName?: string;
   workspaceOverride?: string;
   agentInstructions?: (options: LarkAgentInstructionOptions) => string;
   deliverResponse?: CoreCronDeliverResponse;
@@ -67,7 +69,7 @@ export function buildCoreCronExecutor(input: {
   createRunCard?: typeof import("./message-handler.js")["createCoreRunCardController"];
   requestApproval?: typeof import("./card-actions.js")["requestCoreApproval"];
 }): CronExecutor {
-  return async (job, abortSignal, lifecycle): Promise<void> => {
+  return async (job, abortSignal, lifecycle): Promise<void | CronExecutionResult> => {
     const startExecution = lifecycle?.deferTimeoutUntilStarted();
     abortSignal?.throwIfAborted();
     if (job.channel !== "lark") {
@@ -111,11 +113,12 @@ export function buildCoreCronExecutor(input: {
           options: coreCronReplyOptions(job),
           locale,
         });
+        return { outcome: "reminder_sent" };
       }
-      return;
+      return { outcome: "reminder_muted" };
     }
 
-    const runCronTurn = async (): Promise<void> => {
+    const runCronTurn = async (): Promise<void | CronExecutionResult> => {
       const controller = new AbortController();
       const forwardAbort = () => controller.abort();
       if (abortSignal?.aborted) {
@@ -152,10 +155,24 @@ export function buildCoreCronExecutor(input: {
           ?? resolveInstanceWorkspacePath(cfg);
         const budgetExhausted = await checkBudgetAvailability(input.stateDir, cfg.budgetUsd, locale);
         if (budgetExhausted) {
+          await appendTimelineEventBestEffort(input.stateDir, {
+            type: "budget.blocked",
+            instanceName: input.instanceName,
+            channel: job.channel,
+            chatId: job.chatId,
+            conversationKey,
+            userId: job.userId,
+            detail: "budget exhausted",
+            metadata: {
+              cronJobId: job.id,
+              budgetUsd: budgetExhausted.budgetUsd,
+              totalCostUsd: budgetExhausted.usage.totalCostUsd,
+            },
+          });
           if (!job.mute) {
             await sendCoreMarkdown(input.channel, job.larkChatId!, budgetExhausted.message, replyFields);
           }
-          return;
+          return { outcome: "budget_exhausted" };
         }
         // Render the AI task's result into a run card (same UX as a chat reply):
         // open the card, run the turn, then finish it with the answer.
@@ -261,7 +278,7 @@ export function buildCoreCronExecutor(input: {
         scopedRuns.markForegroundEnded();
         await recordBridgeTurnUsage(input.stateDir, result.usage, cfg.budgetUsd);
         if (job.mute) {
-          return;
+          return { outcome: "completed" };
         }
         const finalText = result.text || renderCoreEmptyCronAgentReply(job);
         const cardDisplayText = runCard ? cleanCardText(runCard.resolveFinalText(finalText), locale) : finalText;
@@ -338,6 +355,7 @@ export function buildCoreCronExecutor(input: {
           if (requiresVisibleDeliveryPhase) {
             await runCard?.finish(runCardAnswerText);
           }
+          return { outcome: "completed" };
         } catch (error) {
           await runCard?.failDelivery(
             finalText,
@@ -358,7 +376,7 @@ export function buildCoreCronExecutor(input: {
     // Scheduled AI turns share the same conversation queue as chat messages.
     // This prevents cron from racing a user turn before the bridge session bind is
     // visible, and makes the run card's Stop button target the cron controller.
-    await input.runtime.chatQueue.enqueue(conversationKey, runCronTurn);
+    return await input.runtime.chatQueue.enqueue(conversationKey, runCronTurn);
   };
 }
 
