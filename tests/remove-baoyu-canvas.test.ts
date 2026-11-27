@@ -21,7 +21,9 @@ import { DesignShareBroker, metaDesignShareRepository, type DesignSharePeer } fr
 import { buildDesignSandbox } from "../client/design-assets.js";
 import { WorkbenchController } from "../client/src/workbench-controller.js";
 import { emptyDesign, emptySlides, type DesignDocument } from "../client/src/workbench-design.js";
-import { emptyWorkbench, type WorkbenchLayout } from "../client/src/workbench-model.js";
+import { createDesignBackup, parseDesignBackup } from "../client/src/workbench-design-backup.js";
+import { exportStoredDesign } from "../client/src/workbench-library.js";
+import { emptyWorkbench, workbenchScope, type WorkbenchLayout } from "../client/src/workbench-model.js";
 import type { HubConnection } from "../client/src/connection.js";
 
 describe("Remove Baoyu Design canvas from Workbench (#89)", () => {
@@ -229,6 +231,103 @@ describe("Remove Baoyu Design canvas from Workbench (#89)", () => {
     expect(saveDesign).not.toHaveBeenCalled();
     expect(designs.get("legacy-canvas")!.revision).toBe(0);
     expect(controller.designSession("legacy-canvas")).toBeUndefined();
+  });
+
+  it("exports a legacy canvas project as a project backup while open, read, edit and import stay refused", async () => {
+    let layout: WorkbenchLayout = {
+      ...emptyWorkbench(),
+      tabs: [
+        { id: "legacy-canvas", kind: "design", title: "Legacy Canvas" },
+        { id: "ppt-1", kind: "design", designFormat: "slides", title: "Deck" },
+      ],
+      visible: ["legacy-canvas"],
+      active: "legacy-canvas",
+    };
+    const designs = new Map<string, DesignDocument>([
+      ["legacy-canvas", emptyDesign("legacy-canvas", "Legacy Canvas")],
+      ["orphan-canvas", emptyDesign("orphan-canvas", "Poster")],
+      ["ppt-1", emptySlides("ppt-1", "Deck")],
+    ]);
+    const stored = structuredClone(designs.get("legacy-canvas")!);
+    const saveDesign = vi.fn(), createDesign = vi.fn(), saveLayout = vi.fn();
+    const frames = new Map<string, WorkbenchCommandFrame>();
+    const state: Record<string, unknown> = { status: "online", user: { id: "owner", name: "Owner" }, workbenchAvailable: true, workbenchDesignAvailable: true, workbenchSlidesAvailable: true };
+    const connection = {
+      identity: { deviceId: "new-app", hubPublicKey: "host" },
+      state,
+      isClosed: false,
+      isReadOnly: false,
+      cache: {
+        isClosed: false,
+        readWorkbench: async () => structuredClone(layout),
+        saveWorkbench: async (_scope: string, expected: number, next: WorkbenchLayout) => { saveLayout(); if (layout.revision !== expected) throw new Error("workbench_revision_conflict"); layout = structuredClone(next); },
+        readWorkbenchDesign: async (_scope: string, id: string) => structuredClone(designs.get(id)),
+        saveWorkbenchDesign: saveDesign,
+        createWorkbenchDesignAndLayout: createDesign,
+        hasWorkbenchItem: async (_scope: string, _kind: string, id: string) => designs.has(id),
+        // As the App's store does: one verified backup of the stored project.
+        readWorkbenchDesignBackup: async (_scope: string, id: string, title: string) => {
+          const document = designs.get(id); if (!document) throw new Error("design_not_found");
+          return createDesignBackup({ title, document: structuredClone(document) });
+        },
+      },
+      subscribe: () => () => undefined,
+      conversationRevision: () => 0,
+      http: vi.fn(async (_route: string, options: RequestInit) => {
+        const frame = frames.get(JSON.parse(String(options.body)).dispatchId)!;
+        return { admitted: true, generation: frame.generation, target: frame.target };
+      }),
+    } as unknown as HubConnection;
+    const controller = new WorkbenchController({ connection, conversationId: "conv" });
+    controllers.push(controller);
+    await controller.initialize();
+    controller.setVisible(true);
+    await new Promise(r => setTimeout(r, 10));
+    const scope = workbenchScope("host", "owner", "conv");
+    expect(controller.scope).toBe(scope);
+
+    // The removed-canvas Tab exports the stored project byte for byte, in the "Back up project" envelope.
+    const text = await controller.exportRemovedCanvas("legacy-canvas", "Legacy Canvas");
+    const backup = JSON.parse(text) as { format: string; version: number; title: string; document: DesignDocument };
+    expect(backup).toMatchObject({ format: "tarobot-design", version: 2, title: "Legacy Canvas" });
+    expect(backup.document.format).toBeUndefined();
+    expect(Object.keys(backup.document.files).sort()).toEqual(["project/Main.dc.html", "project/canvas.json"]);
+    expect(backup.document.files).toEqual(stored.files);
+    // The file is a valid project backup: the 1.6.0 importer's parser reads the canvas back out of it.
+    expect(parseDesignBackup(text, "restored").document.files).toEqual(stored.files);
+    // A project without a Tab is exported from Workbench files the same way.
+    expect(JSON.parse(await exportStoredDesign(connection, scope, "orphan-canvas", "Poster"))).toMatchObject({ format: "tarobot-design", title: "Poster", document: { id: "orphan-canvas" } });
+    // Another user's or Host's scope is never read; a deck keeps its own editor export.
+    await expect(exportStoredDesign(connection, workbenchScope("host", "someone-else", "conv"), "legacy-canvas", "Legacy Canvas")).rejects.toThrow("workbench_scope_unavailable");
+    await expect(exportStoredDesign(connection, workbenchScope("other-host", "owner", "conv"), "legacy-canvas", "Legacy Canvas")).rejects.toThrow("workbench_scope_unavailable");
+    await expect(exportStoredDesign(connection, scope, "missing", "Missing")).rejects.toThrow("design_not_found");
+    await expect(controller.exportRemovedCanvas("ppt-1", "Deck")).rejects.toThrow("workbench_wrong_kind");
+
+    // Exporting opened no editor and wrote nothing.
+    expect(controller.designSession("legacy-canvas")).toBeUndefined();
+    expect(saveDesign).not.toHaveBeenCalled();
+    expect(saveLayout).not.toHaveBeenCalled();
+    expect(designs.get("legacy-canvas")).toEqual(stored);
+
+    // Open, the editor's own export, Bot read/edit and import of the exported file all stay refused.
+    await expect(controller.openLibraryFile({ scope, conversationId: "conv", id: "orphan-canvas", kind: "design", title: "Poster" })).rejects.toThrow("design_canvas_removed");
+    await expect(controller.exportDesign("legacy-canvas", "Legacy Canvas")).rejects.toThrow("design_canvas_removed");
+    const sendCommand = (requestId: string, operation: "design.read" | "design.publish", extra: Record<string, unknown> = {}) => {
+      const frame: WorkbenchCommandFrame = {
+        v: 1, type: "workbench.command", dispatchId: `disp_${requestId}`, deadline: Date.now() + 5000,
+        userId: "owner", conversationId: "conv", generation: controller.getSnapshot().generation,
+        target: { deviceId: "new-app", windowId: controller.getSnapshot().windowId, tabId: "legacy-canvas" },
+        request: { requestId, operation, payload: {}, ...extra } as WorkbenchCommandFrame["request"],
+      };
+      frames.set(frame.dispatchId, frame);
+      return controller.handleCommand(frame);
+    };
+    expect(await sendCommand("export-read", "design.read")).toMatchObject({ status: "not_executed", error: "design_canvas_removed" });
+    expect(await sendCommand("export-publish", "design.publish", { expectedRevision: 0, payload: { files: { "project/Main.dc.html": { content: "<x-dc>mutated</x-dc>", contentType: "text/html" } } } })).toMatchObject({ status: "not_executed", error: "design_canvas_removed" });
+    await expect(controller.importDesign(new File([text], "Legacy Canvas.tarobot-design.json", { type: "application/json" }))).rejects.toThrow("design_canvas_removed");
+    expect(createDesign).not.toHaveBeenCalled();
+    expect(saveDesign).not.toHaveBeenCalled();
+    expect(layout.tabs.map(tab => tab.id)).toEqual(["legacy-canvas", "ppt-1"]);
   });
 
   it("rejects opening, attaching, or joining canvas shares in DesignShareBroker while still letting owners close legacy canvas shares", async () => {

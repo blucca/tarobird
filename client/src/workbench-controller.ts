@@ -16,7 +16,7 @@ import type { Message, Json } from "../../src/client-protocol/index.js";
 import type { HubConnection } from "./connection.js";
 import { changeWorkbench, emptyWorkbench, emptyBoard, boardDocumentSchema, workbenchLayoutSchema, workbenchScope, type WorkbenchLayout, type WorkbenchTab, type LayoutAction, type BoardDocument } from "./workbench-model.js";
 import type { BoardController, BoardResult, BoardImport } from "./workbench-board.js";
-import { designEditorLocks, workbenchEditorLock, type WorkbenchLibraryTarget } from "./workbench-library.js";
+import { designEditorLocks, exportStoredDesign, workbenchEditorLock, type WorkbenchLibraryTarget } from "./workbench-library.js";
 import { WorkbenchBrowserClient, BrowserDispatchRejected, browserAddress, browserPayload, scheduleBrowserLayout, type BrowserEvent, type BrowserTabState, type PreparedBrowserAction } from "./workbench-browser.js";
 
 export type WorkbenchSnapshot = { layout: WorkbenchLayout; ready: boolean; error?: string; browser: boolean; windowId: string; generation: string; boards: ReadonlyMap<string, BoardDocument>; notes: ReadonlyMap<string, MarkdownDocument>; browserTabs: ReadonlyMap<string, BrowserTabState>; chartVersion: number };
@@ -453,6 +453,14 @@ export class WorkbenchController {
     this.check();this.tab(id,"design");await (await this.ensureDesign(id)).flush();this.check();
     const backup=await this.connection.cache.readWorkbenchDesignBackup(this.scope,id,title);this.check();
     return serializeDesignBackup(backup);
+  }
+  /** A Baoyu canvas kept from 1.6.0 or earlier has no editor here and is never
+   * opened. Its stored project can only be saved, as the same backup; a deck
+   * goes through exportDesign, which first flushes its editor. */
+  async exportRemovedCanvas(id: string, title: string): Promise<string> {
+    this.check(); if (this.tab(id, "design").designFormat === "slides") throw new Error("workbench_wrong_kind");
+    const backup = await exportStoredDesign(this.connection, this.scope, id, title); this.check();
+    return backup;
   }
   async importDesign(file: File): Promise<string> {
     if (!file.name.endsWith(".tarobot-design.json") || file.size > DESIGN_BACKUP_MAX_BYTES) throw new Error("design_invalid_import");

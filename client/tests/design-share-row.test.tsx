@@ -28,7 +28,8 @@ describe("shared design list row", () => {
     expect(forGuest).toContain("Canvas removed");
     const forOwner = html(view({ role: "owner", onThisDevice: false, format: "canvas" }));
     expect(buttons(forOwner)).toEqual(["End share"]);
-    expect(shareErrorText(new Error("design_canvas_removed"), word)).toContain("Infinite Canvas");
+    // Says what happened and where a project on this device can be exported; names no replacement product.
+    expect(shareErrorText(new Error("design_canvas_removed"), word)).toBe("The Baoyu Design canvas has been removed from the Workbench. Projects on this device can be exported in Settings → Workbench files.");
     expect(shareErrorText(new Error("design_share_format_unsupported"), word)).toBe("Only PPT projects can be shared.");
   });
   it("asks for confirmation before ending", () => {

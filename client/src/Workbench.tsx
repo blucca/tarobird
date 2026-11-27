@@ -1,7 +1,7 @@
 import type { DesignBotDraft } from "./workbench-design-comments.js";
 import { workbenchErrorText } from "./workbench-error.js";
 import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore, type CSSProperties, type PointerEvent } from "react";
-import { ArrowLeft, ChevronDown, Columns2, FileText, FolderOpen, Globe, LayoutGrid, Presentation, List, Maximize2, Minimize2, MoreHorizontal, Plus, RotateCw, Square, SquarePen, Trash2, Users, X } from "lucide-react";
+import { ArrowLeft, ChevronDown, Columns2, Download, FileText, FolderOpen, Globe, LayoutGrid, Presentation, List, Maximize2, Minimize2, MoreHorizontal, Plus, RotateCw, Square, SquarePen, Trash2, Users, X } from "lucide-react";
 import { useLocale } from "./i18n.js";
 import { WorkbenchSplitPicker } from "./WorkbenchSplitPicker.js";
 import { WorkbenchController } from "./workbench-controller.js";
@@ -16,6 +16,7 @@ import { SidePanelResize } from "./SidePanelResize.js";
 import { DesktopMenu } from "./DesktopMenu.js";
 import { WidgetComposeProvider } from "./widget-compose.js";
 import { BrowserPage } from "./BrowserPage.js";
+import { saveDesignBackup } from "./workbench-design-export.js";
 import "./workbench.css";
 
 const WorkbenchDesign = lazy(() => import("./WorkbenchDesign.js"));
@@ -257,7 +258,7 @@ export function Workbench({ id = "conversation-workbench", compact = false, cont
           <div className={`workbench-pane-content workbench-${tab.kind}`}>
             {tab.kind === "whiteboard" ? state.boards.has(tab.id) ? <Suspense fallback={<p role="status">{word("正在加载白板…", "Loading whiteboard…")}</p>}><WorkbenchCanvas key={tab.id} scope={controller.scope} document={state.boards.get(tab.id)!} savedRevision={() => controller.boardSavedRevision(tab.id)} visible={active} lang={locale}
               persist={(revision, document) => controller.persistBoard(revision, document)} onDocument={controller.boardDocument} onController={value => controller.bindBoard(tab.id, value)} onAnnotate={onAnnotate} onImportBoard={content => controller.importBoard(content)}/></Suspense> : <p>{word("白板文件不可用。", "Board data is unavailable.")}</p>
-              : tab.kind === "design" ? tab.designFormat === "slides" && controller.designSession(tab.id) ? <Suspense fallback={<p role="status">{word("正在打开 PPT…", "Opening PPT…")}</p>}><WorkbenchDesign controller={controller} session={controller.designSession(tab.id)!} active={active} title={tab.title} botAvailable={controller.connection.state.workbenchSlidesAvailable === true} onActivate={() => { if (controller.getSnapshot().layout.active !== tab.id) action(() => controller.change({ type: "select", id: tab.id })); }}/></Suspense> : <p>{tab.designFormat !== "slides" ? word("Baoyu 画布已从工作台移除。", "The Baoyu Design canvas has been removed from the Workbench.") : word("正在打开 PPT…", "Opening PPT…")}</p>
+              : tab.kind === "design" ? tab.designFormat === "slides" && controller.designSession(tab.id) ? <Suspense fallback={<p role="status">{word("正在打开 PPT…", "Opening PPT…")}</p>}><WorkbenchDesign controller={controller} session={controller.designSession(tab.id)!} active={active} title={tab.title} botAvailable={controller.connection.state.workbenchSlidesAvailable === true} onActivate={() => { if (controller.getSnapshot().layout.active !== tab.id) action(() => controller.change({ type: "select", id: tab.id })); }}/></Suspense> : tab.designFormat !== "slides" ? <div className="workbench-removed-canvas"><p>{word("Baoyu 画布已从工作台移除。可导出此项目。", "The Baoyu Design canvas has been removed from the Workbench. You can export this project.")}</p><button onClick={() => action(async () => saveDesignBackup(await controller.exportRemovedCanvas(tab.id, tab.title), tab.title))}><Download size={15}/>{word("导出项目", "Export project")}</button></div> : <p>{word("正在打开 PPT…", "Opening PPT…")}</p>
               : tab.kind === "markdown" ? active && controller.markdownSession(tab.id) ? <Suspense fallback={<p role="status">{word("正在打开笔记…", "Opening note…")}</p>}><WorkbenchMarkdown session={controller.markdownSession(tab.id)!} title={tab.title} botAvailable={controller.connection.state.workbenchMarkdownAvailable === true}/></Suspense> : <p>{word("正在打开笔记…", "Opening note…")}</p>
                 : tab.kind === "chart" ? <ChartPane controller={controller} tab={tab} active={active} compact={shown.length > 2} version={state.chartVersion} onCompose={onCompose}/>
                 : <BrowserPane controller={controller} tab={tab} active={active}/>}
