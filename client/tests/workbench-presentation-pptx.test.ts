@@ -275,7 +275,9 @@ describe("Workbench Presentation (#90): Apache-2.0 slides editor, PPTX import, c
     expect(workbenchErrorText("slides_invalid_pptx_import", "zh")).toContain(".pptx");
     expect(workbenchErrorText("design_file_too_large", "en")).toContain("8 MB");
     expect(workbenchErrorText("design_file_too_large", "zh")).toContain("8 MB");
-  });
+    // Building the two fixtures (79 MiB deflated at level 9) takes longer than the default 5 s on a busy
+    // machine; the importer's own 2 s bound above is unchanged.
+  }, 60_000);
 
   it("partitions >24 positioned shapes into position:relative layers so slides stay editable", () => {
     const shapes = Array.from({ length: 30 }, (_, i) => `
