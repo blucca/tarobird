@@ -46,7 +46,7 @@ export type QuotaView = {
   windows: QuotaWindowView[];
   blocked: QuotaBlock[];
   observedAt: string;
-  /** True when the reading is past its fresh period, flagged stale by the host, or shown from restart cache before live confirmation. */
+  /** True when the reading is past its 30-minute fresh period or shown from restart cache before live confirmation. */
   stale: boolean;
   /** Milliseconds elapsed since `observedAt` at render time. */
   ageMs: number;
@@ -107,7 +107,8 @@ export function quotaView(
   }
   // An account-wide block counts only where some pool of the reading counts for this Bot.
   if (!windows.length && !(blocked.size && (counted || !scope.pools.length))) return undefined;
-  const stale = scope.state === "stale" || ageMs >= QUOTA_SHOWN_FOR_MS || options?.fromCache === true;
+  // Decouple the UI's 30-minute fresh period from the Gateway's 60-second cache TTL (which sets state="stale").
+  const stale = ageMs >= QUOTA_SHOWN_FOR_MS || options?.fromCache === true;
   return {
     left: blocked.size ? 0 : Math.min(...windows.map(window => window.left)),
     windows,
@@ -122,15 +123,21 @@ export function quotaView(
 /** Replies the Hub makes up when a worker did not answer in time or is away; they say nothing about the account. */
 const NO_ANSWER = new Set(["offline", "timeout", "invalid_response", "host_upgrade_required"]);
 export const workerAnswered = (scope: QuotaScope) => !(scope.reason !== undefined && scope.revision === scope.reason && NO_ANSWER.has(scope.reason));
+/** Reasons that invalidate any previously held reading for this Bot even when the revision stays unchanged. */
+export const QUOTA_CLEARING_REASONS = new Set(["auth_changed", "login_required", "mode_not_supported", "not_adapted", "scope_unverifiable"]);
 /** What the App holds for a Bot after a reply from its Host. */
 export function nextHeldQuota(previous: QuotaScope | undefined, scope: QuotaScope): QuotaScope | undefined {
   if (!workerAnswered(scope)) return previous;
   // A reading replaces the held one unless it is the same login's older answer: another process of the Bot
   // may still hold an earlier one.
-  if (scope.observedAt) return previous?.revision === scope.revision && previous.observedAt && previous.observedAt > scope.observedAt ? previous : scope;
+  if (scope.observedAt) {
+    return previous?.revision === scope.revision && previous.observedAt && Date.parse(previous.observedAt) > Date.parse(scope.observedAt)
+      ? previous
+      : scope;
+  }
   // Another login, or a login without quota: the earlier number is not about it. A login the Host cannot verify
   // keeps the same revision when the account behind it changes, so its one-shot reading is not kept either.
-  return previous && (previous.revision !== scope.revision || ["auth_changed", "login_required", "mode_not_supported", "not_adapted", "scope_unverifiable"].includes(scope.reason ?? "")) ? undefined : previous;
+  return previous && (previous.revision !== scope.revision || QUOTA_CLEARING_REASONS.has(scope.reason ?? "")) ? undefined : previous;
 }
 
 /** Readings saved on this device, so a Bot's battery appears immediately when the App starts again

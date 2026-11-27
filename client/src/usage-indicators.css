@@ -17,7 +17,6 @@
 .usage-battery[data-stale=true] .usage-battery-body{stroke:var(--muted);opacity:.85}
 .usage-battery[data-stale=true] .usage-battery-left{fill:var(--muted)}
 .usage-pair[data-stale=true]{color:var(--muted);opacity:.72}
-.usage-bar[data-stale=true]>i{background:var(--muted);opacity:.65}
 .usage-stale-banner{margin:0 0 10px;padding:6px 9px;border-radius:8px;background:var(--surface);color:var(--muted);font-size:11.5px;line-height:1.4}
 
 /* Doubled class: the toolbar styles its plain buttons as larger, heavier pills; this one matches the model controls beside it. */
@@ -38,6 +37,7 @@
 .usage-bar>i{display:block;height:100%;border-radius:99px;background:var(--mono-mark,var(--muted))}
 .usage-bar>i[data-tone=low]{background:var(--orange)}
 .usage-bar>i[data-tone=empty]{background:var(--red)}
+.usage-bar[data-stale=true]>i{background:var(--muted);opacity:.65}
 .usage-window+.usage-window{margin-top:8px}
 .usage-note{margin:0;color:var(--muted);font-size:11.5px}
 .usage-read-at{margin-top:9px;text-align:right}

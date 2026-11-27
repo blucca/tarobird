@@ -365,3 +365,58 @@ test("forgetting a computer on this device also forgets its saved quota readings
     expect(left.afterRemoval).toEqual({ other: { gamma: {} } });
   } finally { await server.close(); }
 });
+
+test("stale low/empty quota progress bars render grey, cold offline reload shows cached battery, and 403 evicts it (#137)", async ({ page }) => {
+  const f = await fixture(page);
+  try {
+    const ws = workspace(page), indicators = ws.locator(".usage-indicators"), battery = indicators.locator("[data-usage=quota]");
+    f.readings.value = nearlyGone();
+    await selectConversation(page, "有读数");
+    await expect(battery).toHaveText("1%");
+    await expect(battery).toHaveAttribute("data-tone", "empty");
+
+    // Cold reload while WebSocket is blocked: the last selected conversation opens offline and its saved battery
+    // appears immediately marked stale (greyed out), with muted grey progress bars inside the details popover.
+    const seen = requests(page);
+    let blockWs = true;
+    await page.routeWebSocket("**/ws", socket => {
+      if (blockWs) { socket.close(); return; }
+      socket.connectToServer();
+    });
+    await page.reload();
+    await expect(page.getByRole("heading", { name: "有读数", exact: true, level: 1 })).toBeVisible();
+    await expect(battery).toHaveText("1%");
+    await expect(battery).toHaveAttribute("data-stale", "true");
+    await indicators.click();
+    const panel = page.getByRole("group", { name: "上下文与额度", exact: true });
+    await expect(panel.locator(".usage-stale-banner")).toBeVisible();
+    const barColors = await panel.evaluate(node => {
+      const fills = [...node.querySelectorAll(".usage-bar[data-stale=true] > i")];
+      const probe = document.createElement("span");
+      probe.style.color = "var(--red)";
+      node.append(probe);
+      const red = getComputedStyle(probe).color;
+      probe.style.color = "var(--muted)";
+      const muted = getComputedStyle(probe).color;
+      probe.remove();
+      return {
+        count: fills.length,
+        allMuted: fills.every(fill => getComputedStyle(fill).backgroundColor === muted),
+        noneRed: fills.every(fill => getComputedStyle(fill).backgroundColor !== red),
+        noneHaveTone: fills.every(fill => !fill.hasAttribute("data-tone")),
+      };
+    });
+    expect(barColors).toEqual({ count: 2, allMuted: true, noneRed: true, noneHaveTone: true });
+    expect(seen.filter(url => url.includes("/api/engine-quotas"))).toEqual([]);
+
+    // Reconnect online with owner role revoked via 403 on quota endpoint: evicts cached battery and storage immediately.
+    blockWs = false;
+    await page.route("**/api/engine-quotas/*", route => route.fulfill({ status: 403, json: { error: "forbidden" } }));
+    await page.reload();
+    await waitForClientOnline(page);
+    await expect(page.getByRole("heading", { name: "有读数", exact: true, level: 1 })).toBeVisible();
+    await expect(battery).toHaveCount(0);
+    const savedAfter403 = await page.evaluate(() => localStorage.getItem("tarobird.quotaReadings.v1") ?? "{}");
+    expect(savedAfter403).not.toContain("alpha");
+  } finally { await f.dispose(); }
+});

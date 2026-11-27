@@ -4,10 +4,12 @@ import type { HubConnection } from "../client/src/connection.js";
 import {
   applyHostQuotaScope,
   cachedQuotaDirectory,
+  clearStoredQuotaHost,
+  ingestQuotaDirectory,
+  projectQuotaDirectory,
   readStoredQuota,
   resetQuotaStoreForTests,
   subscribeQuotaStore,
-  syncQuotaDirectory,
 } from "../client/src/quota-store.js";
 import {
   contextView,
@@ -102,6 +104,9 @@ describe("quota left for one Bot", () => {
     const pools = [{ label: "Codex", windows: [window("primary", 20, { resetsAt: iso(600) })] }];
     const fresh = quotaView(scope("codex", pools, { state: "ready", observedAt: iso(-29) }), "", now)!;
     expect(fresh).toMatchObject({ left: 80, stale: false });
+    // Gateway's 60-second TTL sets state="stale" after 60s; the conversation battery stays fresh for the full 30 minutes.
+    const gatewayTtlStale = quotaView(scope("codex", pools, { state: "stale", observedAt: iso(-2) }), "", now)!;
+    expect(gatewayTtlStale).toMatchObject({ left: 80, stale: false });
     // Past 30 minutes and over an hour: stays visible marked stale instead of disappearing!
     const at30m = quotaView(scope("codex", pools, { state: "ready", observedAt: iso(-30) }), "", now)!;
     expect(at30m).toMatchObject({ left: 80, stale: true });
@@ -314,14 +319,18 @@ describe("shared quota store across restart, conversation battery and Settings p
     expect(cachedDir.scopes).toHaveLength(1);
     expect(cachedDir.scopes[0]).toMatchObject({ id: "bot_a", state: "stale" });
 
-    // If Host returns unknown/not_loaded with same revision, syncQuotaDirectory preserves the cached reading marked stale
+    // If Host returns unknown/not_loaded with same revision, ingestQuotaDirectory preserves the cached reading marked stale
+    // and keeps fromCache: true until an actual live reading arrives.
     const emptyLive = {
       generatedAt: iso(0),
       scopes: [{ ...scope("codex", [], { id: "bot_a", botIds: ["bot_a"], observedAt: undefined, state: "unknown" }), reason: "not_loaded" as const }],
       truncated: false,
     };
-    const synced = syncQuotaDirectory(conn2, emptyLive, now);
-    expect(synced.scopes[0]).toMatchObject({ id: "bot_a", state: "stale", observedAt: iso(-45) });
+    const synced = ingestQuotaDirectory(conn2, emptyLive, now);
+    expect(synced.directory.scopes[0]).toMatchObject({ id: "bot_a", state: "stale", observedAt: iso(-45) });
+    expect(synced.directory.scopes[0]?.reason).toBeUndefined();
+    expect(synced.cachedScopeIds.has("bot_a")).toBe(true);
+    expect(readStoredQuota(conn2, "bot_a", now)?.fromCache).toBe(true);
 
     // When a fresh reading arrives (from Settings refresh or background retry), listeners are notified and both views show fresh data
     const listener = vi.fn();
@@ -332,5 +341,132 @@ describe("shared quota store across restart, conversation battery and Settings p
     expect(fresh.fromCache).toBe(false);
     expect(quotaView(fresh.scope, "gpt-6.1", now, { fromCache: fresh.fromCache })).toMatchObject({ left: 85, stale: false });
     unsub();
+  });
+
+  it("batches ingestQuotaDirectory once and makes projectQuotaDirectory side-effect-free inside subscribers (no recursion)", () => {
+    const conn = fakeConnection("host-batch-1");
+    const setItem = vi.fn((key: string, value: string) => { mem.set(key, value); });
+    vi.stubGlobal("localStorage", {
+      getItem: (key: string) => mem.get(key) ?? null,
+      setItem,
+      removeItem: (key: string) => { mem.delete(key); },
+    });
+
+    const dir = {
+      generatedAt: iso(0),
+      scopes: [reading("bot_1", -2, 20, 300), reading("bot_2", -2, 40, 300), reading("bot_3", -2, 60, 300)],
+      truncated: false,
+    };
+    let listenerRuns = 0;
+    const unsub = subscribeQuotaStore(conn, () => {
+      listenerRuns++;
+      // Calling projectQuotaDirectory inside a subscriber must never mutate storage or re-notify.
+      projectQuotaDirectory(conn, dir, now);
+    });
+
+    ingestQuotaDirectory(conn, dir, now);
+    expect(listenerRuns).toBe(1);
+    expect(setItem).toHaveBeenCalledTimes(1);
+
+    setItem.mockClear();
+    const projected = projectQuotaDirectory(conn, dir, now);
+    expect(projected.directory.scopes).toHaveLength(3);
+    expect(listenerRuns).toBe(1);
+    expect(setItem).not.toHaveBeenCalled();
+    unsub();
+  });
+
+  it("propagates newer readings, preserves live state on not_loaded, never overwrites offline, and never resurrects auth_changed", () => {
+    const conn = fakeConnection("host-project-1");
+    const older = reading("bot_a", -10, 50, 300);
+    const newer = reading("bot_a", -1, 20, 300);
+
+    // 1. Directory holds older reading, background conversation updates store with strictly newer same-revision reading
+    const dirWithOlder = { generatedAt: iso(-10), scopes: [older], truncated: false };
+    ingestQuotaDirectory(conn, dirWithOlder, now);
+    applyHostQuotaScope(conn, "bot_a", newer, now);
+    const updated = projectQuotaDirectory(conn, dirWithOlder, now);
+    expect(updated.directory.scopes[0]).toMatchObject({ id: "bot_a", state: "ready", observedAt: iso(-1) });
+    expect(updated.directory.scopes[0]?.pools[0]?.windows[0]).toMatchObject({ usedPercent: 20 });
+    expect(updated.cachedScopeIds.size).toBe(0);
+
+    // 2. Directory holds not_loaded while store holds a live fresh reading -> keeps state="ready" and clears reason="not_loaded"
+    const dirNotLoaded = {
+      generatedAt: iso(0),
+      scopes: [{ ...scope("codex", [], { id: "bot_a", botIds: ["bot_a"], observedAt: undefined, state: "unknown" }), reason: "not_loaded" as const }],
+      truncated: false,
+    };
+    const withLive = projectQuotaDirectory(conn, dirNotLoaded, now);
+    expect(withLive.directory.scopes[0]).toMatchObject({ id: "bot_a", state: "ready", observedAt: iso(-1) });
+    expect(withLive.directory.scopes[0]?.reason).toBeUndefined();
+    expect(withLive.cachedScopeIds.has("bot_a")).toBe(false);
+
+    // 3. Hub offline fallback keeps state="offline" and reason="offline" (never turns into state="stale" enabling Refresh)
+    const dirOffline = {
+      generatedAt: iso(0),
+      scopes: [{ ...scope("codex", [], { id: "bot_a", botIds: ["bot_a"], revision: "offline", observedAt: undefined, state: "offline" }), reason: "offline" as const }],
+      truncated: false,
+    };
+    const withOffline = projectQuotaDirectory(conn, dirOffline, now);
+    expect(withOffline.directory.scopes[0]).toMatchObject({ id: "bot_a", state: "offline", reason: "offline", revision: "offline", observedAt: iso(-1) });
+    expect(withOffline.cachedScopeIds.has("bot_a")).toBe(true);
+
+    // 4. auth_changed clears held + saved + storage and projecting an older directory inside subscribe never resurrects it
+    const staleDir = { generatedAt: iso(-1), scopes: [newer], truncated: false };
+    const unsub = subscribeQuotaStore(conn, () => { projectQuotaDirectory(conn, staleDir, now); });
+    const authChanged = { ...scope("codex", [], { id: "bot_a", botIds: ["bot_a"], revision: "r_new", observedAt: undefined, state: "unknown" }), reason: "auth_changed" as const };
+    applyHostQuotaScope(conn, "bot_a", authChanged, now);
+    unsub();
+    expect(readStoredQuota(conn, "bot_a", now)).toBeUndefined();
+    expect(mem.get(SAVED_QUOTA_KEY) ?? "{}").not.toContain("bot_a");
+    const afterAuth = projectQuotaDirectory(conn, { generatedAt: iso(0), scopes: [authChanged], truncated: false }, now);
+    expect(afterAuth.directory.scopes[0]).toMatchObject({ id: "bot_a", state: "unknown", reason: "auth_changed", observedAt: undefined });
+  });
+
+  it("keeps fromCache=true after adopting a persisted reading on not_loaded even if refresh fails", () => {
+    const conn1 = fakeConnection("host-cache-prov");
+    applyHostQuotaScope(conn1, "bot_a", reading("bot_a", -10, 30, 300), now);
+
+    // Restart App: only saved reading exists (10m old, < 30m fresh threshold).
+    resetQuotaStoreForTests();
+    const conn2 = fakeConnection("host-cache-prov");
+    expect(readStoredQuota(conn2, "bot_a", now)?.fromCache).toBe(true);
+
+    // Host replies not_loaded (same revision) -> adopts saved reading while preserving fromCache: true
+    const notLoaded = { ...scope("codex", [], { id: "bot_a", botIds: ["bot_a"], observedAt: undefined, state: "unknown" }), reason: "not_loaded" as const };
+    const adopted = applyHostQuotaScope(conn2, "bot_a", notLoaded, now)!;
+    expect(adopted.fromCache).toBe(true);
+    expect(quotaView(adopted.scope, "gpt-6.1", now, { fromCache: adopted.fromCache })).toMatchObject({ left: 70, stale: true, fromCache: true });
+
+    // Subsequent refresh fails with timeout -> still fromCache: true (never un-greys pre-restart reading)
+    const timedOut = { ...scope("codex", [], { id: "bot_a", botIds: ["bot_a"], observedAt: undefined, state: "unavailable" }), reason: "timeout" as const };
+    const afterFail = applyHostQuotaScope(conn2, "bot_a", timedOut, now)!;
+    expect(afterFail.fromCache).toBe(true);
+    expect(quotaView(afterFail.scope, "gpt-6.1", now, { fromCache: afterFail.fromCache })).toMatchObject({ left: 70, stale: true, fromCache: true });
+
+    // Once a live reading arrives, fromCache flips to false and battery becomes fresh
+    const live = applyHostQuotaScope(conn2, "bot_a", reading("bot_a", 0, 25, 300), now)!;
+    expect(live.fromCache).toBe(false);
+    expect(quotaView(live.scope, "gpt-6.1", now, { fromCache: live.fromCache })).toMatchObject({ left: 75, stale: false });
+  });
+
+  it("evicts all in-memory and localStorage quota readings for a host on clearStoredQuotaHost", () => {
+    const connA = fakeConnection("host-revoke-a");
+    const connB = fakeConnection("host-keep-b");
+    applyHostQuotaScope(connA, "bot_a", reading("bot_a", -2, 30, 300), now);
+    applyHostQuotaScope(connB, "bot_b", reading("bot_b", -2, 40, 300), now);
+
+    const listenerA = vi.fn();
+    const unsub = subscribeQuotaStore(connA, listenerA);
+    clearStoredQuotaHost(connA);
+    unsub();
+
+    expect(listenerA).toHaveBeenCalledTimes(1);
+    expect(readStoredQuota(connA, "bot_a", now)).toBeUndefined();
+    expect(cachedQuotaDirectory(connA, now)).toBeUndefined();
+    expect(readStoredQuota(connB, "bot_b", now)).toBeDefined();
+    const raw = JSON.parse(mem.get(SAVED_QUOTA_KEY) ?? "{}") as Record<string, unknown>;
+    expect(raw["host-revoke-a"]).toBeUndefined();
+    expect(raw["host-keep-b"]).toBeDefined();
   });
 });

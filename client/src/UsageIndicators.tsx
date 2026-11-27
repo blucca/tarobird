@@ -44,7 +44,7 @@ function blockText(code: QuotaBlock): string {
   }
 }
 function Bar({ left, label, stale = false }: { left: number; label: string; stale?: boolean }) {
-  return <div className="usage-bar" data-stale={stale ? "true" : undefined} role="meter" aria-label={label} aria-valuemin={0} aria-valuemax={100} aria-valuenow={left}><i data-tone={usageTone(left)} style={{ width: `${left}%` }}/></div>;
+  return <div className="usage-bar" data-stale={stale ? "true" : undefined} role="meter" aria-label={label} aria-valuemin={0} aria-valuemax={100} aria-valuenow={left}><i data-tone={stale ? undefined : usageTone(left)} style={{ width: `${left}%` }}/></div>;
 }
 
 /** The numbers behind the two symbols. Every percentage is what is left. */

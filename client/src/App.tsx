@@ -59,6 +59,7 @@ import { useSearchMessageHighlight } from "./search-message-highlight.js";
 import { BotSettings } from "./BotSettings.js";
 import { ComposerModelControls } from "./ComposerModelControls.js";
 import { QuotaBattery, QuotaMark, quotaMarkLabel, UsageDetails, UsageIndicators } from "./UsageIndicators.js";
+import { clearStoredQuotaHost } from "./quota-store.js";
 import { useUsageReadings } from "./use-usage-readings.js";
 import { usageTone } from "./usage-readings.js";
 import { PiSessionControls } from "./PiSessionControls.js";
@@ -1604,10 +1605,22 @@ export function Workspace({ connection, forget, shell, pane }: WorkspaceProps) {
   } });
   const piSessionControls = visible && chatVisible && current?.type === "direct" && composerBot?.engine === "pi" && !composerBot.deletedAt && state.piSessionAvailable && <PiSessionControls key={`pi:${connection.identity.hubPublicKey}:${current.id}:${composerBot.id}`} connection={connection} conversationId={current.id} bot={composerBot} onCommands={receivePiCommands} active={visible && chatVisible} activity={replying} online={state.status === "online" && !!composerBot.online && !connection.isReadOnly} owner={state.user?.role === "owner" && !connection.isReadOnly}/>;
   const composerModelControls = !phone && !pane && visible && chatVisible && composerBot && !composerBot.deletedAt && (piSessionControls || <ComposerModelControls key={`${connection.identity.hubPublicKey}:${current?.id}:${composerBot.id}`} connection={connection} bot={composerBot} online={state.status === "online" && !!composerBot.online && !connection.isReadOnly} owner={state.user?.role === "owner" && !connection.isReadOnly}/>);
-  // Context and quota (issue 68): one conversation's own view only, never a board pane.
-  const usageBot = !pane && visible && chatVisible && current && composerBot && !composerBot.deletedAt ? composerBot : undefined;
+  // Evict device-saved quota readings if this Host confirms the user is no longer the owner.
+  useEffect(() => {
+    if (state.status === "online" && state.user && state.user.role !== "owner") clearStoredQuotaHost(connection);
+  }, [connection, state.status, state.user?.role]);
+  // Context and quota (issue 68 & 137): one conversation's own view only, never a board pane.
+  // Fall back to cached navigationBots before WS ready arrives so device-saved quota appears immediately on cold start.
+  const usageCandidate = discussionComposer ? undefined : current?.type === "direct"
+    ? (activeBot ?? navigationBots.find(bot => bot.id === current.botIds[0]))
+    : composerRecipients.length === 1
+      ? (composerBot ?? navigationBots.find(bot => bot.id === composerRecipients[0] && current?.botIds.includes(bot.id)))
+      : undefined;
+  const usageBot = !pane && visible && chatVisible && current && usageCandidate && !usageCandidate.deletedAt ? usageCandidate : undefined;
+  const quotaAllowed = !!usageBot && state.user?.role === "owner" && !connection.isReadOnly && state.engineQuotaAvailable !== false;
   const usage = useUsageReadings(connection, { conversationId: usageBot ? current?.id : undefined, botId: usageBot?.id, model: usageBot?.model ?? "",
-    quota: !!usageBot && state.user?.role === "owner" && !connection.isReadOnly && state.engineQuotaAvailable === true,
+    quota: quotaAllowed,
+    quotaLive: quotaAllowed && state.status === "online" && state.engineQuotaAvailable === true,
     // The phone shows no context anywhere, so it does not ask for it.
     context: !!usageBot && !phone && state.contextUsageAvailable === true, turn: messagesReady ? lastBotReply : undefined });
   const [quotaDetails, setQuotaDetails] = useState(false);

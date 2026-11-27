@@ -271,3 +271,38 @@ test("a failed quota card preserves marked old values while a retired scope only
     await expect(coder).toContainText("剩余 62%"); await expect(coder.getByRole("alert")).toHaveCount(0);
   } finally { await f.close(); }
 });
+
+test("offline Bot with cached reading keeps Refresh disabled and cached cards appear on cold offline reload (#137)", async ({ page }) => {
+  const f = await fixture(page);
+  try {
+    await f.open();
+    const panel = page.locator(".engine-quota:visible"), coder = panel.getByRole("region", { name: "Coding Bot · Codex", exact: true });
+    await expect(coder).toContainText("剩余 62%");
+    // Now the Coding Bot goes offline (Hub returns offline fallback revision="offline"): cached bars remain marked old,
+    // offline reason stays visible, and Refresh button MUST stay absent (never submit revision="offline").
+    await page.route("**/api/engine-quotas", async route => {
+      const response = await route.fetch();
+      const body = await response.json();
+      body.scopes = body.scopes.map((scope: Record<string, unknown>) =>
+        scope.id === "coder"
+          ? { ...scope, state: "offline", reason: "offline", revision: "offline", observedAt: undefined, pools: [], constraints: [] }
+          : scope,
+      );
+      await route.fulfill({ response, json: body });
+    });
+    await panel.getByRole("button", { name: "重新读取列表", exact: true }).click();
+    await expect(coder).toContainText("Bot 当前离线");
+    await expect(coder).toContainText("上次读数：剩余 62%");
+    await expect(coder.locator(".quota-state")).toContainText("旧读数");
+    await expect(coder.getByRole("button", { name: "刷新", exact: true })).toHaveCount(0);
+    await page.unroute("**/api/engine-quotas");
+
+    // Cold reload while WebSocket cannot connect: Settings → Model quotas shows saved cards immediately beneath offline notice.
+    await page.routeWebSocket("**/ws", socket => { socket.close(); });
+    await page.reload();
+    await f.open();
+    await expect(page.locator(".engine-quota:visible")).toContainText("连接已断开，仅保留上次读数");
+    await expect(page.locator(".engine-quota:visible").getByRole("region", { name: "Coding Bot · Codex", exact: true })).toContainText("上次读数：剩余 62%");
+    await expect(page.locator(".engine-quota:visible").getByRole("region", { name: "Coding Bot · Codex", exact: true }).locator(".quota-state")).toContainText("旧读数");
+  } finally { await f.close(); }
+});
