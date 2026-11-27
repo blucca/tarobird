@@ -105,12 +105,12 @@ it("end to end, unmocked: the built CLI starts a stopped host whose database is 
     // Foreground run still refuses; its guidance names the explicit start, not a runtime switch.
     const run = cli("run");
     expect(run.status).not.toBe(0);
-    expect(run.stderr).toContain("host_schema_migration_requires_update:26:27"); expect(run.stderr).toContain("启动本机主机"); expect(run.stderr).not.toContain("service install");
+    expect(run.stderr).toContain("host_schema_migration_requires_update:26:28"); expect(run.stderr).toContain("启动本机主机"); expect(run.stderr).not.toContain("service install");
     expect(await readHostSchema(directory)).toBe(26);
     const started = cli("start", "--json");
     expect(started.status, started.stderr).toBe(0);
     expect(JSON.parse(started.stdout)).toMatchObject({ running: true });
-    expect(await readHostSchema(directory)).toBe(27);
+    expect(await readHostSchema(directory)).toBe(28);
     // The runtime selection is unchanged and nothing is written beside the host.
     await expect(stat(path.join(root, "host.runtime"))).rejects.toMatchObject({ code: "ENOENT" });
   } finally { cli("stop", "--force", "--json"); }

@@ -19,7 +19,7 @@ vi.mock("node:fs/promises", async original => { const actual = await original<ty
 const temporary: string[] = [];
 async function fixture() { const base = await mkdtemp(path.join(os.tmpdir(), "hup-")); temporary.push(base); return { base, state: path.join(base, "host"), source: path.join(base, "candidate") }; }
 async function file(root: string, name: string, content: string | object) { await mkdir(path.dirname(path.join(root, name)), { recursive: true }); await writeFile(path.join(root, name), typeof content === "string" ? content : JSON.stringify(content)); }
-async function candidate(root: string, version = "0.1.500", maxHubSchema = 27) {
+async function candidate(root: string, version = "0.1.500", maxHubSchema = 28) {
   await file(root, "package.json", { name: "tarobot", version, private: true, type: "module", engines: { node: ">=20.17.0" }, dependencies: { sqlite3: "6.0.1", zod: "4.1.5" }, tarobotHostUpdate: { format: 1, minHubSchema: 1, maxHubSchema } });
   await file(root, "standalone-graph.json", { inputs: { "src/index.ts": {} } });
   await file(root, "dist/src/index.js", "if(process.argv[2]!=='--help')throw Error('unexpected stateful probe'); console.log('TaroBot test CLI');");

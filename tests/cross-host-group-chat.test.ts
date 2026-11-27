@@ -473,7 +473,7 @@ describe("Cross-host group chat, session-based members & Orca-style group settin
     const reopened = await startHub("macmini", stateDirA);
     reopened.hub.crossHostGroups.registerPeer({ hostId: "peer_b", hostName: "studio-b", publicKey: b.hub.auth.publicKey, url: b.hub.url });
 
-    expect(await reopened.hub.store.db.get("SELECT value FROM meta WHERE key='schema_version'")).toEqual({ value: "27" });
+    expect(await reopened.hub.store.db.get("SELECT value FROM meta WHERE key='schema_version'")).toEqual({ value: "28" });
 
     // Saving mode='designated' succeeds cleanly without SQLITE_CONSTRAINT!
     const current = await reopened.hub.store.groupSettings("owner", group.id);
