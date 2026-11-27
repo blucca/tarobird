@@ -58,6 +58,8 @@ export class HubEngineSettings {
   private warmInFlight?: Promise<LiveEngineDiscovery>;
   private discoverySequence = 0;
   private publishedDiscoverySequence = 0;
+  private closing = false;
+  private readonly cacheWrites = new Set<Promise<void>>();
   get hasDiscoverySnapshot(): boolean { return this.liveDiscovery !== undefined; }
   constructor(readonly directory: string, readonly base: () => NodeJS.ProcessEnv) {}
   private read(): StoredEngineSettings {
@@ -94,10 +96,22 @@ export class HubEngineSettings {
     if (sequence < this.publishedDiscoverySequence) return;
     this.publishedDiscoverySequence = sequence;
     this.liveDiscovery = snapshot;
-    await writeEngineDiscoveryCache(this.directory, {
+    // Once the owner has begun closing, the state folder is no longer ours to write.
+    if (this.closing) return;
+    const write = writeEngineDiscoveryCache(this.directory, {
       paths: snapshot.paths ?? {},
       searchDirs: snapshot.dirs,
     }, platform);
+    this.cacheWrites.add(write);
+    try { await write; } finally { this.cacheWrites.delete(write); }
+  }
+
+  /** Stop writing the discovery cache and wait for a write already in progress,
+   * so neither the cache file nor its lock appears after the owner has closed.
+   * A probe still running finishes in memory only. */
+  async close(): Promise<void> {
+    this.closing = true;
+    await Promise.allSettled([...this.cacheWrites]);
   }
 
   /** Run environment discovery (login shell, package managers, and cached Windows

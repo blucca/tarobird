@@ -469,7 +469,10 @@ export class BotManager {
   }
   get shutdownComplete(): boolean { return this.stopping && this.children.size === 0; }
   async close(): Promise<void> {
-    this.beginShutdown(); await this.tail; await this.drainTail;
+    this.beginShutdown();
+    // No discovery cache write may land in the state folder once closing has begun.
+    await this.engineSettings.close();
+    await this.tail; await this.drainTail;
     await Promise.all([...this.children.values()].map((child) => new Promise<void>((resolve) => {
       if (child.exitCode !== null || child.signalCode !== null) { resolve(); return; }
       const timer = setTimeout(() => {

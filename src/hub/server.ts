@@ -771,6 +771,7 @@ export class HubServer {
     await errors.run("workspace-diff.cancel", () => this.workspaceDiff.close());
     await errors.run("previews.stop", () => this.linkPreviews.stop());
     await errors.run("workers.close", () => this.botManager?.close());
+    await errors.run("engine-settings.close", () => this.engineSettings.close());
     await errors.run("host-terminal.close", () => this.hostTerminal.dispose());
     await errors.run("dispatch.stop", () => this.dispatch.stop());
     await errors.run("push.stop", () => this.pushWorker.stop());
