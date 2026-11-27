@@ -6,7 +6,7 @@ import { RuntimeHostContext } from "./RuntimeHost.js";
 import { SettingsGroupHeading } from "./SettingsParts.js";
 import { MAX_CONCURRENT_QUOTA_REFRESH, useEngineQuota } from "./use-engine-quota.js";
 import { formatQuotaWindowLabel, formatResetCountdown, groupQuotaScopesByAccount, shouldShowQuotaPoolHeading } from "./quota-ui.js";
-import { usageTone } from "./usage-readings.js";
+import { QUOTA_SHOWN_FOR_MS, quotaReadingAgeLabel, usageTone } from "./usage-readings.js";
 import { t, useLocale } from "./i18n.js";
 import "./engine-quota.css";
 
@@ -138,8 +138,8 @@ function WindowQuota({
 export function EngineQuota({ connection, active }: { connection: HubConnection; active: boolean }) {
   const locale = useLocale(), host = useContext(RuntimeHostContext);
   const state = useSyncExternalStore(notify => connection.subscribe(notify), () => connection.state);
-  const owner = state.user?.role === "owner", online = state.status === "online", supported = state.engineQuotaAvailable === true;
-  const quota = useEngineQuota(connection, { userId: state.user?.id, owner, online, supported, active });
+  const owner = state.user?.role === "owner" && !connection.isReadOnly, online = state.status === "online", supported = state.engineQuotaAvailable === true, unsupported = state.engineQuotaAvailable === false;
+  const quota = useEngineQuota(connection, { userId: state.user?.id, owner, online, supported, unsupported, active });
   const [clock, setClock] = useState(Date.now);
   useEffect(() => {
     if (!active || !quota.visible) return;
@@ -160,9 +160,9 @@ export function EngineQuota({ connection, active }: { connection: HubConnection;
     <SettingsGroupHeading scope="host" host={host}>{t("原生模型额度")}</SettingsGroupHeading>
     <p className="settings-note muted">{t("按账号展示原生额度；确认同一账号的多个 Bot 会合并展示，无法确认时分开显示。这里不是消息用量统计。")}</p>
     {!online && <p className="quota-notice" role="status">{t("连接已断开，仅保留上次读数。恢复后重新核对。")}</p>}
-    {!supported ? online && <p role="status">{t("请更新主机以查看模型额度。")}</p> : <>
+    {unsupported ? <p role="status">{t("请更新主机以查看模型额度。")}</p> : <>
       <div className="quota-toolbar">
-        <button type="button" className="secondary" disabled={!online || quota.loading || quota.busy.length > 0} onClick={() => void quota.readDirectory()}>
+        <button type="button" className="secondary" disabled={!online || !supported || quota.loading || quota.busy.length > 0} onClick={() => void quota.readDirectory()}>
           <RefreshCw size={14} aria-hidden="true"/>{t("重新读取列表")}
         </button>
         <small>{t("打开页面自动读取缓存；单卡刷新不会发送模型消息。")}</small>
@@ -175,16 +175,24 @@ export function EngineQuota({ connection, active }: { connection: HubConnection;
       <div className="quota-list">{cards.map(card => {
         const scope = card.primary;
         const cardError = card.scopes.some(item => !!quota.errors[item.id]);
-        const stale = !online || !!quota.error || cardError || scope.state === "stale" || quotaReadingExpired(scope, now);
+        // Gateway/window expiry (60s TTL or resets) marks a reading "待更新"; genuinely old (>= 30m), cached, or offline readings show "旧读数 · <age>".
+        // The card shows its primary reading, so "old" is about that reading.
+        const fromCache = quota.cachedScopeIds.has(scope.id);
+        const observedAge = scope.observedAt ? Math.max(0, now - Date.parse(scope.observedAt)) : 0;
+        const oldReading = !!scope.observedAt && (fromCache || !online || scope.state === "offline" || observedAge >= QUOTA_SHOWN_FOR_MS);
+        const stale = !online || !!quota.error || cardError || fromCache || scope.state === "stale" || (scope.state === "offline" && !!scope.observedAt) || quotaReadingExpired(scope, now) || (!!scope.observedAt && observedAge >= QUOTA_SHOWN_FOR_MS);
+        const ageLabel = scope.observedAt ? quotaReadingAgeLabel(scope.observedAt, now, locale) : "";
         const waiting = card.scopes.some(item => quota.waitingLate.includes(item.id));
         const busy = waiting || card.scopes.some(item => quota.busy.includes(item.id));
         const status = busy
           ? t("正在读取…")
-          : stale
-            ? t("待更新")
-            : ({ ready: t("已读取"), stale: t("待更新"), unknown: t("尚无数据"), login_required: t("需要登录"), offline: t("离线"), unavailable: t("暂不可用"), unsupported: t("暂不支持") })[scope.state];
+          : oldReading
+            ? t("旧读数 · {0}", ageLabel)
+            : stale
+              ? t("待更新")
+              : ({ ready: t("已读取"), stale: t("待更新"), unknown: t("尚无数据"), login_required: t("需要登录"), offline: t("离线"), unavailable: t("暂不可用"), unsupported: t("暂不支持") })[scope.state];
         const passive = scope.capability.mode === "passive";
-        const canRead = scope.capability.mode !== "unsupported" && scope.state !== "offline" && (scope.state !== "unsupported" || scope.capability.mode === "active") && scope.reason !== "host_upgrade_required";
+        const canRead = scope.capability.mode !== "unsupported" && scope.state !== "offline" && scope.reason !== "offline" && (scope.state !== "unsupported" || scope.capability.mode === "active") && scope.reason !== "host_upgrade_required";
         const nextRefreshAt = card.scopes.reduce<string | undefined>((latest, item) => {
           if (!item.nextRefreshAt) return latest;
           const ms = Date.parse(item.nextRefreshAt);
@@ -259,7 +267,7 @@ export function EngineQuota({ connection, active }: { connection: HubConnection;
             {canRead && <button
               type="button"
               className="secondary"
-              disabled={!online || quota.loading || quota.busy.length >= MAX_CONCURRENT_QUOTA_REFRESH || busy || cooling || quota.error === "permission"}
+              disabled={!online || !supported || quota.loading || quota.busy.length >= MAX_CONCURRENT_QUOTA_REFRESH || busy || cooling || quota.error === "permission"}
               onClick={() => void quota.refresh(scope, card.scopes.map(item => item.id))}
             >
               {busy ? <LoaderCircle size={14} className="spin" aria-hidden="true"/> : <RefreshCw size={14} aria-hidden="true"/>}

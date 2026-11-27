@@ -364,7 +364,9 @@ test("slow Claude late-answer polling aborts on close and clears data on owner r
     page.on("requestfailed", req => {
       if (new URL(req.url()).pathname === "/api/engine-quotas/writer" && !req.url().includes("refresh=1")) pollAborted = true;
     });
-    await page.route("**/api/engine-quotas/writer", async route => {
+    // A cache read of this Bot (it may carry ?balances=currency), never its refresh.
+    const writerCacheRead = (url: URL) => url.pathname === "/api/engine-quotas/writer" && !url.searchParams.has("refresh");
+    await page.route(writerCacheRead, async route => {
       pollStarted = true;
       await pollGate;
       await route.continue().catch(() => undefined);
@@ -380,7 +382,7 @@ test("slow Claude late-answer polling aborts on close and clears data on owner r
     await page.getByRole("button", { name: "关闭设置", exact: true }).click();
     await expect.poll(() => pollAborted).toBe(true);
     releasePoll();
-    await page.unroute("**/api/engine-quotas/writer");
+    await page.unroute(writerCacheRead);
 
     // Reopen under a fresh revision, enter watchLateAnswer, and revoke owner permission.
     claudeTimedOut = false;
@@ -664,5 +666,41 @@ test("verified same-account Bots merge on a real Hub, preserve timeout/cooldown 
     // No raw account identifiers or proofs ever enter client HTTP responses
     expect(responseBodies.length).toBeGreaterThan(0);
     expect(responseBodies.join("\n")).not.toMatch(/acct_shared_secret|user_shared_secret|accountKey|proof/);
+  } finally { await f.close(); }
+});
+
+test("offline Bot with cached reading keeps Refresh disabled and cached cards appear on cold offline reload (#137)", async ({ page }) => {
+  const f = await fixture(page);
+  try {
+    await f.open();
+    const panel = page.locator(".engine-quota:visible"), coder = panel.getByRole("region", { name: "Coding Bot · Codex", exact: true });
+    await expect(coder).toContainText("剩余 62%");
+    // Now the Coding Bot goes offline (Hub returns offline fallback revision="offline"): cached bars remain marked old,
+    // offline reason stays visible, and Refresh button MUST stay absent (never submit revision="offline").
+    const directoryRead = (url: URL) => url.pathname === "/api/engine-quotas";
+    await page.route(directoryRead, async route => {
+      const response = await route.fetch();
+      const body = await response.json();
+      body.scopes = body.scopes.map((scope: Record<string, unknown>) =>
+        scope.id === "coder"
+          ? { ...scope, state: "offline", reason: "offline", revision: "offline", observedAt: undefined, pools: [], constraints: [] }
+          : scope,
+      );
+      await route.fulfill({ response, json: body });
+    });
+    await panel.getByRole("button", { name: "重新读取列表", exact: true }).click();
+    await expect(coder).toContainText("Bot 当前离线");
+    await expect(coder).toContainText("上次读数：剩余 62%");
+    await expect(coder.locator(".quota-state")).toContainText("旧读数");
+    await expect(coder.getByRole("button", { name: "刷新", exact: true })).toHaveCount(0);
+    await page.unroute(directoryRead);
+
+    // Cold reload while WebSocket cannot connect: Settings → Model quotas shows saved cards immediately beneath offline notice.
+    await page.routeWebSocket("**/ws", socket => { socket.close(); });
+    await page.reload();
+    await f.open();
+    await expect(page.locator(".engine-quota:visible")).toContainText("连接已断开，仅保留上次读数");
+    await expect(page.locator(".engine-quota:visible").getByRole("region", { name: "Coding Bot · Codex", exact: true })).toContainText("上次读数：剩余 62%");
+    await expect(page.locator(".engine-quota:visible").getByRole("region", { name: "Coding Bot · Codex", exact: true }).locator(".quota-state")).toContainText("旧读数");
   } finally { await f.close(); }
 });
