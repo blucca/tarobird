@@ -25,7 +25,7 @@ import type { DeviceActionProof } from "../client-protocol/device-actions.js";
 import { killProcessTree } from "../codex/process-tree.js";
 import { loadInstanceConfig, resolveInstanceWorkspacePath } from "../state/instance-config.js";
 import { hashSecret, type AuthSession, type HubAuth } from "./auth.js";
-import { HubError, type HubStore } from "./store.js";
+import { HubError, type Device, type HubStore } from "./store.js";
 
 const TERMINAL_POLICY_KEY = "terminal-policy:v1";
 const TERMINAL_LAST_COMMAND_KEY = "terminal-command:v1";
@@ -35,6 +35,23 @@ const MAX_EXITED_TERMINALS = 32;
 const EXITED_SESSION_TTL_MS = 5 * 60_000;
 const MAX_SCROLLBACK_BYTES = 256 * 1024;
 const MAX_LONG_POLL_MS = 8_000;
+export const DEFAULT_TERMINAL_IDLE_TIMEOUT_MS = 2 * 60 * 60_000;
+export const MIN_TERMINAL_IDLE_TIMEOUT_MS = 60_000;
+export const MAX_TERMINAL_IDLE_TIMEOUT_MS = 24 * 60 * 60_000;
+
+export function resolveTerminalIdleTimeoutMs(explicit?: number, env: NodeJS.ProcessEnv = process.env): number {
+  if (typeof explicit === "number" && Number.isFinite(explicit) && explicit > 0) {
+    return Math.min(Math.trunc(explicit), MAX_TERMINAL_IDLE_TIMEOUT_MS);
+  }
+  const raw = env.TAROBOT_TERMINAL_IDLE_TIMEOUT_MS?.trim();
+  if (raw) {
+    const parsed = Number(raw);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return Math.min(Math.max(Math.trunc(parsed), MIN_TERMINAL_IDLE_TIMEOUT_MS), MAX_TERMINAL_IDLE_TIMEOUT_MS);
+    }
+  }
+  return DEFAULT_TERMINAL_IDLE_TIMEOUT_MS;
+}
 
 const PTY_BRIDGE_PY = `
 import errno, fcntl, os, pty, select, signal, struct, sys, termios
@@ -199,6 +216,7 @@ export interface HostTerminalOptions {
   defaultWorkspace?: string;
   resolveBotStateDir?: (botId: string) => Promise<string | undefined>;
   spawnProcess?: (options: { cwd: string; cols: number; rows: number }) => Promise<TerminalProcessHandle>;
+  idleTimeoutMs?: number;
   now?: () => number;
 }
 
@@ -207,7 +225,6 @@ interface LiveTerminal {
   conversationId: string;
   ownerDeviceId: string;
   ownerPublicKey: string;
-  ownerSession: AuthSession;
   userId: string;
   title: string;
   cwd: string;
@@ -518,8 +535,11 @@ export class HubHostTerminal {
   private policyLoading?: Promise<TerminalPolicy>;
   private serialCount = 0;
   private disposed = false;
+  readonly idleTimeoutMs: number;
 
-  constructor(private readonly options: HostTerminalOptions) {}
+  constructor(private readonly options: HostTerminalOptions) {
+    this.idleTimeoutMs = resolveTerminalIdleTimeoutMs(options.idleTimeoutMs);
+  }
 
   private now(): number {
     return this.options.now ? this.options.now() : Date.now();
@@ -562,14 +582,6 @@ export class HubHostTerminal {
     }
   }
 
-  private refreshOwnerSession(session: AuthSession): void {
-    for (const term of this.sessions.values()) {
-      if (term.ownerDeviceId === session.deviceId && session.expiresAt > term.ownerSession.expiresAt) {
-        term.ownerSession = session;
-      }
-    }
-  }
-
   private async readPolicy(): Promise<TerminalPolicy> {
     if (this.policy) return this.policy;
     this.policyLoading ??= this.options.store.db.serial(async () => {
@@ -600,7 +612,6 @@ export class HubHostTerminal {
   private async requireAuthorized(session: AuthSession): Promise<{ device: { id: string; name: string; platform: string; public_key: string; user_id: string }; policy: TerminalPolicy }> {
     const [{ device }, policy] = await Promise.all([this.principal(session), this.readPolicy()]);
     if (!this.isGranted(policy, device)) throw new HubError("terminal_not_authorized", 403);
-    this.refreshOwnerSession(session);
     return { device, policy };
   }
 
@@ -625,7 +636,6 @@ export class HubHostTerminal {
     this.pruneExitedSessions();
     const [{ device, canManage }, policy] = await Promise.all([this.principal(session), this.readPolicy()]);
     const allowed = this.isGranted(policy, device);
-    if (allowed) this.refreshOwnerSession(session);
     let devices: TerminalStatus["devices"];
     if (canManage) {
       const rows = await this.options.store.db.serial(() =>
@@ -841,7 +851,6 @@ export class HubHostTerminal {
           conversationId: input.conversationId,
           ownerDeviceId: device.id,
           ownerPublicKey: device.public_key,
-          ownerSession: session,
           userId: session.userId,
           title: input.title ?? `${handle.shell} #${index}`,
           cwd,
@@ -988,6 +997,7 @@ export class HubHostTerminal {
     const { cols, rows } = terminalResizeSchema.parse(raw);
     term.cols = cols;
     term.rows = rows;
+    if (term.running) term.lastActivityAt = this.now();
     term.handle.resize?.(cols, rows);
     return { ok: true };
   }
@@ -1038,20 +1048,36 @@ export class HubHostTerminal {
   }
 
   async sweep(): Promise<void> {
+    if (this.disposed) return;
     this.pruneExitedSessions();
     if (this.sessions.size === 0) return;
     const policy = await this.readPolicy().catch(() => undefined);
+    const ownerIds = [...new Set([...this.sessions.values()].map((term) => term.ownerDeviceId))];
+    let devicesById: Map<string, Device | undefined>;
+    try {
+      devicesById = await this.options.store.db.serial(async () => {
+        const map = new Map<string, Device | undefined>();
+        for (const deviceId of ownerIds) {
+          map.set(deviceId, await this.options.store.db.get<Device>("SELECT * FROM devices WHERE id=?", [deviceId]));
+        }
+        return map;
+      });
+    } catch {
+      return;
+    }
+    if (this.disposed) return;
+    const now = this.now();
     const byReason = new Map<string, LiveTerminal[]>();
     for (const term of [...this.sessions.values()]) {
       let reason: string | undefined;
       if (policy && !this.isGranted(policy, { id: term.ownerDeviceId, public_key: term.ownerPublicKey })) {
         reason = "permission_revoked";
-      } else {
-        try {
-          const device = await this.options.auth.validateSession(term.ownerSession);
-          if (device.public_key !== term.ownerPublicKey) reason = "device_revoked";
-        } catch (error) {
-          reason = error instanceof HubError && error.code === "device_revoked" ? "device_revoked" : "device_revoked_or_expired";
+      } else if (devicesById.has(term.ownerDeviceId)) {
+        const device = devicesById.get(term.ownerDeviceId);
+        if (!device || device.revoked || device.user_id !== term.userId || device.public_key !== term.ownerPublicKey) {
+          reason = "device_revoked";
+        } else if (term.running && now - term.lastActivityAt >= this.idleTimeoutMs) {
+          reason = "idle_timeout";
         }
       }
       if (reason) {

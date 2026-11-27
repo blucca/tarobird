@@ -14,8 +14,18 @@ import {
   terminalPolicySchema,
 } from "../src/client-protocol/host-terminal.js";
 import { parseAnsiOutput } from "../client/src/terminal-ansi.js";
-import { HubHostTerminal, spawnPipeShell, type TerminalProcessHandle } from "../src/hub/host-terminal.js";
+import { HubAuth } from "../src/hub/auth.js";
+import {
+  DEFAULT_TERMINAL_IDLE_TIMEOUT_MS,
+  HubHostTerminal,
+  MAX_TERMINAL_IDLE_TIMEOUT_MS,
+  MIN_TERMINAL_IDLE_TIMEOUT_MS,
+  resolveTerminalIdleTimeoutMs,
+  spawnPipeShell,
+  type TerminalProcessHandle,
+} from "../src/hub/host-terminal.js";
 import { HubServer } from "../src/hub/server.js";
+import { HubStore } from "../src/hub/store.js";
 
 let tempRoot: string;
 beforeAll(async () => {
@@ -344,7 +354,7 @@ describe("Host terminal ANSI parser, security, lifecycle, PTY, and workspace (#1
     } finally {
       await hub.close();
     }
-  });
+  }, 20_000);
 
   it("terminates real shell processes and flushes hub_shutdown audits before HubServer.close() resolves", async () => {
     const stateDir = path.join(tempRoot, "hub-shutdown");
@@ -412,7 +422,7 @@ describe("Host terminal ANSI parser, security, lifecycle, PTY, and workspace (#1
     } finally {
       await hub2.close();
     }
-  });
+  }, 20_000);
 
   it("handles natural exit audits, non-exhaustion of exited slots, workspace fail-closed + archived rejection, and real PTY Ctrl+C/resize/Ctrl+D", async () => {
     const stateDir = path.join(tempRoot, "hub-terminal");
@@ -526,7 +536,7 @@ describe("Host terminal ANSI parser, security, lifecycle, PTY, and workspace (#1
       await fetch(`${hub.url}${HOST_TERMINALS_PATH}/${create1.terminal.id}/input`, {
         method: "POST",
         headers: { Authorization: `Bearer ${ownerDev.token}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ data: "sleep 5 && echo SHOULD_NOT_RUN\r" }),
+        body: JSON.stringify({ data: "sleep 5 && echo SHOULD_\"NOT_RUN\"\r" }),
       });
       await new Promise((r) => setTimeout(r, 250));
       await fetch(`${hub.url}${HOST_TERMINALS_PATH}/${create1.terminal.id}/input`, {
@@ -549,7 +559,7 @@ describe("Host terminal ANSI parser, security, lifecycle, PTY, and workspace (#1
         afterCtrlC += out.chunks.map((c) => c.data).join("");
       }
       expect(afterCtrlC).toContain("CTRL_C_RECOVERED");
-      expect(afterCtrlC).not.toContain("SHOULD_NOT_RUN\r\n");
+      expect(afterCtrlC).not.toContain("SHOULD_NOT_RUN");
 
       // 6. Natural exit records terminal.closed (process_exited) without waiting for DELETE
       await fetch(`${hub.url}${HOST_TERMINALS_PATH}/${create2.terminal.id}/input`, {
@@ -595,7 +605,7 @@ describe("Host terminal ANSI parser, security, lifecycle, PTY, and workspace (#1
     } finally {
       await hub.close();
     }
-  });
+  }, 20_000);
 
   it("enforces concurrent create slot reservation, kills handles on mid-spawn dispose, and buffers early data/exit", async () => {
     const stateDir = path.join(tempRoot, "hub-races");
@@ -725,7 +735,7 @@ describe("Host terminal ANSI parser, security, lifecycle, PTY, and workspace (#1
     } finally {
       await handle.kill();
     }
-  });
+  }, 20_000);
 
   it("resolves external Bot workspaces via resolveBotStateDir and supports dispatcher ticket workspaces", async () => {
     const stateDir = path.join(tempRoot, "hub-ext-resolve");
@@ -777,6 +787,356 @@ describe("Host terminal ANSI parser, security, lifecycle, PTY, and workspace (#1
       await terminal.dispose();
     } finally {
       await hub.close();
+    }
+  });
+
+  it("keeps running shells alive across 15-minute HTTP session expiry while still terminating on revocation, key change, or grant removal", async () => {
+    const stateDir = path.join(tempRoot, "hub-session-expiry");
+    const ws = path.join(tempRoot, "session-expiry-ws");
+    await mkdir(stateDir, { recursive: true });
+    await mkdir(ws, { recursive: true });
+
+    let fakeNow = Date.UTC(2026, 10, 1, 12, 0, 0);
+    const store = await HubStore.open(stateDir);
+    const auth = await HubAuth.open(store, stateDir, () => fakeNow);
+
+    const registerDevice = async (deviceId: string, localController = false) => {
+      const { publicKey, privateKey } = generateKeyPairSync("ed25519");
+      const pubB64 = publicKey.export({ type: "spki", format: "der" }).toString("base64");
+      await store.db.run(
+        "INSERT INTO devices(id,user_id,name,platform,public_key,created_at,last_seen,revoked) VALUES(?,?,?,?,?,?,?,0)",
+        [deviceId, "owner", deviceId, "macos", pubB64, fakeNow, fakeNow],
+      );
+      if (localController) {
+        await auth.markLocalDesktopController({ deviceId, name: deviceId, platform: "macos", publicKey: pubB64 });
+      }
+      const authenticate = async () => {
+        const clientNonce = randomUUID().replaceAll("-", "").padEnd(43, "a");
+        const connId = `conn_${deviceId}_${randomUUID().slice(0, 8)}`;
+        const ch = await auth.challenge(connId, deviceId, clientNonce, "127.0.0.1");
+        const sig = sign(null, Buffer.from(`tarocub/device/v1\0${deviceId}\0${ch.nonce}\0${clientNonce}`), privateKey).toString("base64");
+        const issued = await auth.authenticate(connId, sig);
+        const session = await auth.authorize(issued.token, "127.0.0.1");
+        return { token: issued.token, session };
+      };
+      return { deviceId, pubB64, privateKey, authenticate };
+    };
+
+    const handles = new Map<string, {
+      killed: number;
+      written: string[];
+      emitData: (chunk: string) => void;
+      emitExit: (code: number | null) => void;
+    }>();
+    let spawnSeq = 0;
+
+    const terminal = new HubHostTerminal({
+      store,
+      auth,
+      stateDir,
+      defaultWorkspace: ws,
+      now: () => fakeNow,
+      spawnProcess: async () => {
+        const key = `mock_${++spawnSeq}`;
+        let dataCb: ((chunk: string) => void) | undefined;
+        let exitCb: ((code: number | null) => void) | undefined;
+        const state = {
+          killed: 0,
+          written: [] as string[],
+          emitData: (chunk: string) => dataCb?.(chunk),
+          emitExit: (code: number | null) => exitCb?.(code),
+        };
+        handles.set(key, state);
+        return {
+          shell: key,
+          backend: "pipe",
+          write: (data) => { state.written.push(data); },
+          kill: async () => { state.killed += 1; },
+          onData: (cb) => { dataCb = cb; },
+          onExit: (cb) => { exitCb = cb; },
+        };
+      },
+    });
+
+    try {
+      await store.db.run("INSERT INTO bots(id,name,engine,secret_hash,online) VALUES('bot_exp','Exp','codex','h',1)");
+      const conv = await store.createConversation("owner", ["bot_exp"], "Long Build Chat", "conv_exp", { type: "direct" });
+      const ownerDev = await registerDevice("exp_owner", true);
+      const revDev = await registerDevice("exp_rev");
+      const keyDev = await registerDevice("exp_key");
+      const grantDev = await registerDevice("exp_grant");
+
+      const signConfig = async (
+        actor: Awaited<ReturnType<typeof registerDevice>>,
+        authResult: { token: string; session: Awaited<ReturnType<HubAuth["authorize"]>> },
+        command: { expectedRevision: number; enabled: boolean; grants: Array<{ deviceId: string; publicKey: string }> },
+      ) => {
+        const full = { ...command, requestId: `req_${randomUUID().replaceAll("-", "")}` };
+        const target = createHash("sha256").update(terminalConfigureText(full)).digest("hex");
+        const statement = await auth.prepareDeviceAction({ operation: "terminal-grant", target }, authResult.token, authResult.session);
+        const signature = sign(null, Buffer.from(deviceActionProofText(statement)), actor.privateKey).toString("base64");
+        return { command: full, proof: { nonce: statement.nonce, signature } };
+      };
+
+      const ownerAuth1 = await ownerDev.authenticate();
+      const revAuth1 = await revDev.authenticate();
+      const keyAuth1 = await keyDev.authenticate();
+      const grantAuth1 = await grantDev.authenticate();
+
+      const cfg1 = await signConfig(ownerDev, ownerAuth1, {
+        expectedRevision: 0,
+        enabled: true,
+        grants: [
+          { deviceId: ownerDev.deviceId, publicKey: ownerDev.pubB64 },
+          { deviceId: revDev.deviceId, publicKey: revDev.pubB64 },
+          { deviceId: keyDev.deviceId, publicKey: keyDev.pubB64 },
+          { deviceId: grantDev.deviceId, publicKey: grantDev.pubB64 },
+        ],
+      });
+      await terminal.configure(ownerAuth1.session, cfg1.command, cfg1.proof);
+
+      const ownerTerm = await terminal.create(ownerAuth1.session, { conversationId: conv.id });
+      const revTerm = await terminal.create(revAuth1.session, { conversationId: conv.id });
+      const keyTerm = await terminal.create(keyAuth1.session, { conversationId: conv.id });
+      const grantTerm = await terminal.create(grantAuth1.session, { conversationId: conv.id });
+
+      // Advance clock 25 minutes: past the 15-minute HTTP session TTL, well under the 2-hour idle ceiling
+      fakeNow += 25 * 60_000;
+      await expect(auth.validateSession(ownerAuth1.session)).rejects.toMatchObject({ code: "session_expired" });
+      await expect(terminal.readOutput(ownerAuth1.session, ownerTerm.id, 0, 0)).rejects.toMatchObject({ code: "session_expired" });
+
+      // Periodic sweep MUST NOT kill running shells just because their creating HTTP sessions expired
+      await terminal.sweep();
+      expect(handles.get("mock_1")!.killed).toBe(0);
+      expect(handles.get("mock_2")!.killed).toBe(0);
+      expect(handles.get("mock_3")!.killed).toBe(0);
+      expect(handles.get("mock_4")!.killed).toBe(0);
+
+      // Re-authenticating after panel reopen / session renewal seamlessly reattaches to the live shell
+      handles.get("mock_1")!.emitData("BUILD_STEP_42\n");
+      const ownerAuth2 = await ownerDev.authenticate();
+      const listed = await terminal.list(ownerAuth2.session, conv.id);
+      expect(listed.map((t) => t.id)).toContain(ownerTerm.id);
+      const out = await terminal.readOutput(ownerAuth2.session, ownerTerm.id, 0, 0);
+      expect(out.running).toBe(true);
+      expect(out.chunks.map((c) => c.data).join("")).toContain("BUILD_STEP_42");
+      await terminal.writeInput(ownerAuth2.session, ownerTerm.id, { data: "echo still-alive\r" });
+      expect(handles.get("mock_1")!.written).toContain("echo still-alive\r");
+
+      // Even while revDev & keyDev HTTP sessions remain expired, sweep() still terminates on:
+      // (a) external SQLite device revocation
+      await store.db.run("UPDATE devices SET revoked=1 WHERE id=?", [revDev.deviceId]);
+      // (b) device public key rotation/change in SQLite
+      const rotatedKey = generateKeyPairSync("ed25519").publicKey.export({ type: "spki", format: "der" }).toString("base64");
+      await store.db.run("UPDATE devices SET public_key=? WHERE id=?", [rotatedKey, keyDev.deviceId]);
+      await terminal.sweep();
+
+      expect(handles.get("mock_1")!.killed).toBe(0);
+      expect(handles.get("mock_2")!.killed).toBe(1);
+      expect(handles.get("mock_3")!.killed).toBe(1);
+      expect(handles.get("mock_4")!.killed).toBe(0);
+
+      // (c) removing terminal authorization terminates grantTerm immediately with permission_revoked
+      const cfg2 = await signConfig(ownerDev, ownerAuth2, {
+        expectedRevision: 1,
+        enabled: true,
+        grants: [{ deviceId: ownerDev.deviceId, publicKey: ownerDev.pubB64 }],
+      });
+      await terminal.configure(ownerAuth2.session, cfg2.command, cfg2.proof);
+      expect(handles.get("mock_4")!.killed).toBe(1);
+      expect(handles.get("mock_1")!.killed).toBe(0);
+
+      await store.flushAudit();
+      const closedAudits = await store.db.all<{ detail_json: string }>(
+        "SELECT detail_json FROM audit_log WHERE kind='terminal.closed'",
+      );
+      expect(closedAudits.some((r) => r.detail_json.includes(revTerm.id) && r.detail_json.includes("device_revoked"))).toBe(true);
+      expect(closedAudits.some((r) => r.detail_json.includes(keyTerm.id) && r.detail_json.includes("device_revoked"))).toBe(true);
+      expect(closedAudits.some((r) => r.detail_json.includes(grantTerm.id) && r.detail_json.includes("permission_revoked"))).toBe(true);
+      expect(closedAudits.some((r) => r.detail_json.includes(ownerTerm.id))).toBe(false);
+    } finally {
+      await terminal.dispose();
+      await store.flushAudit();
+      await store.db.close();
+    }
+  });
+
+  it("reaps abandoned shells after the configurable idle ceiling while keeping active I/O shells alive", async () => {
+    expect(DEFAULT_TERMINAL_IDLE_TIMEOUT_MS).toBe(2 * 60 * 60_000);
+    expect(resolveTerminalIdleTimeoutMs(undefined, {})).toBe(DEFAULT_TERMINAL_IDLE_TIMEOUT_MS);
+    expect(resolveTerminalIdleTimeoutMs(undefined, { TAROBOT_TERMINAL_IDLE_TIMEOUT_MS: String(30 * 60_000) })).toBe(30 * 60_000);
+    expect(resolveTerminalIdleTimeoutMs(undefined, { TAROBOT_TERMINAL_IDLE_TIMEOUT_MS: "500" })).toBe(MIN_TERMINAL_IDLE_TIMEOUT_MS);
+    expect(resolveTerminalIdleTimeoutMs(undefined, { TAROBOT_TERMINAL_IDLE_TIMEOUT_MS: String(99 * 60 * 60_000) })).toBe(MAX_TERMINAL_IDLE_TIMEOUT_MS);
+    expect(resolveTerminalIdleTimeoutMs(undefined, { TAROBOT_TERMINAL_IDLE_TIMEOUT_MS: "0" })).toBe(DEFAULT_TERMINAL_IDLE_TIMEOUT_MS);
+    expect(resolveTerminalIdleTimeoutMs(undefined, { TAROBOT_TERMINAL_IDLE_TIMEOUT_MS: "not-a-number" })).toBe(DEFAULT_TERMINAL_IDLE_TIMEOUT_MS);
+    expect(resolveTerminalIdleTimeoutMs(10_000, {})).toBe(10_000);
+
+    const stateDir = path.join(tempRoot, "hub-idle-ceiling");
+    const ws = path.join(tempRoot, "idle-ceiling-ws");
+    await mkdir(stateDir, { recursive: true });
+    await mkdir(ws, { recursive: true });
+
+    let fakeNow = Date.UTC(2026, 10, 1, 14, 0, 0);
+    const store = await HubStore.open(stateDir);
+    const auth = await HubAuth.open(store, stateDir, () => fakeNow);
+
+    const { publicKey, privateKey } = generateKeyPairSync("ed25519");
+    const pubB64 = publicKey.export({ type: "spki", format: "der" }).toString("base64");
+    await store.db.run(
+      "INSERT INTO devices(id,user_id,name,platform,public_key,created_at,last_seen,revoked) VALUES(?,?,?,?,?,?,?,0)",
+      ["idle_owner", "owner", "idle_owner", "macos", pubB64, fakeNow, fakeNow],
+    );
+    await auth.markLocalDesktopController({ deviceId: "idle_owner", name: "idle_owner", platform: "macos", publicKey: pubB64 });
+
+    const authenticate = async () => {
+      const clientNonce = randomUUID().replaceAll("-", "").padEnd(43, "b");
+      const connId = `conn_idle_${randomUUID().slice(0, 8)}`;
+      const ch = await auth.challenge(connId, "idle_owner", clientNonce, "127.0.0.1");
+      const sig = sign(null, Buffer.from(`tarocub/device/v1\0idle_owner\0${ch.nonce}\0${clientNonce}`), privateKey).toString("base64");
+      const issued = await auth.authenticate(connId, sig);
+      const session = await auth.authorize(issued.token, "127.0.0.1");
+      return { token: issued.token, session };
+    };
+
+    const mocks: Array<{
+      killed: number;
+      emitData: (chunk: string) => void;
+      emitExit: (code: number | null) => void;
+    }> = [];
+
+    const terminal = new HubHostTerminal({
+      store,
+      auth,
+      stateDir,
+      defaultWorkspace: ws,
+      now: () => fakeNow,
+      spawnProcess: async () => {
+        let dataCb: ((chunk: string) => void) | undefined;
+        let exitCb: ((code: number | null) => void) | undefined;
+        const entry = {
+          killed: 0,
+          emitData: (chunk: string) => dataCb?.(chunk),
+          emitExit: (code: number | null) => exitCb?.(code),
+        };
+        mocks.push(entry);
+        return {
+          shell: `idle_mock_${mocks.length}`,
+          backend: "pipe",
+          write: () => {},
+          resize: () => {},
+          kill: async () => { entry.killed += 1; },
+          onData: (cb) => { dataCb = cb; },
+          onExit: (cb) => { exitCb = cb; },
+        };
+      },
+    });
+
+    try {
+      expect(terminal.idleTimeoutMs).toBe(DEFAULT_TERMINAL_IDLE_TIMEOUT_MS);
+      await store.db.run("INSERT INTO bots(id,name,engine,secret_hash,online) VALUES('bot_idle','Idle','codex','h',1)");
+      const conv = await store.createConversation("owner", ["bot_idle"], "Idle Chat", "conv_idle", { type: "direct" });
+
+      const auth1 = await authenticate();
+      const cmd = {
+        expectedRevision: 0,
+        enabled: true,
+        grants: [{ deviceId: "idle_owner", publicKey: pubB64 }],
+        requestId: "req_idle_enable",
+      };
+      const target = createHash("sha256").update(terminalConfigureText(cmd)).digest("hex");
+      const statement = await auth.prepareDeviceAction({ operation: "terminal-grant", target }, auth1.token, auth1.session);
+      const signature = sign(null, Buffer.from(deviceActionProofText(statement)), privateKey).toString("base64");
+      await terminal.configure(auth1.session, cmd, { nonce: statement.nonce, signature });
+
+      const abandoned = await terminal.create(auth1.session, { conversationId: conv.id });
+      const activeBuild = await terminal.create(auth1.session, { conversationId: conv.id });
+
+      // 1 hour later (well past 15-min HTTP session expiry): activeBuild emits output, abandoned stays silent
+      fakeNow += 60 * 60_000;
+      mocks[1]!.emitData("compiling module 12/40\n");
+      await terminal.sweep();
+      expect(mocks[0]!.killed).toBe(0);
+      expect(mocks[1]!.killed).toBe(0);
+
+      // Just before the 2-hour idle ceiling (1h59m59s): abandoned still survives
+      fakeNow += 60 * 60_000 - 1_000;
+      await terminal.sweep();
+      expect(mocks[0]!.killed).toBe(0);
+      expect(mocks[1]!.killed).toBe(0);
+
+      // Cross the 2-hour idle ceiling for abandoned (while activeBuild had output 1h ago)
+      fakeNow += 1_000;
+      await terminal.sweep();
+      expect(mocks[0]!.killed).toBe(1);
+      expect(mocks[1]!.killed).toBe(0);
+
+      // Re-auth and send input to activeBuild at 1h50m since its last stdout -> resets its idle timer
+      fakeNow += 50 * 60_000;
+      const auth2 = await authenticate();
+      expect((await terminal.list(auth2.session, conv.id)).map((t) => t.id)).toEqual([activeBuild.id]);
+      await terminal.writeInput(auth2.session, activeBuild.id, { data: "echo ping\r" });
+
+      // 30 minutes later (2h20m after last stdout, only 30m after writeInput): activeBuild still lives
+      fakeNow += 30 * 60_000;
+      await terminal.sweep();
+      expect(mocks[1]!.killed).toBe(0);
+
+      // 1h30m more of complete silence -> reaches 2h idle and gets reaped
+      fakeNow += 90 * 60_000;
+      await terminal.sweep();
+      expect(mocks[1]!.killed).toBe(1);
+
+      await store.flushAudit();
+      const closedAudits = await store.db.all<{ detail_json: string }>(
+        "SELECT detail_json FROM audit_log WHERE kind='terminal.closed'",
+      );
+      expect(closedAudits.some((r) => r.detail_json.includes(abandoned.id) && r.detail_json.includes("idle_timeout"))).toBe(true);
+      expect(closedAudits.some((r) => r.detail_json.includes(activeBuild.id) && r.detail_json.includes("idle_timeout"))).toBe(true);
+
+      // Short custom idleTimeoutMs: exited shell must NOT be re-audited as idle_timeout
+      const shortTerm = new HubHostTerminal({
+        store,
+        auth,
+        stateDir,
+        defaultWorkspace: ws,
+        idleTimeoutMs: 10_000,
+        now: () => fakeNow,
+        spawnProcess: async () => {
+          let exitCb: ((code: number | null) => void) | undefined;
+          return {
+            shell: "short_mock",
+            backend: "pipe",
+            write: () => {},
+            kill: async () => {},
+            onData: () => {},
+            onExit: (cb) => {
+              exitCb = cb;
+              exitCb(0);
+            },
+          };
+        },
+      });
+      try {
+        expect(shortTerm.idleTimeoutMs).toBe(10_000);
+        const auth3 = await authenticate();
+        const exited = await shortTerm.create(auth3.session, { conversationId: conv.id });
+        fakeNow += 30_000;
+        await shortTerm.sweep();
+        await store.flushAudit();
+        const exitedAudits = await store.db.all<{ detail_json: string }>(
+          "SELECT detail_json FROM audit_log WHERE kind='terminal.closed'",
+        );
+        const matching = exitedAudits.filter((r) => r.detail_json.includes(exited.id));
+        expect(matching).toHaveLength(1);
+        expect(matching[0]!.detail_json).toContain("process_exited");
+        expect(matching[0]!.detail_json).not.toContain("idle_timeout");
+      } finally {
+        await shortTerm.dispose();
+      }
+    } finally {
+      await terminal.dispose();
+      await store.flushAudit();
+      await store.db.close();
     }
   });
 });

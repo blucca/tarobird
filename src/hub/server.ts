@@ -155,7 +155,7 @@ function gatewayWorkbenchMetadata<T extends { workbench?: WorkbenchContext }>(me
 type BotConnection = { botSteer: boolean; engineQuota: boolean; contextUsage: boolean; history: boolean; designOpen: boolean; nativeInput: boolean; nativeReviewInput: boolean; engineTasks: boolean; piSession: boolean; ws: WebSocket; botId: string; queueCapable: boolean; queuePull: boolean; queueAdvertised: boolean; botMessages: boolean; agentBus: boolean; groupDiscussion: boolean; voicePolicy: boolean; widgetPolicy: boolean; replayQueue: boolean; ready: boolean };
 type Rpc = { resolve: (value: Json) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout>; ws: WebSocket };
 export interface HubTlsListener { exposure?: ListenerExposure; host: string; port: number; tls: TlsOptions; managed?: boolean }
-export interface HubServerOptions { voiceSettings?: HubVoiceSettings; asrSetup?: QwenAsrSetup; /** Internal lease duration override for isolated tests. */ drainLeaseMs?: number; relaySources?: RelaySources; exposure?: ListenerExposure; maxFileBytes?: number; managedBots?: BotManagerOptions; hostTerminalSpawner?: (options: { cwd: string; cols: number; rows: number }) => Promise<TerminalProcessHandle>; hostTerminalDefaultWorkspace?: string; stateDir: string; host?: string; port?: number; tls?: TlsOptions; instancePort?: number; tlsListeners?: HubTlsListener[]; push?: PushConfig; origins?: string[]; clientDir?: string; googleDocs?: () => Promise<GoogleDocs>; onWarning?: (code: string) => void; networkExchange?: typeof exchangeNetworkPeer }
+export interface HubServerOptions { voiceSettings?: HubVoiceSettings; asrSetup?: QwenAsrSetup; /** Internal lease duration override for isolated tests. */ drainLeaseMs?: number; relaySources?: RelaySources; exposure?: ListenerExposure; maxFileBytes?: number; managedBots?: BotManagerOptions; hostTerminalSpawner?: (options: { cwd: string; cols: number; rows: number }) => Promise<TerminalProcessHandle>; hostTerminalDefaultWorkspace?: string; hostTerminalIdleTimeoutMs?: number; stateDir: string; host?: string; port?: number; tls?: TlsOptions; instancePort?: number; tlsListeners?: HubTlsListener[]; push?: PushConfig; origins?: string[]; clientDir?: string; googleDocs?: () => Promise<GoogleDocs>; onWarning?: (code: string) => void; networkExchange?: typeof exchangeNetworkPeer }
 export class HubServer {
   private readonly relaySources: RelaySources;
   private readonly fragmentSockets = new WeakSet<WebSocket>();
@@ -362,6 +362,7 @@ export class HubServer {
         return undefined;
       },
       spawnProcess: options.hostTerminalSpawner,
+      idleTimeoutMs: options.hostTerminalIdleTimeoutMs,
     });
     this.screenSockets = new RemoteScreenSockets(this.remoteScreen);
     this.disposers.push(() => { this.remoteScreen.dispose(); this.screenSockets.dispose(); });

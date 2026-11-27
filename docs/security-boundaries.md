@@ -1032,3 +1032,43 @@ model write followed by a failed state read, a timed-out write, or a lost sessio
 guard remains uncertain; do not automatically replay it. Workspace equivalence
 uses physical identity and Windows case comparison, while Windows launch cwd
 keeps its logical junction path and its native ancestor-resource semantics.
+
+## Host terminal
+
+Host Terminal (`host.terminal.v1`) is disabled by default (`terminal-policy:v1`).
+Enabling it or changing per-device grants requires an enrolled local owner
+desktop controller and a one-use signed `terminal-grant` device-action proof
+with revision compare-and-swap and `requestId` idempotency; remote owner devices
+receive `local_controller_required`. Grants bind both `deviceId` and Ed25519
+`publicKey`. Initial working directories resolve from the conversation's
+dispatcher ticket workspace or Bot workspace, reject archived conversations, and
+fail closed rather than falling back to the Hub private `stateDir`.
+
+Authorizing a device for Host Terminal is equivalent to granting interactive
+access to the Host OS account. Spawned shells run as the Host OS user with no
+OS sandbox, inherit the Host process environment variables (including configured
+API keys and credentials), and can access any path or command available to that
+account outside the initial workspace directory.
+
+"Desktop-only" is strictly a client UI affordance that hides the terminal entry
+and panel on mobile/tablet clients and narrow viewports; it is not a Host
+authorization boundary. The Host accepts any device whose `(deviceId, publicKey)`
+is authorized in the enabled policy—including browser/web clients or paired
+member devices if an owner explicitly grants them—and scopes visible terminal
+tabs to the authenticated user's own conversations.
+
+Revoking a device or removing its terminal grant wakes and rejects in-flight
+output polls and terminates owned shells immediately; external CLI revocations
+and key changes in SQLite are enforced by the periodic Host sweep. Running
+shells are not terminated when a device's 15-minute HTTP session token expires
+(so long-running builds survive panel hides, App minimization, and session
+renewal), while HTTP reads and writes still require a currently valid session.
+To prevent abandoned shells from living indefinitely if a client disappears, the
+sweep reaps running shells after an explicit idle timeout ceiling (default 2
+hours without terminal I/O, configurable via `TAROBOT_TERMINAL_IDLE_TIMEOUT_MS`
+between 1 minute and 24 hours).
+
+Platform limit: without bundled `node-pty` (ConPTY), Windows falls back to a
+pipe-backed shell that lacks a PTY, so `Ctrl+C` (`SIGINT`) cannot be delivered
+cleanly to foreground commands. See
+[terminal packaging and runtime notes](client/terminal-packaging.md).
