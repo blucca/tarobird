@@ -1023,3 +1023,90 @@ test("cancelling a pending gen-2 recovery admission lets the user retry recovery
     expect(commands[1]).toMatchObject({ operation: "propose", generation: 2, recover: true });
   } finally { await page.close(); await vite.close(); }
 });
+
+test("mixed 1.6.0 active peer blocks both direct recovery and coordinator reinstate in zh and en, then succeeds after upgrade", async ({ page }) => {
+  const vite = await fixture(page);
+  try {
+    await page.evaluate(() => {
+      const f = (window as any).networkFixture;
+      f.overview(["macmini", "studio-b"], "Home Lab");
+      f.addLegacyPeer("legacy-1.6.0-peer");
+    });
+
+    // Leave studio-b while legacy-1.6.0-peer remains active without generation support.
+    await overview(page).locator(".network-member").filter({ hasText: "studio-b" }).click();
+    await page.getByRole("dialog", { name: "studio-b", exact: true }).getByRole("button", { name: "退出网络", exact: true }).click();
+    const leave = page.getByRole("dialog", { name: "让「studio-b」退出网络？", exact: true });
+    await leave.getByRole("checkbox").check();
+    await leave.getByRole("button", { name: "退出网络", exact: true }).click();
+    await expect(leave).toHaveCount(0);
+
+    // Overview & direct recovery dialog refuse reinstate with clear zh message.
+    const revokedSection = overview(page).getByRole("region", { name: "曾退出或移出的主机", exact: true });
+    await expect(revokedSection).toContainText("请先将网络内所有主机和 App 更新到最新版本后再恢复主机。");
+    await revokedSection.getByRole("button", { name: "恢复加入", exact: true }).click();
+    const recover = page.getByRole("dialog", { name: "恢复加入网络", exact: true });
+    await expect(recover.getByRole("alert")).toContainText("请先将网络内所有主机和 App 更新到最新版本后再恢复主机。");
+    await expect(recover.getByRole("checkbox")).toBeDisabled();
+    await expect(recover.getByRole("button", { name: "确认恢复加入", exact: true })).toBeDisabled();
+
+    // English locale surfaces the exact localized guidance too.
+    await page.evaluate(async () => { const { setLocale } = await import("/src/i18n.ts"); setLocale("en"); });
+    const recoverEn = page.getByRole("dialog", { name: "Recover & rejoin network", exact: true });
+    await expect(recoverEn.getByRole("alert")).toContainText("Update all hosts and Apps in this network before reinstating a host.");
+    await expect(recoverEn.getByRole("button", { name: "Confirm recovery", exact: true })).toBeDisabled();
+    await recoverEn.getByRole("button", { name: "Back", exact: true }).click();
+
+    // Coordinator-only "Allow rejoin" dialog for a non-connected revoked host is also blocked cleanly.
+    await page.evaluate(async () => {
+      const { setLocale } = await import("/src/i18n.ts"); setLocale("zh");
+      (window as any).networkFixture.revokeRemoteHost("remote-worker");
+    });
+    await revokedSection.getByRole("button", { name: "允许重新加入", exact: true }).click();
+    const allowDialog = page.getByRole("dialog", { name: "允许「remote-worker」重新加入网络？", exact: true });
+    await expect(allowDialog.getByRole("alert")).toContainText("请先将网络内所有主机和 App 更新到最新版本后再恢复主机。");
+    await expect(allowDialog.getByRole("checkbox")).toBeDisabled();
+    await expect(allowDialog.getByRole("button", { name: "允许重新加入", exact: true })).toBeDisabled();
+    await allowDialog.getByRole("button", { name: "返回", exact: true }).last().click();
+
+    // No reinstate command was ever sent while the 1.6.0 peer was active.
+    expect((await inspectCalls(page)).map(call => call.command.operation)).toEqual(["leave"]);
+
+    // Once the 1.6.0 peer upgrades, recovery completes normally.
+    await page.evaluate(() => {
+      const f = (window as any).networkFixture;
+      f.upgradeLegacyPeer();
+      f.allowJoin();
+    });
+    await revokedSection.getByRole("button", { name: "恢复加入", exact: true }).click();
+    await expect(recover.getByRole("alert")).toHaveCount(0);
+    await recover.getByRole("checkbox").check();
+    await recover.getByRole("button", { name: "确认恢复加入", exact: true }).click();
+    await expect(recover).toHaveCount(0);
+    expect((await inspectCalls(page)).map(call => call.command.operation)).toEqual(["leave", "reinstate", "propose", "admit", "join"]);
+  } finally { await page.close(); await vite.close(); }
+});
+
+test("a 1.6.0 coordinator without recovery capability blocks reinstatement cleanly in the UI", async ({ page }) => {
+  const vite = await fixture(page);
+  try {
+    await page.evaluate(() => {
+      const f = (window as any).networkFixture;
+      f.overview(["macmini", "studio-b"], "Home Lab");
+    });
+    await overview(page).locator(".network-member").nth(1).click();
+    await page.getByRole("dialog", { name: "studio-b", exact: true }).getByRole("button", { name: "退出网络", exact: true }).click();
+    const leave = page.getByRole("dialog", { name: "让「studio-b」退出网络？", exact: true });
+    await leave.getByRole("checkbox").check();
+    await leave.getByRole("button", { name: "退出网络", exact: true }).click();
+    await expect(leave).toHaveCount(0);
+
+    await page.evaluate(() => (window as any).networkFixture.setRecoveryAvailable(0, false));
+    await overview(page).getByRole("region", { name: "曾退出或移出的主机", exact: true }).getByRole("button", { name: "恢复加入", exact: true }).click();
+    const recover = page.getByRole("dialog", { name: "恢复加入网络", exact: true });
+    await expect(recover.getByRole("alert")).toContainText("请先将网络内所有主机和 App 更新到最新版本后再恢复主机。");
+    await expect(recover.getByRole("checkbox")).toBeDisabled();
+    await expect(recover.getByRole("button", { name: "确认恢复加入", exact: true })).toBeDisabled();
+    expect((await inspectCalls(page)).map(call => call.command.operation)).toEqual(["leave"]);
+  } finally { await page.close(); await vite.close(); }
+});

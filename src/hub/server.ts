@@ -1809,7 +1809,9 @@ export class HubServer {
         return;
       }
       if (route === "/api/network" && req.method === "GET") {
-        await requireOwner(); await reply(200, await this.network.view(validateInQueue)); return;
+        await requireOwner();
+        const includeCapabilities = url.searchParams.get("capabilities") === "1";
+        await reply(200, await this.network.view(validateInQueue, { includeCapabilities })); return;
       }
       if (route === HOST_LAN_SELECTION_PATH && req.method === "POST") {
         await requireOwner();
@@ -1822,10 +1824,11 @@ export class HubServer {
       }
       if (route === "/api/network/manage" && req.method === "POST") {
         await requireOwner();
+        const includeCapabilities = url.searchParams.get("capabilities") === "1";
         // Keep the signed command's original representation for the network
         // layer's canonical-input check; do not normalize nested names/routes.
         const input = z.object({ command: z.unknown(), proof: deviceActionProofSchema.optional() }).strict().parse(await this.jsonBody(req, MAX_NETWORK_BYTES));
-        const result = await this.network.command(input.command, session, input.proof);
+        const result = await this.network.command(input.command, session, input.proof, { includeCapabilities });
         const completed = networkCommandSchema.parse(input.command);
         // An active departure intentionally revokes the requesting phone too.
         // Only return its already-authorized, root-verified departure receipt;

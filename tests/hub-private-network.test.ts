@@ -10,7 +10,10 @@ import { desktopControllerMarkerKey } from "../src/hub/local-controller.js";
 import { markDeviceNameAlias } from "../src/hub/network-device-name.js";
 import { PrivateNetwork, mergeNetworkManifests, networkId, networkMemberId } from "../src/hub/private-network.js";
 import { deviceActionProofText } from "../src/client-protocol/device-actions.js";
-import { networkCanonical, networkCommandSchema, type NetworkManifest, type SignedNetworkPeerRequest, type NetworkCommandInput, type NetworkCommandResult, type SignedNetworkManifest } from "../src/client-protocol/private-network.js";
+import { PRIVATE_NETWORK_RECOVERY_CAPABILITY, networkCanonical, networkCommandSchema, sharedRoutesSchema, type NetworkManifest, type SignedNetworkPeerRequest, type NetworkCommandInput, type NetworkCommandResult, type SignedNetworkManifest } from "../src/client-protocol/private-network.js";
+import { z } from "zod";
+import { hostNameSchema } from "../src/client-protocol/host-profile.js";
+import { deviceActionProofSchema, deviceActionStatementSchema } from "../src/client-protocol/device-actions.js";
 
 type TestDevice = { id: string; publicKey: string; privateKey: KeyObject; token: string; session: AuthSession };
 type TestHost = { directory: string; store: HubStore; auth: HubAuth; profile: HostProfile; network: PrivateNetwork; owner: TestDevice };
@@ -51,7 +54,7 @@ async function host(name: string, clockOffset = 0): Promise<TestHost> {
 async function mutation(host: TestHost, raw: NetworkCommandInput, actor = host.owner): Promise<NetworkCommandResult> {
   const view = await host.network.view();
   if (raw.operation === "leave") raw = { expectedState: view.membership ? view.host.state : "standalone", ...raw };
-  if (raw.operation === "remove") raw = { expectedState: view.membership!.manifest.hosts.find(host => host.publicKey === raw.publicKey)!.state, ...raw };
+  if (raw.operation === "remove") { const targetKey = raw.publicKey; raw = { expectedState: view.membership!.manifest.hosts.find(host => host.publicKey === targetKey)!.state, ...raw }; }
   const contextual = ["routes", "attest", "reinstate", "remove", "leave"].includes(raw.operation) ? { networkId: (await host.network.view()).membership?.manifest.id ?? "", ...raw } : raw;
   const command = networkCommandSchema.parse(contextual), target = hashSecret(networkCanonical(command));
   const statement = await host.auth.prepareDeviceAction({ operation: "network", target }, actor.token, actor.session);
@@ -269,8 +272,9 @@ async function peerRequest(peer: TestHost, extra: Partial<SignedNetworkPeerReque
     v: 1, networkId: (extra.known ?? view.membership)!.manifest.id, publicKey: peer.auth.publicKey,
     nonce: randomBytes(32).toString("base64url"), expiresAt: now + 30_000,
     host: { publicKey: peer.auth.publicKey, name: view.host.name, routes: view.host.routes, protocol: 2 },
-    devices: [], revoked: [], ...(view.membership ? { known: view.membership } : {}), ...extra,
+    devices: [], revoked: [], capabilities: [PRIVATE_NETWORK_RECOVERY_CAPABILITY], ...(view.membership ? { known: view.membership } : {}), ...extra,
   };
+  if (request.capabilities === undefined) delete request.capabilities;
   return { request, signature: peer.auth.signNetworkPeer(request) };
 }
 function rootSign(root: TestHost, manifest: NetworkManifest): SignedNetworkManifest { return { manifest, signature: root.auth.signNetworkManifest(manifest) }; }
@@ -538,7 +542,7 @@ it("uses a root-signed higher backup to restore additions while keeping its loca
 it("merges duplicate-key forks associatively even if another branch already revoked one slot", async () => {
   const a = await host("a"), b = await host("b"); await create(a); await join(a, b);
   const base = (await a.network.view()).membership!.manifest, item = freshEnrollment(b, "duplicate_one").device;
-  const origin = { memberId: networkMemberId(a.auth.publicKey, a.owner.id), originHost: a.auth.publicKey, attestedBy: a.auth.publicKey, scope: "host", revoked: false };
+  const origin = { memberId: networkMemberId(a.auth.publicKey, a.owner.id), originHost: a.auth.publicKey, attestedBy: a.auth.publicKey, scope: "host" as const, revoked: false };
   const left = structuredClone(base), right = structuredClone(base), third = structuredClone(base);
   left.devices.push({ ...item, ...origin }); right.devices.push({ ...item, id: "duplicate_two", ...origin });
   third.devices.push({ ...item, ...origin, revoked: true });
@@ -1214,4 +1218,114 @@ it("keeps a pending gen-2 host descriptor intact when reconcile sees a higher-re
   // B's original commit still succeeds against A without network_commit_invalid.
   await mutation(b, { operation: "join", membership: adm2, nonce: prop2.proposal.nonce });
   expect((await b.network.view()).host).toMatchObject({ state: "active", generation: 2, name: "B-Gen2-Renamed" });
+});
+
+// Exact 1.6.0 strict schemas (no generation/reinstated/hostCapabilities/peer capabilities).
+const legacy160Key = z.string().length(60).regex(/^[A-Za-z0-9+/]{59}=$/);
+const legacy160Id = z.string().min(1).max(128).regex(/^[A-Za-z0-9_-]+$/);
+const legacy160Nonce = z.string().length(43).regex(/^[A-Za-z0-9_-]{43}$/);
+const legacy160Sig = z.string().length(88).regex(/^[A-Za-z0-9+/]{86}==$/);
+const legacy160Deadline = z.number().int().positive().safe();
+const legacy160HostDescriptorSchema = z.object({ publicKey: legacy160Key, name: hostNameSchema, routes: sharedRoutesSchema, protocol: z.literal(2).optional() }).strict();
+const legacy160HostSchema = legacy160HostDescriptorSchema.extend({ state: z.enum(["pending", "active"]), revoked: z.boolean(), proposalNonce: legacy160Nonce.optional(), expiresAt: legacy160Deadline.optional() }).strict();
+const legacy160EnrollmentSchema = z.object({ id: legacy160Id, publicKey: legacy160Key, host: legacy160Key, name: hostNameSchema, platform: z.enum(["web", "macos", "windows", "android", "ios"]) }).strict();
+const legacy160PublishedEnrollmentSchema = legacy160EnrollmentSchema.extend({ scope: z.enum(["host", "network"]).optional() }).strict();
+const legacy160DeviceSchema = legacy160PublishedEnrollmentSchema.extend({ memberId: legacy160Id, originHost: legacy160Key, attestedBy: legacy160Key, revoked: z.boolean() }).strict();
+const legacy160ManifestSchema = z.object({
+  v: z.union([z.literal(1), z.literal(2)]), id: legacy160Id, name: hostNameSchema, authorityKey: legacy160Key, genesisNonce: legacy160Nonce,
+  revision: z.number().int().nonnegative().safe(), hosts: z.array(legacy160HostSchema).min(1).max(256), devices: z.array(legacy160DeviceSchema).max(4096),
+  pendingProposals: z.array(z.object({ host: legacy160Key, nonce: legacy160Nonce, expiresAt: legacy160Deadline }).strict()).max(4096).optional(),
+  cancelledProposals: z.array(z.object({ host: legacy160Key, nonce: legacy160Nonce }).strict()).max(4096).optional(),
+  blockedKeys: z.array(z.string().length(64).regex(/^[a-f0-9]{64}$/)).max(8192).optional(),
+  revokedMembers: z.array(legacy160Id).max(4096), blockedBindings: z.array(z.object({ host: legacy160Key, id: legacy160Id }).strict()).max(4096),
+}).strict();
+const legacy160SignedManifestSchema = z.object({ manifest: legacy160ManifestSchema, signature: legacy160Sig }).strict();
+const legacy160ViewSchema = z.object({ host: legacy160HostSchema, membership: legacy160SignedManifestSchema.optional(), sync: z.enum(["standalone", "current", "waiting", "removed"]), lastSyncedAt: z.number().int().nonnegative() }).strict();
+const legacy160PeerRequestSchema = z.object({
+  v: z.literal(1), networkId: legacy160Id, publicKey: legacy160Key, nonce: legacy160Nonce, expiresAt: legacy160Deadline,
+  host: legacy160HostDescriptorSchema, devices: z.array(legacy160PublishedEnrollmentSchema).max(256), revoked: z.array(legacy160Id).max(256),
+  known: legacy160SignedManifestSchema.optional(), commit: legacy160Nonce.optional(), cancel: legacy160Nonce.optional(), retire: z.literal(true).optional(),
+  attest: z.object({ sourceDeviceId: legacy160Id, device: legacy160EnrollmentSchema, statement: deviceActionStatementSchema, proof: deviceActionProofSchema }).strict().optional(),
+}).strict();
+
+it("refuses reinstate while any active 1.6.0 peer lacks generation support, keeps manifests 1.6.0-valid for revocations, and allows reinstate after upgrade", async () => {
+  const a = await host("a"), b = await host("b"), c = await host("c");
+  const phoneA = await device(a, "phone_a");
+  await create(a); await join(a, b); await join(a, c);
+  const phoneOnC = freshEnrollment(c, "phone_c");
+  await c.network.enroll((await mutation(a, { operation: "attest", device: phoneOnC.device }, phoneA)).membership);
+  const activePhoneOnC = await login(c, phoneOnC.device.id, phoneOnC.keys.privateKey);
+
+  // Simulate upgraded Coordinator A having a 1.6.0 active peer C (e.g. C synced without capabilities).
+  await a.network.peer(await peerRequest(c, { capabilities: undefined }), "legacy-160-peer");
+  const viewWithoutCaps = await a.network.view();
+  expect(() => legacy160ViewSchema.parse(viewWithoutCaps)).not.toThrow();
+  const viewWithCaps = await a.network.view(undefined, { includeCapabilities: true });
+  expect(viewWithCaps.hostCapabilities?.[a.auth.publicKey]).toEqual([PRIVATE_NETWORK_RECOVERY_CAPABILITY]);
+  expect(viewWithCaps.hostCapabilities?.[b.auth.publicKey]).toEqual([PRIVATE_NETWORK_RECOVERY_CAPABILITY]);
+  expect(viewWithCaps.hostCapabilities?.[c.auth.publicKey]).toBeUndefined();
+
+  // Host B leaves; Coordinator A must refuse reinstate while 1.6.0 Peer C is still active.
+  await mutation(b, { operation: "leave" });
+  const beforeRefusal = (await a.network.view()).membership!;
+  await expect(mutation(a, { operation: "reinstate", publicKey: b.auth.publicKey })).rejects.toThrow("network_recovery_upgrade_required");
+  expect((await a.network.view()).membership).toEqual(beforeRefusal);
+  expect(() => legacy160SignedManifestSchema.parse(beforeRefusal)).not.toThrow();
+
+  // Revoking phoneA still yields a 1.6.0-strict manifest so 1.6.0 Peer C accepts it and revokes phoneOnC!
+  await a.auth.revoke(phoneA.id, "local-owner");
+  await a.network.tick();
+  const cSynced = await a.network.peer(await peerRequest(c, { capabilities: undefined }), "legacy-160-peer");
+  expect(() => legacy160SignedManifestSchema.parse(cSynced)).not.toThrow();
+  await c.network.enroll(cSynced);
+  await expect(c.auth.authorize(activePhoneOnC.token)).rejects.toThrow();
+
+  // Once Peer C upgrades and syncs with signed private-network.recovery.v1, reinstate & gen-2 recovery succeed.
+  await c.network.tick();
+  expect((await a.network.view(undefined, { includeCapabilities: true })).hostCapabilities?.[c.auth.publicKey]).toEqual([PRIVATE_NETWORK_RECOVERY_CAPABILITY]);
+  const reinstated = (await mutation(a, { operation: "reinstate", publicKey: b.auth.publicKey })).membership!;
+  expect(() => legacy160SignedManifestSchema.parse(reinstated)).toThrow();
+  const prop = (await mutation(b, { operation: "propose", networkId: reinstated.manifest.id, authorityKey: a.auth.publicKey, seenManifestHash: hashSecret(networkCanonical(reinstated.manifest)), generation: 2, recover: true })).proposal!;
+  const adm = (await mutation(a, { operation: "admit", proposal: prop })).membership!;
+  await mutation(b, { operation: "join", membership: adm, nonce: prop.proposal.nonce });
+  expect((await b.network.view()).host).toMatchObject({ state: "active", revoked: false, generation: 2 });
+
+  // Once a manifest uses generation fields, a downgraded 1.6.0 active peer sync is explicitly rejected.
+  await expect(a.network.peer(await peerRequest(c, { capabilities: undefined }), "downgraded-peer")).rejects.toThrow("network_recovery_upgrade_required");
+}, 20_000);
+
+it("falls back cleanly to 1.6.0-strict peer requests when talking to a 1.6.0 coordinator and re-advertises after TTL", async () => {
+  const a = await host("a"), b = await host("b");
+  await create(a);
+  let coordinatorIs160 = true;
+  let attempts = 0, rejectedLegacySchema = 0, receivedCapabilities = 0;
+  interceptExchange = async (request, next) => {
+    attempts++;
+    if (request.request.capabilities?.includes(PRIVATE_NETWORK_RECOVERY_CAPABILITY)) receivedCapabilities++;
+    if (coordinatorIs160) {
+      const parsed = legacy160PeerRequestSchema.safeParse(request.request);
+      if (!parsed.success) { rejectedLegacySchema++; throw parsed.error; }
+    }
+    return next();
+  };
+
+  // Join (propose -> admit -> join/commit) succeeds against a strict 1.6.0 coordinator via single fallback.
+  await join(a, b);
+  expect((await b.network.view()).host).toMatchObject({ state: "active", revoked: false });
+  expect(rejectedLegacySchema).toBe(1);
+
+  // Subsequent ticks within TTL omit capabilities so zero extra 400/schema rejections occur.
+  const beforeTicks = rejectedLegacySchema;
+  await b.network.tick();
+  await b.network.tick();
+  expect(rejectedLegacySchema).toBe(beforeTicks);
+
+  // Once the coordinator upgrades and TTL elapses, Peer B automatically advertises generation support again.
+  coordinatorIs160 = false;
+  now += 61_000;
+  const capsBefore = receivedCapabilities;
+  await b.network.tick();
+  expect(receivedCapabilities).toBe(capsBefore + 1);
+  expect((await a.network.view(undefined, { includeCapabilities: true })).hostCapabilities?.[b.auth.publicKey]).toEqual([PRIVATE_NETWORK_RECOVERY_CAPABILITY]);
+  expect(attempts).toBeGreaterThanOrEqual(4);
 });

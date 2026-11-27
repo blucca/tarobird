@@ -45,7 +45,7 @@ import { HostNetwork, verifyCliNetworkMembership, verifyCliNetworkProposal } fro
 import { formatLocalRoutes } from "./network-local.js";
 import { tailscaleDiagnostic } from "./tailscale-status.js";
 import { isTailscaleAddress } from "../hub/network.js";
-import { networkCanonical, sharedRoutesSchema, type NetworkCommand } from "../client-protocol/private-network.js";
+import { PRIVATE_NETWORK_RECOVERY_CAPABILITY, networkCanonical, sharedRoutesSchema, unreadyRecoveryHosts, type NetworkCommand } from "../client-protocol/private-network.js";
 import { routesSchema, type Route } from "../client-protocol/routes.js";
 import { createBotSchema } from "../client-protocol/bots.js";
 import { piSessionThinkingSchema, type PiSessionChange } from "../client-protocol/pi-session.js";
@@ -929,6 +929,7 @@ export async function runHostCli(argv: string[]): Promise<void> {
         return;
       }
       yes();
+      const recoveryUpgradeMessage = "请先将网络内所有主机和 App 更新到最新版本后再恢复主机。 / Update all hosts and Apps in this network before reinstating a host.";
       let action: NetworkCommand;
       if (sub === "routes") action = { operation: "routes", networkId: view.membership?.manifest.id ?? "", routes: sharedRoutesSchema.parse(raw) };
       else if (sub === "propose") {
@@ -936,11 +937,13 @@ export async function runHostCli(argv: string[]): Promise<void> {
         const own = offer.manifest.hosts.find(host => host.publicKey === management.client.publicKey);
         if (own?.revoked) {
           if (!v.recover) throw new Error("这台主机曾退出或被移出此网络。请先在协调主机执行 tarobot network reinstate PUBLIC_KEY --yes --out OFFER，再使用 tarobot network propose --from OFFER --out PROPOSAL --recover --yes。");
+          if (!management.client.supports(PRIVATE_NETWORK_RECOVERY_CAPABILITY)) throw new Error(recoveryUpgradeMessage);
           const nextGen = (own.generation ?? 1) + 1;
           if (own.reinstated !== nextGen) throw new Error("协调主机尚未允许这台主机重新加入。请先在协调主机执行 tarobot network reinstate PUBLIC_KEY --yes --out OFFER。");
           action = { operation: "propose", networkId: offer.manifest.id, authorityKey: offer.manifest.authorityKey, seenManifestHash: hashSecret(networkCanonical(offer.manifest)), generation: nextGen, recover: true };
         } else if (own?.state === "pending" && (own.generation ?? 1) > 1) {
           if (!v.recover) throw new Error("这台主机正在恢复加入此网络。请使用 tarobot network propose --from OFFER --out PROPOSAL --recover --yes 重新发起恢复申请。");
+          if (!management.client.supports(PRIVATE_NETWORK_RECOVERY_CAPABILITY)) throw new Error(recoveryUpgradeMessage);
           action = { operation: "propose", networkId: offer.manifest.id, authorityKey: offer.manifest.authorityKey, seenManifestHash: hashSecret(networkCanonical(offer.manifest)), generation: own.generation!, recover: true };
         } else {
           action = { operation: "propose", networkId: offer.manifest.id, authorityKey: offer.manifest.authorityKey, seenManifestHash: hashSecret(networkCanonical(offer.manifest)) };
@@ -950,16 +953,29 @@ export async function runHostCli(argv: string[]): Promise<void> {
         const admission = z.object({ membership: z.unknown(), nonce: z.string().regex(/^[A-Za-z0-9_-]{43}$/) }).strict().parse(raw);
         action = { operation: "join", membership: verifyCliNetworkMembership(admission.membership, management.client.publicKey), nonce: admission.nonce };
       } else if (sub === "reinstate") {
-        const target = view.membership?.manifest.hosts.find(host => host.publicKey === argument && host.revoked);
-        if (!target) throw new Error("没有找到此网络中已退出或被移出的目标主机公钥。");
-        action = { operation: "reinstate", networkId: view.membership!.manifest.id, publicKey: target.publicKey, expectedGeneration: target.generation ?? 1 };
+        if (!management.client.supports(PRIVATE_NETWORK_RECOVERY_CAPABILITY)) throw new Error(recoveryUpgradeMessage);
+        const manifest = view.membership?.manifest;
+        const target = manifest?.hosts.find(host => host.publicKey === argument && host.revoked);
+        if (!manifest || !target) throw new Error("没有找到此网络中已退出或被移出的目标主机公钥。");
+        if (manifest.authorityKey === management.client.publicKey && (manifest.v !== 2 || unreadyRecoveryHosts(manifest, view.hostCapabilities).length > 0)) {
+          throw new Error(recoveryUpgradeMessage);
+        }
+        action = { operation: "reinstate", networkId: manifest.id, publicKey: target.publicKey, expectedGeneration: target.generation ?? 1 };
       } else if (sub === "leave") action = { operation: "leave", networkId: view.membership?.manifest.id ?? "", expectedState: view.membership ? view.host.state : "standalone" };
       else if (sub === "remove") {
         const target = view.membership?.manifest.hosts.find(host => host.publicKey === argument && !host.revoked);
         if (!target) throw new Error("没有找到此网络中的目标主机公钥。");
         action = { operation: "remove", networkId: view.membership!.manifest.id, publicKey: target.publicKey, expectedState: target.state };
       } else throw new Error("未知 network 命令。");
-      const transfer = await executeNetworkTransfer(directory, action, v.out, () => network.command(action));
+      const transfer = await executeNetworkTransfer(directory, action, v.out, async () => {
+        try { return await network.command(action); }
+        catch (error) {
+          if (error instanceof Error && error.message === "network_recovery_upgrade_required") {
+            throw Object.assign(new Error(recoveryUpgradeMessage), { code: "network_recovery_upgrade_required", cause: error });
+          }
+          throw error;
+        }
+      });
       await output(transfer.document);
       return;
     }

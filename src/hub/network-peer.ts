@@ -53,7 +53,7 @@ function send(route: Route, path: string, body: Buffer | undefined, signal: Abor
       }),
       headers: { ...(body ? { "Content-Type": "application/json", "Content-Length": body.length } : {}), Accept: "application/json" },
     }, res => {
-      if (res.statusCode !== 200) { res.destroy(); finish(new HubError("network_peer_rejected", 502)); return; }
+      if (res.statusCode !== 200) { res.destroy(); finish(new HubError("network_peer_rejected", body && res.statusCode === 400 ? 400 : 502)); return; }
       const unobserved = observePeerCertificate(res, tls);
       if (unobserved) { res.destroy(); finish(unobserved); return; }
       const declared = Number(res.headers["content-length"]);
@@ -113,7 +113,10 @@ export async function exchangeNetworkPeer(rawHost: NetworkHost, rawRequest: Sign
         || result.manifest.revision < (signed.request.known?.manifest.revision ?? 0)
         || !verify(null, Buffer.from(networkManifestProof(result.manifest)), parsePublicKey(host.publicKey), Buffer.from(result.signature, "base64"))) throw new HubError("network_peer_identity_mismatch", 403);
       return result;
-    } catch (error) { lastError = error; }
+    } catch (error) {
+      if (error instanceof HubError && error.code === "network_peer_rejected" && error.status === 400) throw error;
+      lastError = error;
+    }
   }
   throw lastError instanceof HubError ? lastError : new HubError("network_peer_response_invalid", 502);
 }

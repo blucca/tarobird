@@ -5724,5 +5724,6 @@
   "连不上时先检查这几项（无需退出网络）：": "Check these first when you cannot connect (no need to leave the network):",
   "确认目标电脑已开机，且 TaroBird 主机正在运行。": "Make sure the computer is awake and the TaroBird Host is running.",
   "确认两台设备在同一局域网，或 Tailscale 均已登录并连通；外出使用需有可达的 VPS 中转。": "Make sure both devices are on the same LAN or connected via Tailscale, or have a reachable VPS relay when remote.",
-  "查看下方各条线路的探测状态，或点击「编辑线路」核对地址。": "Review each route’s probe status below, or choose Edit routes to verify addresses."
+  "查看下方各条线路的探测状态，或点击「编辑线路」核对地址。": "Review each route’s probe status below, or choose Edit routes to verify addresses.",
+  "请先将网络内所有主机和 App 更新到最新版本后再恢复主机。": "Update all hosts and Apps in this network before reinstating a host."
 }

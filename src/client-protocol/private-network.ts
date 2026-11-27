@@ -5,12 +5,20 @@ import { deviceActionProofSchema, deviceActionStatementSchema } from "./device-a
 import { isLoopbackOrUnspecified } from "./loopback-address.js";
 
 export const PRIVATE_NETWORK_CAPABILITY = "private-network.v2";
+export const PRIVATE_NETWORK_RECOVERY_CAPABILITY = "private-network.recovery.v1";
 export const MAX_NETWORK_BYTES = 2 * 1024 * 1024;
 const key = z.string().length(60).regex(/^[A-Za-z0-9+/]{59}=$/);
 const id = z.string().min(1).max(128).regex(/^[A-Za-z0-9_-]+$/).refine(value => !/[\r\n]/.test(value));
 const nonce = z.string().length(43).regex(/^[A-Za-z0-9_-]{43}$/);
 const signature = z.string().length(88).regex(/^[A-Za-z0-9+/]{86}==$/);
 const deadline = z.number().int().positive().safe();
+export const networkPeerCapabilitySchema = z.enum([PRIVATE_NETWORK_RECOVERY_CAPABILITY]);
+export type NetworkPeerCapability = z.infer<typeof networkPeerCapabilitySchema>;
+export const networkPeerCapabilitiesSchema = z.array(networkPeerCapabilitySchema).min(1).max(16)
+  .refine(values => new Set(values).size === values.length, { message: "duplicate_network_peer_capability" });
+export const networkHostCapabilitiesSchema = z.record(key, networkPeerCapabilitiesSchema)
+  .refine(value => Object.keys(value).length <= 256, { message: "too_many_host_capabilities" });
+export type NetworkHostCapabilities = z.infer<typeof networkHostCapabilitiesSchema>;
 export const sharedRoutesSchema = z.array(routeSchema).max(9).superRefine((routes, ctx) => {
   if (routes.length && !routesSchema.safeParse(routes).success) ctx.addIssue({ code: "custom", message: "invalid_network_routes" });
   for (const route of routes) {
@@ -102,10 +110,12 @@ export type NetworkCommand = z.infer<typeof networkCommandSchema>;
 export type NetworkCommandInput = NetworkCommand extends infer C ? C extends NetworkCommand ? C["operation"] extends "routes" | "attest" | "reinstate" | "remove" | "leave" ? Omit<C, "networkId" | "expectedState"> & { networkId?: string } & (C extends { expectedState: infer S } ? { expectedState?: S } : {}) : C : never : never;
 export const networkViewSchema = z.object({ host: networkHostSchema, membership: signedNetworkManifestSchema.optional(),
   sync: z.enum(["standalone", "current", "waiting", "removed"]), lastSyncedAt: z.number().int().nonnegative(),
+  hostCapabilities: networkHostCapabilitiesSchema.optional(),
 }).strict();
 export type NetworkView = z.infer<typeof networkViewSchema>;
 export const networkPeerRequestSchema = z.object({ v: z.literal(1), networkId: id, publicKey: key, nonce, expiresAt: deadline,
   host: networkHostDescriptorSchema, devices: z.array(networkPublishedEnrollmentSchema).max(256), revoked: z.array(id).max(256), known: signedNetworkManifestSchema.optional(), commit: nonce.optional(), cancel: nonce.optional(), retire: z.literal(true).optional(),
+  capabilities: networkPeerCapabilitiesSchema.optional(),
   attest: z.object({ sourceDeviceId: id, device: networkEnrollmentSchema, statement: deviceActionStatementSchema, proof: deviceActionProofSchema }).strict().optional(),
 }).strict().refine(value => [value.commit, value.cancel, value.retire, value.attest].filter(Boolean).length <= 1, { message: "invalid_network_peer_action" });
 export type NetworkPeerRequest = z.infer<typeof networkPeerRequestSchema>;
@@ -113,6 +123,23 @@ export const signedNetworkPeerRequestSchema = z.object({ request: networkPeerReq
 export type SignedNetworkPeerRequest = z.infer<typeof signedNetworkPeerRequestSchema>;
 export const networkCommandResultSchema = z.object({ view: networkViewSchema, proposal: signedNetworkProposalSchema.optional(), membership: signedNetworkManifestSchema.optional() }).strict();
 export type NetworkCommandResult = z.infer<typeof networkCommandResultSchema>;
+/** True when a manifest carries host-recovery generation fields that 1.6.0
+ * peers/Apps reject under strict schema validation. */
+export function manifestUsesGenerations(manifest: NetworkManifest): boolean {
+  return manifest.hosts.some(host => host.generation !== undefined || host.reinstated !== undefined)
+    || manifest.devices.some(device => device.generation !== undefined || device.originGeneration !== undefined || device.attestedGeneration !== undefined)
+    || (manifest.pendingProposals ?? []).some(proposal => proposal.generation !== undefined);
+}
+/** Active non-coordinator hosts in `manifest` that have not advertised
+ * generation-aware manifest support (`private-network.recovery.v1`). */
+export function unreadyRecoveryHosts(manifest: NetworkManifest, hostCapabilities?: NetworkHostCapabilities): NetworkHost[] {
+  return manifest.hosts.filter(host =>
+    !host.revoked
+    && host.state === "active"
+    && host.publicKey !== manifest.authorityKey
+    && !hostCapabilities?.[host.publicKey]?.includes(PRIVATE_NETWORK_RECOVERY_CAPABILITY),
+  );
+}
 /** Stable JavaScript key order. Native devices only sign the SHA256 digest. */
 export function networkCanonical(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(networkCanonical).join(",")}]`;

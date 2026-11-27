@@ -1,9 +1,10 @@
 import { createHash, randomBytes, verify } from "node:crypto";
 import { z } from "zod";
 import {
+  PRIVATE_NETWORK_RECOVERY_CAPABILITY, manifestUsesGenerations, unreadyRecoveryHosts,
   networkCanonical, networkCommandSchema, networkPublishedEnrollmentSchema, networkManifestProof, networkManifestSchema, networkGenesisText, networkMemberText, networkBindingKey, networkDeviceRetiredByHosts,
   networkPeerProof, networkProposalProof, sharedRoutesSchema, signedNetworkManifestSchema, signedNetworkPeerRequestSchema,
-  signedNetworkProposalSchema, type NetworkCommandResult, type NetworkDevice, type NetworkEnrollment, type NetworkPublishedEnrollment, type NetworkHost,
+  signedNetworkProposalSchema, type NetworkCommandResult, type NetworkDevice, type NetworkEnrollment, type NetworkPublishedEnrollment, type NetworkHost, type NetworkHostCapabilities, type NetworkPeerCapability,
   type NetworkManifest, type NetworkPeerRequest, type NetworkView, type NetworkHostDescriptor, type SignedNetworkManifest, type SignedNetworkPeerRequest,
   type SignedNetworkProposal,
 } from "../client-protocol/private-network.js";
@@ -21,7 +22,7 @@ const stateSchema = z.object({
   v: z.literal(1), routes: sharedRoutesSchema, membership: signedNetworkManifestSchema.optional(), proposal: signedNetworkProposalSchema.optional(),
   accepted: z.object({ nonce: z.string(), networkId: z.string(), authorityKey: z.string() }).strict().optional(),
   imported: z.record(z.string(), z.object({ publicKey: z.string(), memberId: z.string(), networkId: z.string() }).strict()),
-  revokedMembers: z.array(z.string()), revokedHosts: z.array(z.string()), retiredNetworks: z.array(z.string()), retiredAccessNetworks: z.array(z.string()).default([]), upgradedHosts: z.array(z.string()).default([]),
+  revokedMembers: z.array(z.string()), revokedHosts: z.array(z.string()), retiredNetworks: z.array(z.string()), retiredAccessNetworks: z.array(z.string()).default([]), upgradedHosts: z.array(z.string()).default([]), generationAwareHosts: z.array(z.string()).default([]),
   admissions: z.array(memoSchema), peers: z.array(memoSchema), proofs: z.array(memoSchema), lastSyncedAt: z.number(), waiting: z.boolean(),
   intents: z.record(z.string(), z.object({ networkId: z.string(), authorityKey: z.string(), deviceId: z.string(), devicePublicKey: z.string(), memberId: z.string(), commandHash: z.string(), expiresAt: z.number() }).strict()),
 }).strict();
@@ -160,19 +161,39 @@ export function mergeNetworkManifests(a: NetworkManifest, b: NetworkManifest): N
 /** A signed directory is shared, while each Hub continues to own its runtime,
  * database and private key. Only the creating Hub signs directory revisions. */
 export class PrivateNetwork {
+  private static readonly LEGACY_AUTHORITY_TTL_MS = 60_000;
   private readonly now: () => number;
   private closed = false;
   private ticking?: Promise<void>;
   private commandTail: Promise<unknown> = Promise.resolve();
   private commandsPending = 0;
   private pendingExchanges = 0;
+  private readonly legacyAuthorities = new Map<string, number>();
   constructor(private readonly store: HubStore, private readonly auth: HubAuth, private readonly profile: HostProfile, private readonly options: PrivateNetworkOptions = {}) {
     this.now = options.now ?? Date.now;
+  }
+  private authorityScope(manifest: NetworkManifest): string { return `${manifest.id}:${manifest.authorityKey}`; }
+  private isLegacyAuthority(manifest: NetworkManifest): boolean {
+    const until = this.legacyAuthorities.get(this.authorityScope(manifest));
+    if (until === undefined) return false;
+    if (until <= this.now()) { this.legacyAuthorities.delete(this.authorityScope(manifest)); return false; }
+    return true;
+  }
+  private rememberLegacyAuthority(manifest: NetworkManifest): void {
+    const scope = this.authorityScope(manifest);
+    if (!this.legacyAuthorities.has(scope) && this.legacyAuthorities.size >= 64) {
+      const oldest = this.legacyAuthorities.keys().next().value;
+      if (oldest !== undefined) this.legacyAuthorities.delete(oldest);
+    }
+    this.legacyAuthorities.set(scope, this.now() + PrivateNetwork.LEGACY_AUTHORITY_TTL_MS);
+  }
+  private isLegacyPeerRequestRejection(error: unknown): boolean {
+    return error instanceof z.ZodError || (error instanceof HubError && error.code === "network_peer_rejected" && error.status === 400);
   }
   private checkOpen() { if (this.closed) throw new HubError("network_closed", 503); }
   private async load(): Promise<NetworkState> {
     const row = await this.store.db.get<{ value: string }>("SELECT value FROM meta WHERE key=?", [STATE_KEY]);
-    return row ? stateSchema.parse(JSON.parse(row.value)) : { v: 1, routes: [], imported: {}, revokedMembers: [], revokedHosts: [], retiredNetworks: [], retiredAccessNetworks: [], upgradedHosts: [], admissions: [], peers: [], proofs: [], intents: {}, lastSyncedAt: 0, waiting: false };
+    return row ? stateSchema.parse(JSON.parse(row.value)) : { v: 1, routes: [], imported: {}, revokedMembers: [], revokedHosts: [], retiredNetworks: [], retiredAccessNetworks: [], upgradedHosts: [], generationAwareHosts: [], admissions: [], peers: [], proofs: [], intents: {}, lastSyncedAt: 0, waiting: false };
   }
   private async save(state: NetworkState) {
     this.checkOpen();
@@ -184,15 +205,29 @@ export class PrivateNetwork {
     return { publicKey: this.auth.publicKey, name, routes: state.routes, protocol: 2, ...(generation > 1 ? { generation } : {}) };
   }
   private host(state: NetworkState, name: string): NetworkHost { return { ...this.descriptor(state, name), state: "active", revoked: false }; }
-  private asView(state: NetworkState, name: string): NetworkView {
+  private hostCapabilities(state: NetworkState): NetworkHostCapabilities {
+    const capabilities: NetworkHostCapabilities = { [this.auth.publicKey]: [PRIVATE_NETWORK_RECOVERY_CAPABILITY] };
+    const manifest = state.membership?.manifest;
+    if (manifest && manifest.authorityKey === this.auth.publicKey) {
+      const confirmed = new Set(state.generationAwareHosts);
+      for (const host of manifest.hosts) {
+        if (!host.revoked && host.state === "active" && host.publicKey !== this.auth.publicKey && confirmed.has(`${manifest.id}:${host.publicKey}`)) {
+          capabilities[host.publicKey] = [PRIVATE_NETWORK_RECOVERY_CAPABILITY];
+        }
+      }
+    }
+    return capabilities;
+  }
+  private asView(state: NetworkState, name: string, includeCapabilities = false): NetworkView {
     const own = state.membership?.manifest.hosts.find(host => host.publicKey === this.auth.publicKey);
     return { host: own ? { ...own, name, routes: state.routes } : this.host(state, name), ...(state.membership ? { membership: state.membership } : {}),
-      sync: !state.membership ? "standalone" : own?.revoked ? "removed" : state.waiting || own?.state === "pending" ? "waiting" : "current", lastSyncedAt: state.lastSyncedAt };
+      sync: !state.membership ? "standalone" : own?.revoked ? "removed" : state.waiting || own?.state === "pending" ? "waiting" : "current", lastSyncedAt: state.lastSyncedAt,
+      ...(includeCapabilities ? { hostCapabilities: this.hostCapabilities(state) } : {}) };
   }
-  async view(validate?: () => Promise<unknown>): Promise<NetworkView> {
+  async view(validate?: () => Promise<unknown>, options: { includeCapabilities?: boolean } = {}): Promise<NetworkView> {
     this.checkOpen();
     const { name } = await this.profile.read();
-    return this.store.db.serial(async () => { this.checkOpen(); await validate?.(); return this.asView(await this.load(), name); });
+    return this.store.db.serial(async () => { this.checkOpen(); await validate?.(); return this.asView(await this.load(), name, options.includeCapabilities); });
   }
   /** This host's signed single-direct descriptor routes, for its own views. */
   async sharedRoutes(validate?: () => Promise<unknown>): Promise<Route[]> {
@@ -489,9 +524,29 @@ export class PrivateNetwork {
     manifest.v = 2;
     for (const host of manifest.hosts) if (!host.revoked && host.state === "active") host.protocol = 2;
   }
+  private recordPeerCapabilities(state: NetworkState, manifest: NetworkManifest, peer?: { publicKey: string; capabilities?: readonly NetworkPeerCapability[] }): void {
+    const next = new Set(state.generationAwareHosts);
+    next.add(`${manifest.id}:${this.auth.publicKey}`);
+    if (peer && peer.publicKey !== this.auth.publicKey) {
+      const entry = `${manifest.id}:${peer.publicKey}`;
+      if (peer.capabilities?.includes(PRIVATE_NETWORK_RECOVERY_CAPABILITY)) next.add(entry);
+      else next.delete(entry);
+    }
+    state.generationAwareHosts = [...next].sort();
+  }
+  private forgetPeerCapabilities(state: NetworkState, network: string, publicKey?: string): void {
+    const prefix = publicKey ? `${network}:${publicKey}` : `${network}:`;
+    state.generationAwareHosts = state.generationAwareHosts.filter(entry => publicKey ? entry !== prefix : !entry.startsWith(prefix));
+  }
+  private requireRecoveryPeersReady(state: NetworkState, manifest: NetworkManifest): void {
+    if (manifest.v !== 2 || unreadyRecoveryHosts(manifest, this.hostCapabilities(state)).length > 0) {
+      throw new HubError("network_recovery_upgrade_required", 409);
+    }
+  }
   private async refreshAuthority(state: NetworkState, name: string, revoked: string[]): Promise<void> {
     const manifest = structuredClone(this.authority(state));
     this.upgradeProtocol(state, manifest);
+    this.recordPeerCapabilities(state, manifest);
     await this.localRevocations(state, manifest);
     this.publish(manifest, this.descriptor(state, name), await this.originals(state));
     this.applyTombstones(state, manifest);
@@ -507,9 +562,11 @@ export class PrivateNetwork {
     const descriptor = self.state === "pending"
       ? { publicKey: self.publicKey, name: self.name, routes: self.routes, ...(self.protocol ? { protocol: self.protocol } : {}), ...(self.generation ? { generation: self.generation } : {}) }
       : this.descriptor(state, name);
+    const advertiseCapabilities = !this.isLegacyAuthority(manifest);
     const request: NetworkPeerRequest = { v: 1, networkId: manifest.id, publicKey: this.auth.publicKey,
       nonce: randomBytes(32).toString("base64url"), expiresAt: this.now() + REQUEST_MS, host: descriptor, devices: await this.originals(state),
-      revoked: [...new Set(await this.localRevocations(state))], known: state.membership!, ...(attest ? { attest } : {}), ...(action === "retire" ? { retire: true as const } : self.state === "pending" ? action === "cancel" ? { cancel: self.proposalNonce! } : { commit: self.proposalNonce! } : {}) };
+      revoked: [...new Set(await this.localRevocations(state))], known: state.membership!, ...(advertiseCapabilities ? { capabilities: [PRIVATE_NETWORK_RECOVERY_CAPABILITY] } : {}),
+      ...(attest ? { attest } : {}), ...(action === "retire" ? { retire: true as const } : self.state === "pending" ? action === "cancel" ? { cancel: self.proposalNonce! } : { commit: self.proposalNonce! } : {}) };
     return { request, signature: this.auth.signNetworkPeer(request) };
   }
   private async exchange(state: NetworkState, request: SignedNetworkPeerRequest): Promise<SignedNetworkManifest> {
@@ -517,10 +574,26 @@ export class PrivateNetwork {
     const manifest = this.active(state, true), authority = manifest.hosts.find(host => host.publicKey === manifest.authorityKey)!;
     if (!this.options.exchange) throw new HubError("network_authority_unavailable", 503);
     if (request.request.commit) this.pendingExchanges++;
-    try { const returned = await this.options.exchange(authority, request); this.checkOpen(); return this.verifyMembership(returned); }
+    try {
+      let returned: SignedNetworkManifest;
+      try {
+        returned = await this.options.exchange(authority, request);
+        if (request.request.capabilities?.length) this.legacyAuthorities.delete(this.authorityScope(manifest));
+      } catch (error) {
+        if (!request.request.capabilities?.length || !this.isLegacyPeerRequestRejection(error)) throw error;
+        // 1.6.0 coordinators reject unknown fields on NetworkPeerRequest with
+        // HTTP 400 before touching state. Fall back once to a 1.6.0-strict peer
+        // request and retry advertising capabilities after LEGACY_AUTHORITY_TTL_MS.
+        this.rememberLegacyAuthority(manifest);
+        const { capabilities: _capabilities, ...legacyBody } = request.request;
+        const retryBody: NetworkPeerRequest = { ...legacyBody, nonce: randomBytes(32).toString("base64url") };
+        returned = await this.options.exchange(authority, { request: retryBody, signature: this.auth.signNetworkPeer(retryBody) });
+      }
+      this.checkOpen(); return this.verifyMembership(returned);
+    }
     finally { if (request.request.commit) this.pendingExchanges--; }
   }
-  command(raw: unknown, session: AuthSession, proof?: DeviceActionProof): Promise<NetworkCommandResult> {
+  command(raw: unknown, session: AuthSession, proof?: DeviceActionProof, options: { includeCapabilities?: boolean } = {}): Promise<NetworkCommandResult> {
     // A sync must not import a command's receipt first: joining could then see
     // a stale revision, and departure could revoke the requesting phone before
     // its own authorized operation returns. Keep network I/O outside the DB
@@ -528,12 +601,12 @@ export class PrivateNetwork {
     this.commandsPending++;
     const work = this.commandTail.then(async () => {
       await this.ticking?.catch(() => undefined);
-      return this.applyCommand(raw, session, proof);
+      return this.applyCommand(raw, session, proof, options.includeCapabilities);
     });
     this.commandTail = work.catch(() => undefined);
     return work.finally(() => { this.commandsPending--; });
   }
-  private async applyCommand(raw: unknown, session: AuthSession, proof?: DeviceActionProof): Promise<NetworkCommandResult> {
+  private async applyCommand(raw: unknown, session: AuthSession, proof?: DeviceActionProof, includeCapabilities = false): Promise<NetworkCommandResult> {
     this.checkOpen();
     const command = networkCommandSchema.parse(raw), { name } = await this.profile.read(), revoked: string[] = [];
     if (!same(command, raw)) throw new HubError("network_noncanonical", 400);
@@ -551,6 +624,7 @@ export class PrivateNetwork {
         const manifest: NetworkManifest = { v: 2, id: networkId(this.auth.publicKey, genesisNonce), name: command.name, authorityKey: this.auth.publicKey, genesisNonce, revision: 0,
           hosts: [this.host(state, name)], devices: (await this.originals(state)).map(device => ({ ...device, memberId: networkMemberId(this.auth.publicKey, device.id), originHost: this.auth.publicKey, attestedBy: this.auth.publicKey, revoked: false })), revokedMembers: [], blockedBindings: [], blockedKeys: [], pendingProposals: [], cancelledProposals: [] };
         state.membership = this.sign(manifest); state.lastSyncedAt = this.now(); state.waiting = false;
+        this.recordPeerCapabilities(state, manifest);
         delete state.proposal; delete state.accepted;
       } else if (command.operation === "routes") {
         state.routes = command.routes;
@@ -647,7 +721,6 @@ export class PrivateNetwork {
         } else outgoing = { state: structuredClone(state), request: await this.request(state, name, { sourceDeviceId: session.deviceId, device: command.device, statement, proof: proof! }) };
       } else if (command.operation === "reinstate") {
         const manifest = structuredClone(this.authority(state));
-        if (manifest.v !== 2) throw new HubError("network_upgrade_required", 409);
         if (command.publicKey === this.auth.publicKey) throw new HubError("network_cannot_reinstate_authority", 409);
         const host = manifest.hosts.find(item => item.publicKey === command.publicKey);
         if (!host) throw new HubError("network_host_missing", 404);
@@ -655,6 +728,7 @@ export class PrivateNetwork {
         const currentGen = hostGeneration(host);
         if (command.expectedGeneration !== undefined && command.expectedGeneration !== currentGen) throw new HubError("network_host_state_changed", 409);
         if (command.seenManifestHash !== undefined && command.seenManifestHash !== hashSecret(networkCanonical(manifest))) throw new HubError("network_review_changed", 409);
+        this.requireRecoveryPeersReady(state, manifest);
         if (host.reinstated !== currentGen + 1) {
           host.reinstated = currentGen + 1;
           const blockedKeys = new Set(manifest.blockedKeys ?? []);
@@ -677,7 +751,7 @@ export class PrivateNetwork {
         if (manifest.v !== 2) throw new HubError("network_upgrade_required", 409);
         if (host.state !== command.expectedState) throw new HubError("network_host_state_changed", 409);
         if (host.state === "pending") throw new HubError("network_pending_requires_local_cancel", 409);
-        host.revoked = true; delete host.reinstated; this.applyTombstones(state, manifest); this.next(state, manifest); await this.cacheRemoval(state.membership!, host.publicKey, hostGeneration(host)); await this.materialize(state, revoked);
+        host.revoked = true; delete host.reinstated; this.forgetPeerCapabilities(state, manifest.id, host.publicKey); this.applyTombstones(state, manifest); this.next(state, manifest); await this.cacheRemoval(state.membership!, host.publicKey, hostGeneration(host)); await this.materialize(state, revoked);
       } else {
         const own = state.membership?.manifest.hosts.find(host => host.publicKey === this.auth.publicKey);
         if (state.membership && state.membership.manifest.v !== 2) throw new HubError("network_upgrade_required", 409);
@@ -701,7 +775,7 @@ export class PrivateNetwork {
           memberId: manifest.devices.find(binding => binding.host === this.auth.publicKey && binding.id === session.deviceId && deviceGeneration(binding) >= ownGen)?.memberId ?? networkMemberId(this.auth.publicKey, session.deviceId, ownGen), commandHash, expiresAt: statement.expiresAt };
       }
       await this.save(state);
-      return { view: this.asView(state, name), ...(proposal ? { proposal } : {}), ...(state.membership || departure ? { membership: state.membership ?? departure } : {}) };
+      return { view: this.asView(state, name, includeCapabilities), ...(proposal ? { proposal } : {}), ...(state.membership || departure ? { membership: state.membership ?? departure } : {}) };
     });
     this.auth.notifyRevokedDevices(revoked);
     if (!outgoing) return result;
@@ -727,7 +801,7 @@ export class PrivateNetwork {
       }
       delete state.intents[intentNonce!];
       await this.save(state);
-      return { view: this.asView(state, name), ...(state.membership ? { membership: state.membership } : command.operation === "leave" && command.expectedState === "active" ? { membership: returned } : {}) };
+      return { view: this.asView(state, name, includeCapabilities), ...(state.membership ? { membership: state.membership } : command.operation === "leave" && command.expectedState === "active" ? { membership: returned } : {}) };
     });
     this.auth.notifyRevokedDevices(afterRevoked);
     if (denied) throw new HubError("device_revoked", 401);
@@ -756,6 +830,7 @@ export class PrivateNetwork {
       state.retiredNetworks = [...new Set([...state.retiredNetworks, state.membership.manifest.id])];
       state.revokedHosts = [...new Set([...state.revokedHosts, revokedHostKey(state.membership.manifest.id, this.auth.publicKey, hostGeneration(own))])];
     }
+    if (state.membership) this.forgetPeerCapabilities(state, state.membership.manifest.id);
     delete state.membership; delete state.proposal; delete state.accepted; state.revokedMembers = []; state.admissions = []; state.peers = []; state.proofs = []; state.intents = {}; state.lastSyncedAt = 0; state.waiting = false;
   }
   private rememberPending(manifest: NetworkManifest, host: string, nonce: string, expiresAt: number, generation = 1): void {
@@ -846,6 +921,7 @@ export class PrivateNetwork {
         return this.removedResponse(state.membership!, issuer.publicKey, known);
       }
       if (manifest.v === 2 && request.host.protocol !== 2) throw new HubError("network_upgrade_required", 409);
+      if (manifestUsesGenerations(manifest) && !request.capabilities?.includes(PRIVATE_NETWORK_RECOVERY_CAPABILITY)) throw new HubError("network_recovery_upgrade_required", 409);
       const digest = hashSecret(networkCanonical(signed)), replayKey = networkBindingKey(request.publicKey, request.nonce), prior = state.peers.find(item => item.nonce === replayKey);
       if (prior) {
         if (prior.digest !== digest) throw new HubError("network_request_replayed", 403);
@@ -860,13 +936,14 @@ export class PrivateNetwork {
         if (!binding.revoked) manifest.blockedKeys = [...new Set([...(manifest.blockedKeys ?? []), hashSecret(binding.publicKey)])].sort();
       }
       this.upgradeProtocol(state, manifest, request.host);
+      this.recordPeerCapabilities(state, manifest, { publicKey: request.publicKey, capabilities: request.capabilities });
       if (request.retire) {
         if (manifest.v !== 2 || request.host.protocol !== 2) throw new HubError("network_upgrade_required", 409);
         if (issuer.publicKey === manifest.authorityKey || issuer.state !== "active") throw new HubError("network_host_state_changed", 409);
         this.publish(manifest, request.host, request.devices);
         this.applyTombstones(state, manifest);
         this.requireDepartureReady(manifest, issuer.publicKey);
-        issuer.revoked = true; delete issuer.reinstated; this.applyTombstones(state, manifest); this.next(state, manifest, sameRevisionFork);
+        issuer.revoked = true; delete issuer.reinstated; this.forgetPeerCapabilities(state, manifest.id, issuer.publicKey); this.applyTombstones(state, manifest); this.next(state, manifest, sameRevisionFork);
         await this.cacheRemoval(state.membership!, issuer.publicKey, hostGeneration(issuer)); await this.materialize(state, revoked);
         state.peers = this.memo(state.peers, { nonce: replayKey, digest, expiresAt: request.expiresAt });
         await this.save(state); return state.membership!;

@@ -3,9 +3,9 @@ import { createRoot } from "react-dom/client";
 import { NetworkManager } from "../../src/NetworkManager.js";
 import { runtimeHostId } from "../../src/host-registry.js";
 import { reviewedNetworkHash } from "../../src/network-join.js";
-import { networkCommandSchema } from "../../../src/client-protocol/private-network.js";
+import { PRIVATE_NETWORK_RECOVERY_CAPABILITY, networkCommandSchema, unreadyRecoveryHosts } from "../../../src/client-protocol/private-network.js";
 import type { ConnectedHost } from "../../src/host-connections.js";
-import type { NetworkCommand, NetworkView, SignedNetworkManifest, SignedNetworkProposal } from "../../../src/client-protocol/private-network.js";
+import type { NetworkCommand, NetworkHostCapabilities, NetworkView, SignedNetworkManifest, SignedNetworkProposal } from "../../../src/client-protocol/private-network.js";
 import "../../src/styles.css";
 import "../../src/brand-theme.css";
 import "../../src/palette-tokens.css";
@@ -24,6 +24,7 @@ const initial: SignedNetworkManifest = { signature: "A".repeat(86) + "==", manif
   { publicKey: keys[0]!, name: "同名主机", routes: [{ name: "Direct", url: "https://host-a.test" }], state: "active" as const, revoked: false },
   { publicKey: keys[2]!, name: "尚未连接的工作主机", routes: [{ name: "Direct", url: "https://host-c.test" }], state: "active" as const, revoked: false },
 ] } };
+const recoveryCaps = (...hostKeys: string[]): NetworkHostCapabilities => Object.fromEntries(hostKeys.map(hostKey => [hostKey, [PRIVATE_NETWORK_RECOVERY_CAPABILITY]]));
 class FixtureConnection {
   listeners = new Set<() => void>();
   identity;
@@ -41,7 +42,7 @@ class FixtureConnection {
   confirmedChanges: NetworkView[] = [];
   constructor(readonly index: number) {
     this.identity = { routes: [{ name: "Direct" as const, url: `https://host-${index ? "b" : "a"}.test` }], hubPublicKey: keys[index], publicKey: key(index + 5), deviceId: `device-${index}`, name: "Fixture" };
-    this.state = { networkChange: undefined as NetworkView | undefined, status: "online", networkAvailable: true, user: { id: "owner", role: "owner", name: "Owner" }, hostProfile: { name: "同名主机", revision: 0 }, network: { host: { publicKey: keys[index]!, name: "同名主机", routes: this.identity.routes, state: "active" as const, revoked: false }, ...(index ? {} : { membership: structuredClone(initial) }), sync: index ? "standalone" : "current", lastSyncedAt: Date.now() } as NetworkView };
+    this.state = { networkChange: undefined as NetworkView | undefined, status: "online", networkAvailable: true, networkRecoveryAvailable: true, user: { id: "owner", role: "owner", name: "Owner" }, hostProfile: { name: "同名主机", revision: 0 }, network: { host: { publicKey: keys[index]!, name: "同名主机", routes: this.identity.routes, state: "active" as const, revoked: false }, ...(index ? {} : { membership: structuredClone(initial) }), sync: index ? "standalone" : "current", lastSyncedAt: Date.now(), hostCapabilities: index ? recoveryCaps(keys[index]!) : recoveryCaps(keys[0]!, keys[2]!) } as NetworkView };
   }
   subscribe(callback: () => void) { this.listeners.add(callback); return () => this.listeners.delete(callback); }
   emit() { this.listeners.forEach(callback => callback()); }
@@ -57,8 +58,8 @@ class FixtureConnection {
     if (command.operation === "create") {
       networkCommandSchema.parse(command);
       const membership = structuredClone(initial);
-      membership.manifest = { ...membership.manifest, id: "created-network", name: command.name, authorityKey: this.state.network.host.publicKey, hosts: [this.state.network.host] };
-      this.state.network = { ...this.state.network, membership, sync: "current" };
+      membership.manifest = { ...membership.manifest, v: 2, id: "created-network", name: command.name, authorityKey: this.state.network.host.publicKey, hosts: [{ ...this.state.network.host, protocol: 2 as const }] };
+      this.state.network = { ...this.state.network, membership, sync: "current", ...(this.state.networkRecoveryAvailable ? { hostCapabilities: recoveryCaps(this.state.network.host.publicKey) } : {}) };
     }
     if (command.operation === "routes") {
       if (this.failRoutes) throw new Error(this.failRoutes);
@@ -74,6 +75,9 @@ class FixtureConnection {
     if (command.operation === "reinstate") {
       if (command.seenManifestHash && command.seenManifestHash !== reviewedNetworkHash(this.state.network.membership!.manifest)) throw new Error("network_review_changed");
       const membership = structuredClone(this.state.network.membership!);
+      if (!this.state.networkRecoveryAvailable || membership.manifest.v !== 2 || unreadyRecoveryHosts(membership.manifest, this.state.network.hostCapabilities).length > 0) {
+        throw new Error("network_recovery_upgrade_required");
+      }
       membership.manifest.v = 2;
       membership.manifest.revision++;
       membership.manifest.hosts = membership.manifest.hosts.map(host => host.publicKey === command.publicKey
@@ -103,7 +107,9 @@ class FixtureConnection {
       const protocolField = membership.manifest.v === 2 ? { protocol: 2 as const } : {};
       membership.manifest.hosts = membership.manifest.hosts.map(host => host.publicKey === this.state.network.host.publicKey ? { publicKey: host.publicKey, name: host.name, routes: host.routes, ...(host.generation ? { generation: host.generation } : {}), ...protocolField, state: "active", revoked: false } : host);
       this.state.network = { ...this.state.network, membership, sync: "current" };
-      connections[0]!.state.network = { ...connections[0]!.state.network, membership }; connections[0]!.emit();
+      const nextCaps = connections[0]!.state.network.hostCapabilities ? { ...connections[0]!.state.network.hostCapabilities } : undefined;
+      if (nextCaps && this.state.networkRecoveryAvailable) nextCaps[this.state.network.host.publicKey] = [PRIVATE_NETWORK_RECOVERY_CAPABILITY];
+      connections[0]!.state.network = { ...connections[0]!.state.network, membership, ...(nextCaps ? { hostCapabilities: nextCaps } : {}) }; connections[0]!.emit();
       if (this.failAfterJoin) connections[0]!.failRefresh = true;
     }
     if (command.operation === "remove") {
@@ -113,7 +119,9 @@ class FixtureConnection {
         const { reinstated: _reinstated, ...rest } = host;
         return { ...rest, revoked: true };
       });
-      this.state.network = { ...this.state.network, membership };
+      const nextCaps = this.state.network.hostCapabilities ? { ...this.state.network.hostCapabilities } : undefined;
+      if (nextCaps) delete nextCaps[command.publicKey];
+      this.state.network = { ...this.state.network, membership, ...(nextCaps ? { hostCapabilities: nextCaps } : {}) };
     }
     if (command.operation === "leave") {
       if (this.failLeave) throw new Error(this.failLeave);
@@ -128,9 +136,11 @@ class FixtureConnection {
           const { reinstated: _reinstated, ...rest } = host;
           return { ...rest, revoked: true };
         });
-        connections[0]!.state.network = { ...connections[0]!.state.network, membership }; connections[0]!.emit();
+        const nextCaps = connections[0]!.state.network.hostCapabilities ? { ...connections[0]!.state.network.hostCapabilities } : undefined;
+        if (nextCaps && command.expectedState !== "pending") delete nextCaps[this.state.network.host.publicKey];
+        connections[0]!.state.network = { ...connections[0]!.state.network, membership, ...(nextCaps ? { hostCapabilities: nextCaps } : {}) }; connections[0]!.emit();
       }
-      this.state.network = { host: { publicKey: this.state.network.host.publicKey, name: this.state.network.host.name, routes: this.state.network.host.routes, state: "active", revoked: false }, sync: "standalone", lastSyncedAt: Date.now() };
+      this.state.network = { host: { publicKey: this.state.network.host.publicKey, name: this.state.network.host.name, routes: this.state.network.host.routes, state: "active", revoked: false }, sync: "standalone", lastSyncedAt: Date.now(), ...(this.state.networkRecoveryAvailable ? { hostCapabilities: recoveryCaps(this.state.network.host.publicKey) } : {}) };
     }
     if ((command.operation === "remove" || command.operation === "leave") && this.failAfterDeparture) this.failRefresh = true;
     this.emit(); return { view: this.state.network };
@@ -215,11 +225,12 @@ const entries = connections.map((connection, index) => ({ host: { id: runtimeHos
   offlineAuthority() { connections[0]!.state.status = "offline"; connections[0]!.emit(); },
   authorityAccess(role: string, networkAvailable = true) { connections[0]!.state.user.role = role; connections[0]!.state.networkAvailable = networkAvailable; connections[0]!.emit(); },
   overview(names = ["example-mac", "示例电脑"], networkName = "我的网络") {
-    const membership = structuredClone(initial); membership.manifest.name = networkName; membership.manifest.revision++;
-    membership.manifest.hosts = connections.map((connection, index) => ({ ...connection.state.network.host, name: names[index]!, state: "active" as const }));
+    const membership = structuredClone(initial); membership.manifest.v = 2; membership.manifest.name = networkName; membership.manifest.revision++;
+    membership.manifest.hosts = connections.map((connection, index) => ({ ...connection.state.network.host, name: names[index]!, protocol: 2 as const, state: "active" as const }));
+    const coordCaps = recoveryCaps(...connections.filter(connection => connection.state.networkRecoveryAvailable).map(connection => connection.state.network.host.publicKey));
     connections.forEach((connection, index) => {
       connection.state.hostProfile = { name: names[index]!, revision: connection.state.hostProfile.revision + 1 };
-      connection.state.network = { host: membership.manifest.hosts[index]!, membership, sync: "current", lastSyncedAt: Date.now() };
+      connection.state.network = { host: membership.manifest.hosts[index]!, membership, sync: "current", lastSyncedAt: Date.now(), ...(connection.state.networkRecoveryAvailable ? { hostCapabilities: index === 0 ? coordCaps : recoveryCaps(connection.state.network.host.publicKey) } : {}) };
       connection.emit();
     });
   },
@@ -245,7 +256,53 @@ const entries = connections.map((connection, index) => ({ host: { id: runtimeHos
   standaloneAll() {
     connections.forEach(connection => { connection.state.network = { host: connection.state.network.host, sync: "standalone", lastSyncedAt: Date.now() }; connection.emit(); });
   },
-  changeDirectory() { const membership = structuredClone(connections[0]!.state.network.membership!); membership.manifest.revision++; membership.manifest.hosts.push({ publicKey: key(4), name: "刚加入的另一台主机", routes: [], state: "active", revoked: false }); connections[0]!.state.network = { ...connections[0]!.state.network, membership }; connections[0]!.emit(); connections[1]!.failJoin = false; },
+  changeDirectory() {
+    const membership = structuredClone(connections[0]!.state.network.membership!); membership.manifest.revision++;
+    const addedKey = key(4);
+    membership.manifest.hosts.push({ publicKey: addedKey, name: "刚加入的另一台主机", routes: [], ...(membership.manifest.v === 2 ? { protocol: 2 as const } : {}), state: "active", revoked: false });
+    const nextCaps = connections[0]!.state.network.hostCapabilities ? { ...connections[0]!.state.network.hostCapabilities, [addedKey]: [PRIVATE_NETWORK_RECOVERY_CAPABILITY] } : undefined;
+    connections[0]!.state.network = { ...connections[0]!.state.network, membership, ...(nextCaps ? { hostCapabilities: nextCaps } : {}) }; connections[0]!.emit(); connections[1]!.failJoin = false;
+  },
+  addLegacyPeer(name = "legacy-1.6.0-peer") {
+    const membership = structuredClone(connections[0]!.state.network.membership!); membership.manifest.v = 2; membership.manifest.revision++;
+    const legacyKey = key(9);
+    membership.manifest.hosts = [
+      ...membership.manifest.hosts.filter(host => host.publicKey !== legacyKey).map(host => !host.revoked && host.state === "active" ? { ...host, protocol: 2 as const } : host),
+      { publicKey: legacyKey, name, routes: [{ name: "Direct", url: "https://legacy-peer.test" }], protocol: 2 as const, state: "active", revoked: false },
+    ];
+    const nextCaps = connections[0]!.state.network.hostCapabilities ? { ...connections[0]!.state.network.hostCapabilities } : recoveryCaps(keys[0]!);
+    delete nextCaps[legacyKey];
+    connections[0]!.state.network = { ...connections[0]!.state.network, membership, hostCapabilities: nextCaps };
+    connections[0]!.emit();
+  },
+  upgradeLegacyPeer() {
+    const legacyKey = key(9);
+    const nextCaps = { ...(connections[0]!.state.network.hostCapabilities ?? recoveryCaps(keys[0]!)), [legacyKey]: [PRIVATE_NETWORK_RECOVERY_CAPABILITY] };
+    connections[0]!.state.network = { ...connections[0]!.state.network, hostCapabilities: nextCaps };
+    connections[0]!.emit();
+  },
+  setRecoveryAvailable(index: number, available: boolean) {
+    const connection = connections[index]!;
+    connection.state.networkRecoveryAvailable = available;
+    if (!available) {
+      const { hostCapabilities: _caps, ...rest } = connection.state.network;
+      connection.state.network = rest;
+    } else if (index === 0) {
+      const activeKeys = (connection.state.network.membership?.manifest.hosts ?? []).filter(host => !host.revoked && host.state === "active").map(host => host.publicKey);
+      connection.state.network = { ...connection.state.network, hostCapabilities: recoveryCaps(keys[0]!, ...activeKeys) };
+    }
+    connection.emit();
+  },
+  revokeRemoteHost(name = "尚未连接的工作主机") {
+    const membership = structuredClone(connections[0]!.state.network.membership!); membership.manifest.v = 2; membership.manifest.revision++;
+    const existing = membership.manifest.hosts.find(host => host.publicKey === keys[2]);
+    if (existing) { existing.revoked = true; delete existing.reinstated; }
+    else membership.manifest.hosts.push({ publicKey: keys[2]!, name, routes: [{ name: "Direct", url: "https://host-c.test" }], protocol: 2 as const, state: "active", revoked: true });
+    const nextCaps = { ...(connections[0]!.state.network.hostCapabilities ?? recoveryCaps(keys[0]!)) };
+    delete nextCaps[keys[2]!];
+    connections[0]!.state.network = { ...connections[0]!.state.network, membership, hostCapabilities: nextCaps };
+    connections[0]!.emit();
+  },
 };
 function Fixture() {
   const [open, setOpen] = useState(true), [connectionsOpen, setConnectionsOpen] = useState(false);

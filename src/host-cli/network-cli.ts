@@ -1,5 +1,5 @@
 import { createHash, verify } from "node:crypto";
-import { networkCanonical, networkCommandSchema, networkCommandResultSchema, networkGenesisText, networkManifestProof, networkMemberText, networkProposalProof, networkViewSchema, signedNetworkManifestSchema, signedNetworkProposalSchema, type NetworkCommand, type NetworkCommandResult, type NetworkView, type SignedNetworkManifest, type SignedNetworkProposal } from "../client-protocol/private-network.js";
+import { PRIVATE_NETWORK_RECOVERY_CAPABILITY, networkCanonical, networkCommandSchema, networkCommandResultSchema, networkGenesisText, networkManifestProof, networkMemberText, networkProposalProof, networkViewSchema, signedNetworkManifestSchema, signedNetworkProposalSchema, type NetworkCommand, type NetworkCommandResult, type NetworkView, type SignedNetworkManifest, type SignedNetworkProposal } from "../client-protocol/private-network.js";
 import { HOST_ROUTES_CAPABILITY, HOST_ROUTES_PATH, HOST_LAN_SELECTION_CAPABILITY, HOST_LAN_SELECTION_PATH, managedLanSelectionSchema, hostRoutesViewSchema, type HostRoutesView } from "../client-protocol/host-routes.js";
 import { hashSecret, parsePublicKey } from "../hub/auth.js";
 import { HostCliError, LocalHostClient } from "./client.js";
@@ -46,7 +46,10 @@ export class HostNetwork {
     if (view.membership) verifyCliNetworkMembership(view.membership, this.client.publicKey);
     return view;
   }
-  async view(): Promise<NetworkView> { return this.verifyView(await this.client.request("/api/network")); }
+  async view(): Promise<NetworkView> {
+    const route = this.client.supports(PRIVATE_NETWORK_RECOVERY_CAPABILITY) ? "/api/network?capabilities=1" : "/api/network";
+    return this.verifyView(await this.client.request(route));
+  }
   /** Read-only: the same owner-scoped endpoint the App uses for self-route sync. */
   async localRoutes(): Promise<HostRoutesView> {
     if (!this.client.ready.serverCapabilities.includes(HOST_ROUTES_CAPABILITY)) throw new HostCliError("host_routes_update_required");
@@ -67,12 +70,16 @@ export class HostNetwork {
     const command = networkCommandSchema.parse(raw);
     if (!CLI_OPERATIONS.has(command.operation)) throw new HostCliError("cli_network_host_controller_only");
     if (networkCanonical(raw) !== networkCanonical(command)) throw new HostCliError("network_command_invalid");
+    if ((command.operation === "reinstate" || (command.operation === "propose" && command.recover)) && !this.client.supports(PRIVATE_NETWORK_RECOVERY_CAPABILITY)) {
+      throw new HostCliError("network_recovery_upgrade_required");
+    }
     if (command.operation === "admit") verifyCliNetworkProposal(command.proposal);
     if (command.operation === "join") verifyCliNetworkMembership(command.membership, this.client.publicKey);
     const proof = await this.client.deviceAction({ operation: "network", target: hashSecret(networkCanonical(command)) });
     // Mutations are intentionally never retried automatically. The caller
     // retains the signed proposal and its original nonce across lost replies.
-    const result = networkCommandResultSchema.parse(await this.client.request("/api/network/manage", "POST", { command, proof }));
+    const manageRoute = this.client.supports(PRIVATE_NETWORK_RECOVERY_CAPABILITY) ? "/api/network/manage?capabilities=1" : "/api/network/manage";
+    const result = networkCommandResultSchema.parse(await this.client.request(manageRoute, "POST", { command, proof }));
     this.verifyView(result.view);
     if (result.membership) verifyCliNetworkMembership(result.membership);
     if (result.proposal) {
