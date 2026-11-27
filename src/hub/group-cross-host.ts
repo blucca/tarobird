@@ -377,7 +377,9 @@ export class HubCrossHostGroups {
           // Tables are created and migrated in HubDatabase.open() (schema v27).
           this.initialized = true;
         });
-        await this.recoverPendingQuestionsInternal({ includeRecent: true }).catch(() => undefined);
+        // Recovery of interrupted `sending` questions is not part of init: peers
+        // may be asleep, and every API call awaits init. HubServer.start runs
+        // `recoverPendingQuestions({ includeRecent: true })` in the background.
       })();
     }
     await this.initPromise;

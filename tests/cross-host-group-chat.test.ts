@@ -1163,8 +1163,9 @@ describe("Cross-host group chat, session-based members & Orca-style group settin
         localHostName: async () => "macmini",
       });
       reopenedGroups.registerPeer({ hostId: "peer_b", hostName: "studio-b", publicKey: b.hub.auth.publicKey, url: b.hub.url });
-      // Startup init() MUST automatically recover BOTH persisted `sending` rows!
+      // Startup recovery (run by HubServer.start in the background, after init) MUST recover BOTH persisted `sending` rows!
       await reopenedGroups.init();
+      await reopenedGroups.recoverPendingQuestions({ includeRecent: true });
 
       const recoveredBefore = await reopenedStore.db.get<{ status: string; error: string | null }>(
         "SELECT status, error FROM group_remote_questions WHERE id=?",
@@ -1267,9 +1268,13 @@ describe("Cross-host group chat, session-based members & Orca-style group settin
     hubs.splice(hubs.indexOf(reopenedHub.hub), 1);
 
     const restartedOffline = await startHub("macmini", stateDirA);
-    const offlineRow = await restartedOffline.hub.store.db.get<{ status: string; error: string | null }>(
-      "SELECT status, error FROM group_remote_questions WHERE id=?",
-      [qidOffline],
+    // Startup recovery runs in the background after start() resolves.
+    const offlineRow = await waitFor(
+      async () => restartedOffline.hub.store.db.get<{ status: string; error: string | null }>(
+        "SELECT status, error FROM group_remote_questions WHERE id=?",
+        [qidOffline],
+      ),
+      (row) => row?.status !== "sending",
     );
     expect(offlineRow?.status).toBe("failed");
     expect(offlineRow?.error).toContain("studio-b");
@@ -1278,6 +1283,75 @@ describe("Cross-host group chat, session-based members & Orca-style group settin
     const retried = await restartedOffline.hub.crossHostGroups.reconcileOrRetryQuestion("owner", group.id, qidOffline);
     expect(retried.status).toBe("delivered");
   }, 20_000);
+
+  it("starts without waiting for cross-host question recovery, re-drives the question afterwards, and stops cleanly mid-recovery", async () => {
+    const a = await startHub("macmini");
+    const b = await startHub("studio-b");
+    a.hub.crossHostGroups.registerPeer({ hostId: "peer_b", hostName: "studio-b", publicKey: b.hub.auth.publicKey, url: b.hub.url });
+    b.hub.crossHostGroups.registerPeer({ hostId: "peer_a", hostName: "macmini", publicKey: a.hub.auth.publicKey, url: a.hub.url });
+    await a.hub.store.db.run("INSERT INTO bots(id,name,engine,secret_hash,online) VALUES('bot_local','Local','codex','h',1)");
+    await b.hub.store.db.run("INSERT INTO bots(id,name,engine,secret_hash,online) VALUES('bot_remote','Remote','claude','h',1)");
+    await b.hub.crossHostGroups.grantPeerBot(a.hub.auth.publicKey, "bot_remote");
+    const group = await a.hub.store.createConversation("owner", ["bot_local"], "Background Recovery", "g_bg_recover", { type: "group" });
+    const member = await a.hub.crossHostGroups.addMember("owner", group.id, { hostId: "peer_b", botId: "bot_remote", historyVisibility: { kind: "none" } });
+    const source = await a.hub.store.sendMessage("owner", { conversationId: group.id, clientMsgId: "bg_src", text: "Recover me in the background", attachments: [], mentions: ["bot_local"] });
+    // updated_at in the future: only the startup recovery (includeRecent) picks it, never the regular sweep's grace window.
+    const qid = "gq_bg_recover_01", future = Date.now() + 10 * 60_000;
+    await a.hub.store.db.run(
+      `INSERT INTO group_remote_questions(
+        id, group_id, conversation_id, member_key, host_id, host_name, host_public_key, bot_id, session_id,
+        bot_name_snapshot, source_message_id, request_id, status, stopped_unanswered, error, created_at, updated_at
+      ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,'sending',0,NULL,?,?)`,
+      [qid, group.id, group.id, member.memberKey, "peer_b", "studio-b", b.hub.auth.publicKey, "bot_remote", member.sessionId, "Remote", source.message.id, "greq_bg_recover_01", future, future],
+    );
+    const stateDirA = a.stateDir;
+    await a.hub.close();
+    hubs.splice(hubs.indexOf(a.hub), 1);
+
+    // A peer that never answers is modelled by holding every recovery call until the test releases it
+    // (the real peer timeout is 10 s and this file has no fake clock).
+    const original = HubCrossHostGroups.prototype.recoverPendingQuestions;
+    let release!: () => void;
+    let gate = new Promise<void>((resolve) => { release = resolve; });
+    const calls: Array<Promise<unknown>> = [];
+    HubCrossHostGroups.prototype.recoverPendingQuestions = function (this: HubCrossHostGroups, ...args) {
+      const run = gate.then(() => original.apply(this, args));
+      calls.push(run);
+      return run;
+    };
+    try {
+      // 1. Stop during recovery: close() resolves, the held recovery then does no work, the row is untouched.
+      const first = await startHub("macmini", stateDirA);
+      expect(calls.length).toBeGreaterThanOrEqual(1);
+      const closing = first.hub.close();
+      hubs.splice(hubs.indexOf(first.hub), 1);
+      release();
+      await closing;
+      expect(await Promise.all(calls)).toEqual(calls.map(() => []));
+      const afterStop = await HubStore.open(stateDirA);
+      try {
+        expect(await afterStop.db.get("SELECT status FROM group_remote_questions WHERE id=?", [qid])).toEqual({ status: "sending" });
+      } finally { await afterStop.db.close(); }
+
+      // 2. start() resolves while recovery is still held; the question is re-driven afterwards.
+      gate = new Promise<void>((resolve) => { release = resolve; });
+      calls.length = 0;
+      const second = await startHub("macmini", stateDirA);
+      expect(calls.length).toBeGreaterThanOrEqual(1);
+      expect(await second.hub.store.db.get("SELECT status FROM group_remote_questions WHERE id=?", [qid])).toEqual({ status: "sending" });
+      second.hub.crossHostGroups.registerPeer({ hostId: "peer_b", hostName: "studio-b", publicKey: b.hub.auth.publicKey, url: b.hub.url });
+      b.hub.crossHostGroups.registerPeer({ hostId: "peer_a", hostName: "macmini", publicKey: second.hub.auth.publicKey, url: second.hub.url });
+      release();
+      const delivered = await waitFor(
+        async () => second.hub.store.db.get<{ status: string }>("SELECT status FROM group_remote_questions WHERE id=?", [qid]),
+        (row) => row?.status === "delivered",
+      );
+      expect(delivered?.status).toBe("delivered");
+    } finally {
+      HubCrossHostGroups.prototype.recoverPendingQuestions = original;
+      release();
+    }
+  });
 
   it("runs session-bound group messages in the member's single-chat saved workspace folder when it differs from the group conversation's workspace folder", async () => {
     const { hub } = await startHub("macmini");

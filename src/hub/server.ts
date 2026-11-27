@@ -707,7 +707,6 @@ export class HubServer {
       await hub.groupDiscussions.reconcile();
       await hub.cloudflare.load();
       for (const listener of hub.listeners) await hub.bindListener(listener);
-      // Recover persisted `sending` cross-host questions after listeners bind so callbackUrl/reply routes are live.
       await hub.crossHostGroups.init();
       const runningHub = hub;
       const retryListeners = setInterval(() => {
@@ -724,6 +723,12 @@ export class HubServer {
       hub.dispatch.start();
       hub.startNetworkSync();
       store.activityIndex.start();
+      // Recover persisted `sending` cross-host questions in the background, after
+      // listeners bind (callback routes are live) and Bots start: a sleeping peer
+      // must not delay start. Same serialized path as the sweep (one recovery at a
+      // time, per-question in-flight guard, stops between questions on stop());
+      // tracked so close() drains it before SQLite closes.
+      hub.trackTask(hub.crossHostGroups.recoverPendingQuestions({ includeRecent: true }).catch(() => options.onWarning?.("cross_host_question_recovery_failed")));
       return hub;
     } catch (error) { if (hub) await hub.close(); else { try { await store?.db.close(); } finally { await releaseIdentity?.(); } } throw error; }
   }
