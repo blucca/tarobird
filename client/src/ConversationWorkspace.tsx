@@ -17,16 +17,25 @@ import {
   Users,
   X,
 } from "lucide-react";
-import { blocksText, type Conversation, type Message } from "../../src/client-protocol/index.js";
+import { type Conversation, type Message } from "../../src/client-protocol/index.js";
 import { engineTaskSnapshotSchema, type EngineTask } from "../../src/client-protocol/engine-tasks.js";
-import { promptQueueSnapshotSchema, type PromptQueueSnapshot } from "../../src/client-protocol/prompt-queue.js";
+import { promptQueueSnapshotSchema } from "../../src/client-protocol/prompt-queue.js";
 import { conversationFilesPageSchema, type ConversationFile } from "../../src/client-protocol/conversation-files.js";
 import { permissionSettingsSchema, type PermissionSettings } from "../../src/client-protocol/permissions.js";
 import { BOT_COMMS_LIMIT, conversationBotCommsSchema, type BotCommItem, type ConversationBotComms } from "../../src/client-protocol/workspace-comms.js";
 import { nativeRun } from "../../src/client-protocol/run.js";
 import { runChangesSummarySchema } from "../../src/client-protocol/run-changes.js";
+import { isAgentBusRecord } from "./agent-bus-record.js";
 import type { Bot, HubConnection } from "./connection.js";
 import { WorkspaceRunChanges } from "./WorkspaceRunChanges.js";
+import {
+  buildReplyingEntries,
+  createWorkspaceQueueReader,
+  previewWorkspaceMessage,
+  scopePromptQueue,
+  type ScopedPromptQueueState,
+  type WorkspaceQueueReader,
+} from "./workspace-replying.js";
 import { listWorkbenchLibrary, type WorkbenchLibraryEntry } from "./workbench-library.js";
 import type { WorkbenchFileTarget } from "./workbench-library-context.js";
 import { t, useLocale } from "./i18n.js";
@@ -50,6 +59,10 @@ function formatRelativeTime(timestamp: number, locale: string): string {
   if (diffSec < 3600) return t("{0} 分钟前", Math.floor(diffSec / 60));
   if (diffSec < 86400) return t("{0} 小时前", Math.floor(diffSec / 3600));
   return new Date(timestamp).toLocaleDateString(locale === "en" ? "en-US" : "zh-CN", { month: "short", day: "numeric" });
+}
+
+function previewMessage(message: Message | undefined): string {
+  return previewWorkspaceMessage(message, t("附件消息"));
 }
 
 function fileBadge(name: string, mime?: string): { label: string; tone: string } {
@@ -227,7 +240,7 @@ export function ConversationWorkspace({
   const [filePage, setFilePage] = useState(0);
   const [expandedComms, setExpandedComms] = useState<ReadonlySet<string>>(() => new Set());
   const [tasks, setTasks] = useState<EngineTask[]>([]);
-  const [queue, setQueue] = useState<PromptQueueSnapshot | undefined>(undefined);
+  const [queueState, setQueueState] = useState<ScopedPromptQueueState | undefined>(undefined);
   const [permissions, setPermissions] = useState<PermissionSettings | undefined>(undefined);
   const [files, setFiles] = useState<ConversationFile[]>([]);
   const [filesHasMore, setFilesHasMore] = useState(false);
@@ -246,7 +259,7 @@ export function ConversationWorkspace({
     setCommPage(0);
     setFilePage(0);
     setTasks([]);
-    setQueue(undefined);
+    setQueueState(undefined);
     setPermissions(undefined);
     setFiles([]);
     setFilesHasMore(false);
@@ -297,14 +310,6 @@ export function ConversationWorkspace({
           })
           .catch(() => undefined);
       }
-      if (connection.state.promptQueueAvailable) {
-        void connection.http(`/api/conversations/${encodeURIComponent(convId)}/queue?${new URLSearchParams({ botId: directBot.id })}`, { signal: abort.signal })
-          .then(raw => {
-            if (abort.signal.aborted) return;
-            setQueue(promptQueueSnapshotSchema.parse(raw));
-          })
-          .catch(() => undefined);
-      }
     }
 
     return () => abort.abort();
@@ -315,10 +320,79 @@ export function ConversationWorkspace({
     directBot?.online,
     online,
     connection.state.engineTasksAvailable,
-    connection.state.promptQueueAvailable,
     refreshTick,
     settledMessageCount,
   ]);
+
+  const queueScope = directBot ? `${connection.identity.hubPublicKey}:${conversation.id}:${directBot.id}` : "";
+  const scopedQueue = useMemo(
+    () => scopePromptQueue(queueState, queueScope, conversation.id, directBot?.id),
+    [queueState, queueScope, conversation.id, directBot?.id],
+  );
+  const queuedItems = scopedQueue?.items ?? [];
+  const dispatchedItems = useMemo(
+    () => queuedItems.filter(item => item.state === "dispatched"),
+    [queuedItems],
+  );
+  const waitingItems = useMemo(
+    () => queuedItems.filter(item => item.state === "queued"),
+    [queuedItems],
+  );
+
+  // Refresh the prompt queue promptly when messages arrive or active replies start/finish.
+  const queueSignal = useMemo(() => {
+    let count = 0;
+    let streaming = "";
+    let lastBot = "";
+    for (const msg of messages) {
+      if (msg.conversationId !== conversation.id) continue;
+      count++;
+      if (msg.authorType !== "bot" || msg.forwardedFrom || isAgentBusRecord(msg)) continue;
+      if (msg.status === "streaming") streaming += `${msg.id}:${msg.replyTo ?? ""};`;
+      else lastBot = `${msg.id}:${msg.status}`;
+    }
+    return `${count}|${streaming}|${lastBot}`;
+  }, [messages, conversation.id]);
+
+  const queueAvailable = online && !!directBot && !!connection.state.promptQueueAvailable;
+  const queueNeedsPoll = queuedItems.length > 0 || (online && streamingBots.length > 0);
+  const queueReaderRef = useRef<WorkspaceQueueReader | undefined>(undefined);
+
+  useEffect(() => {
+    if (!queueAvailable || !directBot) return;
+    const convId = conversation.id;
+    const botId = directBot.id;
+    const scope = queueScope;
+    const reader = createWorkspaceQueueReader({
+      fetch: async signal => {
+        const raw = await connection.http(
+          `/api/conversations/${encodeURIComponent(convId)}/queue?${new URLSearchParams({ botId })}`,
+          { signal },
+        );
+        return promptQueueSnapshotSchema.parse(raw);
+      },
+      onSnapshot: snapshot => {
+        setQueueState({ scope, snapshot });
+      },
+    });
+    queueReaderRef.current = reader;
+    const onVisibility = () => reader.onVisibilityChange();
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisibility);
+      reader.dispose();
+      if (queueReaderRef.current === reader) queueReaderRef.current = undefined;
+    };
+  }, [connection, conversation.id, directBot?.id, queueAvailable, queueScope]);
+
+  useEffect(() => {
+    if (!queueAvailable) return;
+    queueReaderRef.current?.trigger();
+  }, [queueAvailable, queueScope, queueSignal, refreshTick]);
+
+  useEffect(() => {
+    queueReaderRef.current?.setPolling(queueAvailable && queueNeedsPoll);
+  }, [queueAvailable, queueScope, queueNeedsPoll]);
 
   // The permission mode is a Bot setting, owner-only on the Host: read when the rail opens for a Bot and on a
   // manual refresh, not with every message.
@@ -353,8 +427,19 @@ export function ConversationWorkspace({
     () => tasks.filter(task => task.status === "running"),
     [tasks],
   );
-  const queuedItems = queue?.items ?? [];
-  const waitingItems = queuedItems.filter(item => item.state === "queued");
+  const replyingEntries = useMemo(
+    () => buildReplyingEntries({
+      messages,
+      conversationId: conversation.id,
+      online,
+      directBotId: directBot?.id,
+      dispatchedItems,
+      streamingBots,
+      resolveBotName: botId => botLabels.get(botId) ?? bots.find(bot => bot.id === botId)?.name ?? botId,
+      attachmentLabel: t("附件消息"),
+    }),
+    [messages, conversation.id, online, directBot?.id, dispatchedItems, streamingBots, botLabels, bots, locale],
+  );
   const commItems = comms?.items ?? [];
   const filteredComms = useMemo(() => {
     if (commFilter === "active") {
@@ -699,17 +784,17 @@ export function ConversationWorkspace({
                   </button>
                 )}
               </div>
-              {activeTasks.length > 0 || queuedItems.length > 0 || streamingBots.length > 0 ? (
+              {activeTasks.length > 0 || waitingItems.length > 0 || replyingEntries.length > 0 ? (
                 <div className="workspace-list">
-                  {streamingBots.length > 0 && activeTasks.length === 0 && (
-                    <div className="workspace-item-row">
+                  {replyingEntries.map(entry => (
+                    <div key={entry.key} className="workspace-item-row workspace-replying-row">
                       <span className="workspace-item-icon"><span className="status-dot online"/></span>
                       <span className="workspace-item-main">
-                        <span className="workspace-item-title">{t("正在回复")}</span>
-                        <span className="workspace-item-meta">{streamingBots.join("、")}</span>
+                        <span className="workspace-item-title" title={entry.text || undefined}>{entry.text || t("正在回复")}</span>
+                        <span className="workspace-item-meta">{entry.text ? t("正在回复 · {0}", entry.botName) : entry.botName}</span>
                       </span>
                     </div>
-                  )}
+                  ))}
                   {activeTasks.slice(0, 2).map(task => (
                     <div key={task.id} className="workspace-item-row">
                       <span className="workspace-item-icon"><span className="status-dot online"/></span>
@@ -719,19 +804,18 @@ export function ConversationWorkspace({
                       </span>
                     </div>
                   ))}
-                  {queuedItems.slice(0, 2).map((item, idx) => (
-                    <div key={item.message.id} className="workspace-item-row">
+                  {waitingItems.slice(0, 2).map((item, idx) => (
+                    <div key={item.message.id} className="workspace-item-row workspace-queue-row">
                       <span className="workspace-item-icon"><ListOrdered size={12}/></span>
                       <span className="workspace-item-main">
-                        <span className="workspace-item-title">{blocksText(item.message.blocks).trim() || t("排队消息 #{0}", idx + 1)}</span>
-                        {/* A message already handed to the Bot is no longer waiting in line. */}
-                        <span className="workspace-item-meta">{item.state === "queued" ? t("队列第 {0} 位", waitingItems.indexOf(item) + 1) : t("处理中")}</span>
+                        <span className="workspace-item-title" title={previewMessage(item.message) || undefined}>{previewMessage(item.message) || t("排队消息 #{0}", idx + 1)}</span>
+                        <span className="workspace-item-meta">{online ? t("队列第 {0} 位", idx + 1) : t("{0} · {1}", t("队列第 {0} 位", idx + 1), t("离线"))}</span>
                       </span>
                     </div>
                   ))}
-                  {(activeTasks.length > 2 || queuedItems.length > 2) && (
+                  {(activeTasks.length > 2 || waitingItems.length > 2) && (
                     <div className="workspace-more-hint">
-                      {[activeTasks.length > 2 ? t("还有 {0} 个后台任务", activeTasks.length - 2) : "", queuedItems.length > 2 ? t("还有 {0} 条排队消息", queuedItems.length - 2) : ""].filter(Boolean).join(" · ")}
+                      {[activeTasks.length > 2 ? t("还有 {0} 个后台任务", activeTasks.length - 2) : "", waitingItems.length > 2 ? t("还有 {0} 条排队消息", waitingItems.length - 2) : ""].filter(Boolean).join(" · ")}
                     </div>
                   )}
                 </div>
