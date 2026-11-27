@@ -809,7 +809,18 @@ test("Workspace rail fixes cross-host avatar isolation, queue dedup race, long B
       node.querySelector('[aria-label="做出来的东西"] .workspace-section-header')!.getBoundingClientRect().bottom,
     );
     await page.setViewportSize({ width: 1280, height: Math.max(620, Math.round(madeHeaderBottom + 50)) });
-    await rail(page).getByRole("button", { name: "说明：做出来的东西" }).click();
+    const help = rail(page).getByRole("button", { name: "说明：做出来的东西" });
+    // Place the target fully inside the scrollport, close enough to the bottom
+    // to exercise the flip without Playwright scrolling it into the middle.
+    await expect.poll(() => help.evaluate(button => {
+      const body = button.closest(".workspace-body")!;
+      const header = button.closest(".workspace-section-header")!;
+      const bottom = body.getBoundingClientRect().bottom;
+      body.scrollTop += header.getBoundingClientRect().bottom - (bottom - 40);
+      const gap = bottom - header.getBoundingClientRect().bottom;
+      return gap >= 36 && gap <= 44;
+    })).toBe(true);
+    await help.click();
     const popover = rail(page).locator(".ws-help-popover");
     await expect(popover).toBeVisible();
     await expect(popover).toHaveClass(/is-up/);
