@@ -105,6 +105,7 @@ export class HubDatabase {
         const botColumns = await result.all<{ name: string }>("PRAGMA table_info(bots)");
         if (!botColumns.some(c => c.name === "deleted_at")) await result.exec("ALTER TABLE bots ADD COLUMN deleted_at INTEGER");
         if (!botColumns.some(c => c.name === "role")) await result.exec("ALTER TABLE bots ADD COLUMN role TEXT NOT NULL DEFAULT ''");
+        if (!botColumns.some(c => c.name === "workspace_path")) await result.exec("ALTER TABLE bots ADD COLUMN workspace_path TEXT");
         const messageColumns = await result.all<{ name: string }>("PRAGMA table_info(messages)");
         if (!messageColumns.some(c => c.name === "history_json")) await result.exec("ALTER TABLE messages ADD COLUMN history_json TEXT");
         if (!messageColumns.some(c => c.name === "bot_source_json")) await result.exec("ALTER TABLE messages ADD COLUMN bot_source_json TEXT");
@@ -133,6 +134,7 @@ export class HubDatabase {
         if (!conversationColumns.some((c) => c.name === "binding_id")) await result.exec("ALTER TABLE conversations ADD COLUMN binding_id TEXT");
         if (!conversationColumns.some((c) => c.name === "hidden")) await result.exec("ALTER TABLE conversations ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0");
         if (!conversationColumns.some((c) => c.name === "ticket_json")) await result.exec("ALTER TABLE conversations ADD COLUMN ticket_json TEXT");
+        if (!conversationColumns.some((c) => c.name === "workspace_path")) await result.exec("ALTER TABLE conversations ADD COLUMN workspace_path TEXT");
         if (version && Number(version.value) < 11) {
           // Old tombstones have empty blocks. Read their own retained events
           // in small pages, using the protocol's attachment traversal so button
@@ -410,6 +412,7 @@ CREATE TABLE IF NOT EXISTS events (conversation_id TEXT NOT NULL REFERENCES conv
 CREATE TABLE IF NOT EXISTS messages (id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL REFERENCES conversations(id), author_id TEXT NOT NULL, author_type TEXT NOT NULL, blocks_json TEXT NOT NULL, status TEXT NOT NULL, version INTEGER NOT NULL, client_msg_id TEXT, reply_to TEXT, created_at INTEGER NOT NULL, UNIQUE(author_id,client_msg_id));
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(message_id UNINDEXED, conversation_id UNINDEXED, body, tokenize='trigram');
 CREATE TABLE IF NOT EXISTS attachments (id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL REFERENCES conversations(id), owner_id TEXT NOT NULL, sha256 TEXT NOT NULL, size INTEGER NOT NULL, mime TEXT NOT NULL, name TEXT NOT NULL, stored_name TEXT NOT NULL, complete INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS attachment_recording (attachment_id TEXT PRIMARY KEY REFERENCES attachments(id) ON DELETE CASCADE, recording INTEGER NOT NULL CHECK(recording IN (0,1)));
 CREATE TABLE IF NOT EXISTS retired_attachments (attachment_id TEXT PRIMARY KEY REFERENCES attachments(id) ON DELETE CASCADE);
 CREATE TABLE IF NOT EXISTS upload_chunks (attachment_id TEXT NOT NULL REFERENCES attachments(id), chunk_index INTEGER NOT NULL, sha256 TEXT NOT NULL, size INTEGER NOT NULL, PRIMARY KEY(attachment_id,chunk_index));
 CREATE TABLE IF NOT EXISTS message_deletions (user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE, deleted_at INTEGER NOT NULL, PRIMARY KEY(user_id,message_id));
@@ -478,6 +481,8 @@ CREATE INDEX IF NOT EXISTS dispatch_assists_child ON dispatch_assists(child_atte
 CREATE INDEX IF NOT EXISTS dispatch_assists_continuation ON dispatch_assists(continuation_attempt_id) WHERE continuation_attempt_id IS NOT NULL;
 -- Assistance allowed since the ticket's latest dispatch; continuations keep it.
 CREATE TABLE IF NOT EXISTS dispatch_assist_windows (ticket_id TEXT PRIMARY KEY REFERENCES dispatch_tickets(id), attempt_id TEXT NOT NULL, remaining INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS saved_workspaces (id TEXT PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES users(id), name TEXT NOT NULL, path TEXT NOT NULL, created_at INTEGER NOT NULL, last_used_at INTEGER NOT NULL, UNIQUE(owner_id,path));
+CREATE INDEX IF NOT EXISTS saved_workspaces_owner ON saved_workspaces(owner_id,last_used_at DESC,created_at DESC);
 ${MESSAGE_ACTIVITY_SCHEMA}
 ${EVENT_HISTORY_SCHEMA}
 `;

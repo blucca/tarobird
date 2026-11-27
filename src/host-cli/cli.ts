@@ -2,7 +2,7 @@ import { historyCommandFailure, runHistoryCommand } from "./history.js";
 import { engineQuotaCommand, engineQuotaNotes } from "./engine-quota.js";
 import { screenCommand } from "./screens.js";
 import { runWorkbenchCommand } from "./workbench.js";
-import { runConversationsCommand } from './conversations.js';
+import { runConversationsCommand, runConversationPinsCommand } from './conversations.js';
 import { runBackupsCommand } from "./backups.js";
 import { runFoldersCommand } from './folders.js';
 import { engineSettingsCommand } from "./engine-settings.js";
@@ -46,7 +46,8 @@ import { formatLocalRoutes } from "./network-local.js";
 import { tailscaleDiagnostic } from "./tailscale-status.js";
 import { isTailscaleAddress } from "../hub/network.js";
 import { networkCanonical, sharedRoutesSchema, type NetworkCommand } from "../client-protocol/private-network.js";
-import { routesSchema, type Route } from "../client-protocol/routes.js";
+import { localRoutesSchema, routesSchema, type Route } from "../client-protocol/routes.js";
+import { selectPairingInviteRoutes, type NetworkCandidateMeta, type WindowsFirewallStatus } from "../client-protocol/network-candidates.js";
 import { createBotSchema } from "../client-protocol/bots.js";
 import { piSessionThinkingSchema, type PiSessionChange } from "../client-protocol/pi-session.js";
 import { effortArgumentError, explainPiModelRejection, piLevelArgumentError, piSessionRejectionNote } from "./pi-rejections.js";
@@ -80,7 +81,7 @@ export const HOST_CLI_HELP = `TaroBird — 同一台主机，桌面与命令行�
     [--workspace DIRECTORY] [--permission CHOICE] [--request-id ID]
     权限选项以 bots catalog 为准；Claude 还支持 claude-auto / claude-accept-edits。
     [--role dispatcher [--dispatch-mode ask|auto] [--max-concurrent N] [--allow ENGINE,ENGINE|all]]
-    --role dispatcher 创建幕僚长（Chancellor）：只有一个对话，把任务拆成工单，直接交给本机已装的 CLI 执行；只能在创建时选择。
+    --role dispatcher 创建幕僚长（Superagent）：支持多个对话、群组和 Bot 消息，把任务拆成工单交给本机已装的 CLI 执行；只能在创建时选择。
   bots status ID | restart ID | rename ID --name N --expected-name OLD
   bots chrome ID                        读取 Claude 浏览器联动开关和 revision
   bots chrome ID --enabled on|off --revision REV
@@ -101,7 +102,10 @@ export const HOST_CLI_HELP = `TaroBird — 同一台主机，桌面与命令行�
   folders pin --unfiled --enabled on|off --revision N
     取消置顶恢复普通分组位置；旧置顶未保存原位置时回到普通分组末尾
   conversations list --host HOST --bot BOT [--source-bot LOCAL_BOT_ID]
+  conversations create [--host auto] (--engine ENGINE | --bot BOT) [--model M] [--title T] [--workspace DIR] [--request-id ID]
   conversations local                 当前本地主机的全部可见对话（含已归档）
+  conversations pins                  读取当前用户的置顶对话和 revision
+  conversations pin ID [--global] --enabled on|off --revision N
   history snapshot|anchors CONVERSATION --bot BOT [--message MESSAGE] [--cursor CURSOR]
   history rewind|fork CONVERSATION --bot BOT --revision REV --request-id ID [--anchor ANCHOR] [--title TITLE]
   history status CONVERSATION --bot BOT --request-id ID
@@ -142,10 +146,10 @@ export const HOST_CLI_HELP = `TaroBird — 同一台主机，桌面与命令行�
     主人专用：不带 --conversation 时按对话汇总附件占用；带上则列出该对话的附件，每页 100 项
   attachments delete (--ids ID,ID | --conversation ID) --yes
     删除主机上的附件文件并立即释放空间；消息保留原文，附件处显示「附件已删除」。Bot 尚未处理完的消息里的附件会被拒绝
-  tickets list [--bot DISPATCHER] [--open] | show TICKET | targets | engines
+  tickets list [--bot DISPATCHER] [--conversation CONVERSATION] [--open] | show TICKET | targets | engines
   tickets capabilities --engine ENGINE [--match TEXT] [--offset N] [--bot DISPATCHER]
     按需读取用户级技能/MCP元数据，每页40项；不创建执行者、不验证运行权限或质量。
-  tickets create --title T (--text T | --text-file F) [--context-message ID]
+  tickets create --title T (--text T | --text-file F) [--conversation CONVERSATION] [--context-message ID]
   tickets dispatch TICKET --engine codex|claude|kimi|deepseek|antigravity [--model M] [--effort E] [--assist 0..2] [--text T | --text-file F] [--force] [--context-message ID]
     --assist 为本次派工链的协助次数；auto 默认 1，ask 默认 0。ask 模式需在计划中取得主人同意；限定单一模型时请设 0。
   tickets update TICKET [--status queued|needs_answer|needs_review|blocked|done|cancelled] [--note N] [--context-message ID]
@@ -254,8 +258,11 @@ export const HOST_CLI_HELP = `TaroBird — 同一台主机，桌面与命令行�
   devices rename ID --name N           修改此主机上的设备名称
                                       本机桌面端共用主机名称，请用 name <名称>
                                       撤销已入网设备会同步全网，不会让主机退出组网
-  pair [--lan | --tailscale | --routes FILE] [--address IP] [--out FILE] [--wait SECONDS]
+  pair [--lan | --tailscale | --routes FILE] [--address IP] [--v2] [--out FILE] [--wait SECONDS]
     需运行新版主机并登记 CLI 控制器（tarobot enroll）；生成 5 分钟有效、仅限一台新设备的邀请。
+    默认生成只含一个直连地址的 v1 连接码，所有版本的 App 都能识别；电脑有多个地址时用 --address IP 选择。
+    --v2 仅用于高于 1.6.0 的 App：--lan 自动排序并写入最多 4 条直连候选和已共享的中转，新设备会同时尝试；
+    1.6.0 及更早的 App 无法识别 v2 连接码。
   network status | create --name N | routes --from FILE --yes
   network local [--tailscale] [--json] 只读查看本机局域网/Tailscale 线路与共享线路
   network select-lan --from FILE --yes 选择已监听的局域网线路，保留已共享的 Tailscale
@@ -320,9 +327,9 @@ export async function runHostCli(argv: string[]): Promise<void> {
     days: { type: "string" }, mode: { type: "string" }, adapter: { type: "string" }, "threshold-seconds": { type: "string" }, enabled: { type: "string" }, engine: { type: "string" }, model: { type: "string" }, effort: { type: "string" }, workspace: { type: "string" }, permission: { type: "string" },
     action: { type: "string" }, anchor: { type: "string" }, cursor: { type: "string" }, "request-id": { type: "string" }, "expected-name": { type: "string" }, yes: { type: "boolean" }, force: { type: "boolean" }, abandon: { type: "boolean" },
     wait: { type: "string" }, from: { type: "string" }, out: { type: "string" }, routes: { type: "string" },
-    lan: { type: "boolean" }, tailscale: { type: "boolean" }, address: { type: "string" }, reset: { type: "boolean" },
+    lan: { type: "boolean" }, tailscale: { type: "boolean" }, address: { type: "string" }, v2: { type: "boolean" }, reset: { type: "boolean" },
     role: { type: "string" }, "dispatch-mode": { type: "string" }, "max-concurrent": { type: "string" }, allow: { type: "string" }, assist: { type: "string" }, status: { type: "string" }, note: { type: "string" }, open: { type: "boolean" }, match: { type: "string" }, offset: { type: "string" },
-    folder: { type: "string" }, "new-folder": { type: "string" }, unfiled: { type: "boolean" }, "dry-run": { type: "boolean" }, revision: { type: "string" }, receipt: { type: "string" },
+    folder: { type: "string" }, "new-folder": { type: "string" }, unfiled: { type: "boolean" }, global: { type: "boolean" }, "dry-run": { type: "boolean" }, revision: { type: "string" }, receipt: { type: "string" },
     "html-file": { type: "string" }, "report-file": { type: "string" }, title: { type: "string" }, summary: { type: "string" },
     token: { type: "string" }, session: { type: "string" }, thinking: { type: "string" }, target: { type: "string" }, task: { type: "string" }, bot: { type: "string" }, message: { type: "string" }, before: { type: "string" }, through: { type: "string" }, last: { type: "boolean" },
     refresh: { type: "boolean" }, path: { type: "string" }, operation: { type: "string" }, preview: { type: "boolean" },
@@ -352,10 +359,10 @@ export async function runHostCli(argv: string[]): Promise<void> {
     backups: ["days", "revision", "request-id"],
     integrations: ["yes", "request-id", "mode", "enabled", "adapter", "threshold-seconds", "revision"], directory: ["from"], init: ["name"], stop: ["wait", "force"], restart: ["wait", "force"], enroll: ["reset", "yes"], name: ["name"], drain: ["wait"],
     service: ["yes"], bots: ["name", "engine", "model", "effort", "workspace", "permission", "request-id", "expected-name", "yes", "revision", "enabled", "role", "dispatch-mode", "max-concurrent", "allow", "from"],
-    tickets: ["bot", "match", "offset", "assist", "engine", "title", "text", "text-file", "model", "effort", "force", "status", "note", "open", "request-id", "context-message", "dispatch-mode", "max-concurrent", "allow", "revision"],
-    devices: ["yes", "name"], pair: ["lan", "tailscale", "address", "routes", "out", "wait"], network: ["name", "from", "out", "yes", "tailscale"], update: ["from", "yes", "wait", "dry-run", "revision", "receipt"],
+    tickets: ["bot", "conversation", "match", "offset", "assist", "engine", "title", "text", "text-file", "model", "effort", "force", "status", "note", "open", "request-id", "context-message", "dispatch-mode", "max-concurrent", "allow", "revision"],
+    devices: ["yes", "name"], pair: ["lan", "tailscale", "address", "v2", "routes", "out", "wait"], network: ["name", "from", "out", "yes", "tailscale"], update: ["from", "yes", "wait", "dry-run", "revision", "receipt"],
     folders: ["enabled", "revision", "unfiled"],
-    conversations: ["host", "bot", "source-bot", "ids", "yes", "folder", "new-folder", "unfiled", "revision", "request-id", "model", "thinking", "session"],
+    conversations: ["host", "bot", "source-bot", "ids", "yes", "folder", "new-folder", "unfiled", "revision", "request-id", "model", "thinking", "session", "enabled", "global", "engine", "title", "workspace"],
     widgets: ["html-file", "report-file", "title", "summary", "request-id", "enabled", "revision"],
     messages: ["ids", "before", "through", "yes", "to", "source-bot", "text-file", "file", "new-conversation", "message", "timeout", "out", "request-id", "from", "bot", "context-message", "cross-host", "delivery", "enabled"],
     queue: ["bot", "message", "before", "last", "text", "text-file", "revision", "request-id"],
@@ -372,7 +379,7 @@ export async function runHostCli(argv: string[]): Promise<void> {
   if (command === "conversations") {
     if (sub === "pi-session") {
       required(argument, "缺少 CONVERSATION。"); required(v.bot, "缺少 --bot BOT。");
-      if ([v.host, v["source-bot"], v.ids, v.yes, v.folder, v["new-folder"], v.unfiled, v.revision].some(value => value !== undefined)) throw new Error("pi-session 仅支持当前主机的对话与 Pi 会话参数。");
+      if ([v.host, v["source-bot"], v.ids, v.yes, v.folder, v["new-folder"], v.unfiled, v.revision, v.engine, v.title, v.workspace].some(value => value !== undefined)) throw new Error("pi-session 仅支持当前主机的对话与 Pi 会话参数。");
       if (v.model !== undefined && v.thinking !== undefined) throw new Error("--model 与 --thinking 不能同时使用。");
       if (v.model !== undefined || v.thinking !== undefined) {
         const expectedSession = required(v.session, "修改 Pi 会话必须填写 --session TOKEN。"), requestId = required(v["request-id"], "修改 Pi 会话必须填写 --request-id ID；结果未知时保留同一编号核对。");
@@ -380,10 +387,18 @@ export async function runHostCli(argv: string[]): Promise<void> {
         if (action === "thinking" && selected !== "default" && !piSessionThinkingSchema.safeParse(selected).success) throw piLevelArgumentError("--thinking", selected);
         piSessionUpdate = { expectedSession, requestId, action, value: selected === "default" ? null : action === "thinking" ? piSessionThinkingSchema.parse(selected) : selected };
       } else if (v.session !== undefined || v["request-id"] !== undefined) throw new Error("只读 Pi 会话不接受 --session 或 --request-id；修改时需填写 --model 或 --thinking。");
-    } else if ([v.model, v.thinking, v.session].some(value => value !== undefined)) throw new Error("--model、--thinking、--session 仅支持 conversations pi-session。");
+    } else if (sub === "create") {
+      if (argument !== undefined) throw new Error("conversations create 不接受额外的位置参数。");
+      if ([v.thinking, v.session].some(value => value !== undefined)) throw new Error("--thinking、--session 仅支持 conversations pi-session。");
+      if ([v.ids, v.yes, v.folder, v["new-folder"], v.unfiled, v.revision, v["source-bot"]].some(value => value !== undefined)) throw new Error("conversations create 不接受批量整理或跨主机路由参数。");
+    } else {
+      if ([v.model, v.thinking, v.session].some(value => value !== undefined)) throw new Error("--model、--thinking、--session 仅支持 conversations pi-session（--model 也支持 conversations create）。");
+      if ([v.engine, v.title, v.workspace].some(value => value !== undefined)) throw new Error("--engine、--title、--workspace 仅支持 conversations create。");
+    }
+    if (sub !== "pin" && (v.enabled !== undefined || v.global !== undefined)) throw new Error("--enabled 与 --global 仅支持 conversations pin。");
   }
   const positionalLimit: Record<string, number> = { history: 3, screens: 3, workbench: 3, engines: 2, backups: 2, integrations: 3, directory: 2, name: 2, bots: 3, queue: 3, tasks: 3, steer: 3, side: 3, changes: 3, bus: 3, groups: 3, messages: 3, tickets: 3, widgets: 3, folders: 3, conversations: 2, devices: 3, service: 2, network: 3, update: 3, backup: 2, restore: 2 };
-  if (command === "conversations" && sub === "pi-session") positionalLimit.conversations = 3;
+  if (command === "conversations" && (sub === "pi-session" || sub === "pin")) positionalLimit.conversations = 3;
   if (command === "bus" && ["list", "create", "prepare"].includes(sub ?? "")) positionalLimit.bus = 2;
   if (command === "bots" && ["list", "catalog", "create"].includes(sub ?? "") || command === "devices" && ["list", "pending", "invites"].includes(sub ?? "") || command === "network" && sub !== "remove" || command === "update" && sub !== "apply") positionalLimit[command] = 2;
   if (p.length > (positionalLimit[command] ?? 1)) throw new Error("此命令不接受额外的位置参数。请执行 tarobot --help。");
@@ -696,21 +711,28 @@ export async function runHostCli(argv: string[]): Promise<void> {
     try {
     reserved = await outputFile?.stat();
     let routes: Route[];
+    let candidates: NetworkCandidateMeta[] | undefined;
+    let windowsFirewall: WindowsFirewallStatus | undefined;
     if (v.lan || v.tailscale) {
       await startCompatible();
       let drainId: string | undefined, lease: ReturnType<typeof keepHostDrainLease> | undefined;
       let configured;
+      // A v1 code holds one direct address, and Apps up to 1.6.0 read nothing
+      // else: several candidates are written only when --v2 asks for them.
+      const requireSingleAddress = !!v.address || !!v.tailscale || !v.v2;
       try {
         checkCancelled();
         configured = await desktopHost(v.tailscale ? "tailscale" : "network", directory, entrypoint, undefined, {
-          selectAddress: addresses => {
-            if (v.address && !addresses.includes(v.address)) throw new Error(`指定地址不在可用线路中：${addresses.join("、")}。请用 --address IP 选择。`);
-            if (v.address) return v.address;
-            const ipv4 = v.tailscale ? addresses.filter(isIPv4) : [];
-            const candidates = ipv4.length ? ipv4 : addresses;
-            if (candidates.length > 1) throw new Error(`发现多个可用地址：${candidates.join("、")}。请用 --address IP 选择手机可达的地址。`);
-            return candidates[0]!;
-          },
+          ...(requireSingleAddress ? {
+            selectAddress: (addresses: readonly string[]) => {
+              if (v.address && !addresses.includes(v.address)) throw new Error(`指定地址不在可用线路中：${addresses.join("、")}。请用 --address IP 选择。`);
+              if (v.address) return v.address;
+              const ipv4 = v.tailscale ? addresses.filter(isIPv4) : [];
+              const selectionPool = ipv4.length ? ipv4 : addresses;
+              if (selectionPool.length > 1) throw new Error(`发现多个可用地址：${selectionPool.join("、")}。请用 --address IP 选择手机可达的地址。${v.lan ? "新设备的 App 高于 1.6.0 时，也可改用 --v2 一次写入多个候选地址。" : ""}`);
+              return selectionPool[0]!;
+            },
+          } : {}),
           beforeRestart: async () => {
             drainId = await wait();
             lease = drainId ? keepHostDrainLease(directory, drainId) : undefined;
@@ -727,8 +749,19 @@ export async function runHostCli(argv: string[]): Promise<void> {
         }
       }
       if (!("routes" in configured)) throw new Error("配对线路尚未准备好。");
-      routes = routesSchema.parse([configured.routes[0]]);
-    } else if (v.routes) routes = routesSchema.parse(await readJson(v.routes));
+      candidates = "candidates" in configured ? configured.candidates : undefined;
+      windowsFirewall = "windowsFirewall" in configured ? configured.windowsFirewall : undefined;
+      if (requireSingleAddress) {
+        routes = routesSchema.parse([configured.routes[0]]);
+      } else {
+        const hasPlausible = candidates ? candidates.some(candidate => !candidate.demoted && !candidate.virtualBridge) : true;
+        if (!hasPlausible && configured.routes.length > 1) {
+          const labels = (candidates ?? []).map(candidate => candidate.address);
+          throw new Error(`发现多个虚拟网桥或 VPN 地址：${labels.join("、")}。请用 --address IP 选择手机可达的地址。`);
+        }
+        routes = localRoutesSchema.parse(selectPairingInviteRoutes(configured.routes, [], { candidates }));
+      }
+    } else if (v.routes) routes = (v.v2 ? localRoutesSchema : routesSchema).parse(await readJson(v.routes));
     else {
       const client = await LocalHostClient.connect(directory);
       try { routes = (await new HostNetwork(client).view()).host.routes; } finally { client.close(); }
@@ -743,17 +776,31 @@ export async function runHostCli(argv: string[]): Promise<void> {
         const sharedLan = view.host.routes.find(route => route.name === "Direct" && /^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(new URL(route.url).hostname));
         if (!sharedLan || sharedLan.url === routes[0]!.url && sharedLan.certificateAuthority === routes[0]!.certificateAuthority) await network.selectLan(routes[0]);
         else console.error("已生成所选地址的连接码；原共享局域网线路保持不变。如需替换，请使用 network routes 明确更新。");
+        if (v.v2 && !v.address) {
+          const relays = view.host.routes.filter(route => route.name === "VPS");
+          if (relays.length) routes = localRoutesSchema.parse(selectPairingInviteRoutes(routes, relays, { candidates }));
+        }
       }
       return management.issuePairingInvite();
     }).catch((error: unknown) => {
       if (error instanceof Error && error.message === "pairing_invites_full") throw new Error("有效邀请或待确认设备过多。请用 tarobot devices invites 查看，再用 tarobot devices revoke-invite ID 撤销未使用的邀请，或等待 5 分钟后重试。");
       throw error;
     });
-    const link = hostPairingLink(service.publicKey, routes, invitation.invite);
+    const link = hostPairingLink(service.publicKey, routes, invitation.invite, { version: v.v2 ? 2 : 1 });
     if (outputFile) { await outputFile.writeFile(link + "\n"); await outputFile.sync(); exported = true; }
-    if (v.json) await output({ host: await readHostProfile(directory), publicKey: service.publicKey, routes, link, inviteId: invitation.id, expiresAt: invitation.expiresAt, serverTime: invitation.serverTime });
-    else { console.log(`限时连接码有效期 5 分钟，仅限一台新设备；过期后重新运行 tarobot pair。邀请 ID：${invitation.id}。
-在新手机或电脑扫描连接二维码，再用已授权设备确认新设备上的 8 位配对码；也可在此运行 tarobot devices approve <配对码>。\n${link}`); try { console.log(await terminalPairingQr(link)); } catch { console.error("连接信息超出终端二维码容量；请在新设备选择「粘贴连接信息」并粘贴上面的链接。"); } }
+    if (v.json) await output({ host: await readHostProfile(directory), publicKey: service.publicKey, routes, ...(candidates ? { candidates } : {}), ...(windowsFirewall?.supported ? { windowsFirewall } : {}), link, inviteId: invitation.id, expiresAt: invitation.expiresAt, serverTime: invitation.serverTime });
+    else {
+      if (windowsFirewall?.supported && windowsFirewall.networkCategory !== "domain") {
+        if (windowsFirewall.networkCategory === "public") {
+          console.error("提示：Windows 当前将此网络标记为「公用网络」，可能阻止手机连接。请在 Windows「网络和 Internet」设置中将此网络改为「专用网络」。");
+        } else if (windowsFirewall.blockingRuleDetected || (windowsFirewall.privateFirewallEnabled && !windowsFirewall.ruleAllowed)) {
+          console.error(`提示：Windows 防火墙可能阻止手机连接端口 ${windowsFirewall.port}。如需放行，请在管理员 PowerShell 运行：\n  ${windowsFirewall.recommendedCommand ?? ""}`);
+        }
+      }
+      console.log(`限时连接码有效期 5 分钟，仅限一台新设备；过期后重新运行 tarobot pair。邀请 ID：${invitation.id}。
+在新手机或电脑扫描连接二维码，再用已授权设备确认新设备上的 8 位配对码；也可在此运行 tarobot devices approve <配对码>。\n${link}`);
+      try { console.log(await terminalPairingQr(link)); } catch { console.error("连接信息超出终端二维码容量；请在新设备选择「粘贴连接信息」并粘贴上面的链接。"); }
+    }
     return;
     } finally {
       await outputFile?.close();
@@ -773,7 +820,7 @@ export async function runHostCli(argv: string[]): Promise<void> {
   if (command === "attachments") { await output(await runAttachmentsCommand(directory, sub, { conversation: v.conversation, ids: v.ids, sort: v.sort, offset: v.offset, yes: v.yes })); return; }
   if (command === "tickets") {
     await output(await runTicketsCommand(directory, sub, argument, {
-      bot: v.bot, match: v.match, offset: v.offset, assist: v.assist, engine: v.engine, title: v.title, text: v.text, "text-file": v["text-file"], model: v.model, effort: v.effort, force: v.force, status: v.status, note: v.note, open: v.open,
+      bot: v.bot, conversation: v.conversation, match: v.match, offset: v.offset, assist: v.assist, engine: v.engine, title: v.title, text: v.text, "text-file": v["text-file"], model: v.model, effort: v.effort, force: v.force, status: v.status, note: v.note, open: v.open,
       "request-id": v["request-id"], "context-message": v["context-message"], "dispatch-mode": v["dispatch-mode"], "max-concurrent": v["max-concurrent"], allow: v.allow, revision: v.revision,
     }, id => console.error(`工单操作编号：${id}。结果未确认时保留原参数并用 --request-id ${id} 核对，不会自动重发。`))); return;
   }
@@ -809,6 +856,19 @@ export async function runHostCli(argv: string[]): Promise<void> {
         const note = piSessionUpdate && "outcome" in result ? piSessionRejectionNote(result, piSessionUpdate.value) : undefined;
         if (note && !v.json) console.error(note);
         await output(result); return;
+      }
+      if (sub === "pins" || sub === "pin") {
+        if ([v.host, v.bot, v["source-bot"], v.ids, v.yes, v.folder, v["new-folder"], v.unfiled, v["request-id"]].some(value => value !== undefined)) {
+          throw new Error(`conversations ${sub} 不接受批量整理或跨 Bot 路由参数。`);
+        }
+        await output(await runConversationPinsCommand(management.client, sub, argument, { global: v.global, enabled: v.enabled, revision: v.revision }));
+        return;
+      }
+      if (sub === "create") {
+        await output(await runConversationsCommand(management.client, sub, {
+          host: v.host, engine: v.engine, model: v.model, title: v.title, workspace: v.workspace, bot: v.bot, requestId: v["request-id"],
+        }));
+        return;
       }
       if (argument || [v.host, v.bot, v["source-bot"]].some(value => value !== undefined)) throw new Error("批量整理使用当前本地主机；不接受跨 Bot 路由参数。");
       await output(await runConversationsCommand(management.client, sub, { ids: v.ids, yes: v.yes, folder: v.folder, unfiled: v.unfiled, newFolder: v["new-folder"], revision: v.revision, requestId: v["request-id"] }, id => console.error(`批量操作编号：${id}。结果不确定时保留原编号和参数核对，勿换编号重复提交。`))); return;

@@ -42,11 +42,14 @@ import { GatewayAgentBusRuns, observeAgentBusRun } from "./agent-bus.js";
 import { deliveryLedgerEnabled } from "../state/delivery-obligation-store.js";
 import { redeliverRecoveredCoreObligations } from "../core/delivery-recovery.js";
 import { loadInstanceConfig, resolveInstanceWorkspacePath, type InstanceEngine } from "../state/instance-config.js";
+import { resolveConversationResume } from "../runtime/conversation-resume.js";
+import { SessionStore } from "../state/session-store.js";
 import { createAppPlatformTools } from "./app-tools.js";
 import { GatewayReceipts } from "./receipts.js";
 import { gatewayActiveWorkCount } from "./activity.js";
 import { effortSettings } from "../runtime/effort-settings.js";
 import { modelSettings } from "../runtime/model-settings.js";
+import { workspaceSettings } from "../runtime/workspace-settings.js";
 import { appTurnInstructions, botMessageQuestionInstructions, dispatcherExecutionInstructions, dispatcherInstructions, workerExecutionInstructions, type AppInstructionOptions } from "./agent-instructions.js";
 import { mergeTurnInstructions } from "../core/agent-instructions.js";
 import { stripAlreadyDeliveredAppArtifacts, type AppDeliveryReceipt } from "./app-delivery.js";
@@ -58,7 +61,8 @@ export interface GatewayServiceOptions extends GatewayTransportOptions { bridge:
  * store, usage ledger, cron runtime and native session lock stay shared. */
 export async function attachGateway(options: GatewayServiceOptions): Promise<GatewayChannel> {
   const attachedAt = Date.now();
-  const channel = new GatewayChannel(new GatewayTransport(options));
+  const quotaEngine = quotaEngineSchema.safeParse(options.engine);
+  const channel = new GatewayChannel(new GatewayTransport({ ...options, engineQuotaAccountMatch: quotaEngine.success }));
   let disconnecting = false;
   const blockedPulls = new Map<string, ReturnType<typeof setTimeout>>();
   const activePulls = new Set<Promise<void>>();
@@ -155,13 +159,16 @@ export async function attachGateway(options: GatewayServiceOptions): Promise<Gat
       const instructionOptions: AppInstructionOptions = { engine: config.engine, claudeChrome: config.claudeChrome, timezone: config.timezone,
         context: discussionTurn ? "discussion" : input.instructions?.includes("This scheduled run must not") ? "cron" : "chat" };
       const source = channel.currentBotSource();
-      const dispatcherContext = { scheduled: instructionOptions.context === "cron", delegated: !!source };
+      // Host ticket notices are explicitly verified by the Hub (clientMsgId `tn_*` + own hostId).
+      // Preserve the dispatcher's owner-facing flow only for verified Host notices, while treating
+      // genuine Bot-to-Bot messages (even with a caller-supplied `tk_*` requestId) as delegated Bot turns.
+      const ticketNotice = config.role === "dispatcher" && !!source && channel.currentTicketNotice();
+      const dispatcherContext = { scheduled: instructionOptions.context === "cron", delegated: !!source && !ticketNotice, ...(conversationId ? { conversationId } : {}) };
       const workerInstructions = channel.currentTicket() && conversationId && input.conversationKey === buildCoreConversationKey(conversationId) && !discussionTurn && instructionOptions.context !== "cron"
         ? workerExecutionInstructions(channel.currentMessageId()) : undefined;
       instructionOptions.ticketWorker = !!workerInstructions;
-      // Ticket notices also carry botSource; preserve the dispatcher's owner-facing flow.
       // Turn-local provenance only: owner text/history must not disable questions.
-      instructionOptions.botMessageTask = !!source && !workerInstructions && !discussionTurn && config.role !== "dispatcher";
+      instructionOptions.botMessageTask = !!source && !ticketNotice && !workerInstructions && !discussionTurn;
       const ordinaryGroup = !discussionTurn && conversationId && await channel.getChatMode(conversationId) === "group";
       // A discussion turn gets no cross-Bot CLI context: the Hub rejects it too.
       const frozenWorkbench = conversationId && channel.currentMessageId() ? await channel.workbenchContext().catch(() => undefined) : undefined;
@@ -184,6 +191,16 @@ export async function attachGateway(options: GatewayServiceOptions): Promise<Gat
       const groupSessionKey = groupSession ? buildCoreConversationKey(groupSession.sessionId) : undefined;
       const sessionConversationKey = groupSessionKey ?? input.conversationKey;
       const sessionChatId = groupSessionKey ? stableCoreNumericId(groupSessionKey) : input.chatId;
+      let effectiveWorkspace = input.workspaceOverride;
+      if (groupSession && groupSessionKey) {
+        const boundSession = await new SessionStore(path.join(options.stateDir, "session.json")).findByConversationKeySafe(groupSessionKey);
+        const boundResume = boundSession.warning ? undefined : resolveConversationResume(boundSession.record, config.resume);
+        effectiveWorkspace = boundResume?.workspacePath
+          ?? groupSession.workspacePath
+          ?? await channel.conversationWorkspace(groupSession.sessionId)
+          ?? resolveInstanceWorkspacePath(config)
+          ?? input.workspaceOverride;
+      }
       const groupHistoryPrefix = groupSession?.contextMessages?.length
         ? `[Group "${groupSession.groupTitle}" recent context]\n${groupSession.contextMessages.map((m) => `${m.authorName}: ${m.text}`).join("\n")}\n\n`
         : "";
@@ -196,7 +213,7 @@ export async function attachGateway(options: GatewayServiceOptions): Promise<Gat
       const signal = input.abortSignal ? AbortSignal.any([input.abortSignal, lifetime.signal]) : lifetime.signal;
       const appPlatformTools = conversationId && input.conversationKey === buildCoreConversationKey(conversationId)
         ? createAppPlatformTools({ channel, stateDir: options.stateDir, conversationId, requestOutputDir: input.requestOutputDir,
-          workspaceOverride: input.workspaceOverride, options: instructionOptions, receipts: appReceipts, signal,
+          workspaceOverride: effectiveWorkspace, options: instructionOptions, receipts: appReceipts, signal,
           suppressDelivery: input.suppressAppDelivery,
           replyTo: input.appDeliveryReplyTo ?? channel.currentMessageId(),
           deliveryCache: input.appDeliveryCache,
@@ -209,7 +226,7 @@ export async function attachGateway(options: GatewayServiceOptions): Promise<Gat
         // Persistent CLI workers can invoke these callbacks from an older
         // async context, even after this request returns. Bind App formatting
         // explicitly so late reports never fall back to Feishu card limits.
-        let response = await target.handleAuthorizedMessage({ ...input, conversationKey: sessionConversationKey, chatId: sessionChatId, text: engineText, appPlatformTools,
+        let response = await target.handleAuthorizedMessage({ ...input, conversationKey: sessionConversationKey, chatId: sessionChatId, workspaceOverride: effectiveWorkspace, text: engineText, appPlatformTools,
           onHistoryAnchor: input.historyInputMessageId && conversationId && channel.transport.capabilities.includes(CONVERSATION_HISTORY_CAPABILITY)
             ? async evidence => {
               const record = historyAnchorEvidenceSchema.parse({ ...evidence, conversationId });
@@ -267,8 +284,20 @@ export async function attachGateway(options: GatewayServiceOptions): Promise<Gat
     // Only a Hub-dispatched run marker selects Agent Bus execution and observation.
     const agentBus = message.agentBus ? observeAgentBusRun({ transport: channel.transport, runs: agentBusRuns, botId: options.botId, messageId: message.messageId,
       dispatch: message.agentBus, runtime: messageRuntime, bridge, onWarning: options.onWarning }) : undefined;
+    const groupSession = !message.groupDiscussion ? channel.currentGroupSession() : undefined;
+    let sessionWorkspaceOverride: string | undefined;
+    if (groupSession) {
+      const cfg = await loadInstanceConfig(options.stateDir);
+      const boundSession = await new SessionStore(path.join(options.stateDir, "session.json")).findByConversationKeySafe(buildCoreConversationKey(groupSession.sessionId));
+      const boundResume = boundSession.warning ? undefined : resolveConversationResume(boundSession.record, cfg.resume);
+      sessionWorkspaceOverride = boundResume?.workspacePath
+        ?? message.workspaceOverride
+        ?? groupSession.workspacePath
+        ?? await channel.conversationWorkspace(groupSession.sessionId)
+        ?? resolveInstanceWorkspacePath(cfg);
+    }
     let failure: unknown;
-    try { await handleCoreMessage({ channel, bridge: agentBus?.bridge ?? bridge, runtime: agentBus?.runtime ?? messageRuntime, stateDir: options.stateDir, instanceName: options.botId, message, requireMentionInGroup: options.requireMentionInGroup ?? true }); }
+    try { await handleCoreMessage({ channel, bridge: agentBus?.bridge ?? bridge, runtime: agentBus?.runtime ?? messageRuntime, stateDir: options.stateDir, instanceName: options.botId, message, requireMentionInGroup: options.requireMentionInGroup ?? true, ...(sessionWorkspaceOverride ? { workspaceOverride: sessionWorkspaceOverride } : {}) }); }
     catch (error) {
       failure = error;
       if (!(error instanceof GatewaySessionBindingError)) throw error;
@@ -281,19 +310,23 @@ export async function attachGateway(options: GatewayServiceOptions): Promise<Gat
   const engineTasks = gatewayEngineTasks(bridge, channel, options.stateDir);
   const contextUsage = gatewayContextUsage(bridge, channel);
   const piSession = gatewayPiSession(bridge, channel, options.stateDir, options.botId);
-  const history = gatewayConversationHistory(bridge, channel, runtime, options.stateDir, options.botId, () => (sideSessions?.activeCount() ?? 0) > 0);
+  const history = gatewayConversationHistory(bridge, channel, runtime, options.stateDir, options.botId, (conversationId) => sideSessions?.hasOpenSession(conversationId) ?? false);
   // Side audio uses the main transcriber and cloud policy, without its chat progress cards.
   sideSessions = gatewaySideSessions(surface, options.stateDir, options.botId, conversationId => channel.canSteerConversation!(conversationId), instanceAttachmentDownload(channel.transport), runtime.transcribeMedia ?? createDefaultTranscribeVoice(), channel);
   const schedules = gatewaySchedules(options, channel);
-  const quotaEngine = quotaEngineSchema.safeParse(options.engine);
-  const quotas = quotaEngine.success ? gatewayEngineQuota({ botId: options.botId, engine: quotaEngine.data, read: bridge.readAccountQuota?.bind(bridge) }) : undefined;
+  const quotas = quotaEngine.success ? gatewayEngineQuota({ botId: options.botId, engine: quotaEngine.data, read: bridge.readAccountQuota?.bind(bridge), getAccountProofKey: () => channel.transport.quotaProofKey }) : undefined;
   channel.onCall = async (method, raw): Promise<Json> => withChannelProfile("gateway", async () => {
     if (method.startsWith("history.")) return history(method, raw);
     if (method === "quota.get") { if (!quotas) throw new Error("quota_engine_unavailable"); return z.json().parse(await quotas(raw)); }
+    if (method === "quota.accountProof") { if (!quotas) throw new Error("quota_engine_unavailable"); return z.json().parse(quotas.accountProof(raw)); }
     if (method === "tasks.list" || method === "tasks.stop" || method === "tasks.recover") return z.json().parse(await engineTasks(method, raw));
     if (method === "context.usage") return z.json().parse(await contextUsage(raw));
     if (method === "pi.session.get" || method === "pi.session.set") return z.json().parse(await piSession(method, raw));
     if (["side.status", "side.open", "side.read", "side.ask", "side.stop", "side.close"].includes(method)) return z.json().parse(await sideSessions!.call(method, raw));
+    if (method === "workspace.get" || method === "workspace.set") {
+      if (method === "workspace.get") z.object({}).strict().parse(raw);
+      return z.json().parse(await workspaceSettings(options.stateDir, activeWorkCount, method === "workspace.set" ? raw : undefined));
+    }
     if (method === "persona.get" || method === "persona.set") {
       if (method === "persona.get") z.object({}).strict().parse(raw);
       return z.json().parse(await personaSettings(options.stateDir, activeWorkCount, method === "persona.set" ? raw : undefined));
@@ -348,7 +381,7 @@ export async function attachGateway(options: GatewayServiceOptions): Promise<Gat
     if (["sessions", "status", "service.status", "restart"].includes(method)) return gatewayOperation(method, options);
     throw new Error("unknown_gateway_call");
   });
-  const executeCron = buildCoreCronExecutor({ channel, bridge, runtime, stateDir: options.stateDir, deliverResponse: deliverCoreResponse, createRunCard: createCoreRunCardController, requestApproval: requestCoreApproval });
+  const executeCron = buildCoreCronExecutor({ channel, bridge, runtime, stateDir: options.stateDir, instanceName: options.botId, deliverResponse: deliverCoreResponse, createRunCard: createCoreRunCardController, requestApproval: requestCoreApproval });
   channel.runCron = (job, signal, lifecycle) => channel.inConversation(job.larkChatId ?? "", () => executeCron(job, signal, lifecycle));
   await channel.connect(); return channel;
 }

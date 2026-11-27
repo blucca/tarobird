@@ -158,6 +158,7 @@ export const groupLocalSessionDispatchSchema = z.object({
   sessionId: id,
   sessionTitle: z.string().max(256),
   groupTitle: z.string().max(256),
+  workspacePath: z.string().max(4096).optional(),
   contextMessages: z.array(z.object({
     seq: z.number().int().nonnegative(),
     authorName: z.string().max(256),

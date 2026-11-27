@@ -35,6 +35,7 @@ import { Avatar, AvatarProvider, ConversationAvatar } from './Avatar.js';
 import { BotReferences, ReferencePreview } from './BotReferences.js';
 import type { Bot, HubConnection } from './connection.js';
 import { t, useLocale } from './i18n.js';
+import { routeDiagnosisMessage } from './route-diagnostics.js';
 import { useLocalDay } from './local-day.js';
 import { useBackAction } from './back-navigation.js';
 import { useConversationHold } from './useConversationHold.js';
@@ -64,6 +65,8 @@ export type MobileHomeProps = {
   changeGroupByHost?: (value: boolean) => void;
   notice?: ReactNode;
   hosts: MobileHost[];
+  /** Total registered non-blocked hosts (keeps combined cross-host mode stable while another host transitions). */
+  registeredHostCount?: number;
   activeHostId: string;
   tab: MobileTab;
   setTab: (value: MobileTab) => void;
@@ -147,7 +150,8 @@ export const MobileHome = memo(function MobileHome(props: MobileHomeProps) {
 }, (previous, next) => previous.visible === false && next.visible === false);
 
 const MobileHomeContent = memo(function MobileHome(props: MobileHomeProps) {
-  const { hosts, activeHostId, tab, setTab, create } = props;
+  const { hosts, registeredHostCount, activeHostId, tab, setTab, create } = props;
+  const totalHosts = Math.max(hosts.length, registeredHostCount ?? 0);
   const locale = useLocale();
   const [localInbox, setLocalInbox] = useState<MobileInboxState>({ query: '', filter: 'all' });
   // The inbox lists every host, so its filters belong to the device shell,
@@ -259,7 +263,7 @@ const MobileHomeContent = memo(function MobileHome(props: MobileHomeProps) {
             if (searching) closeSearch();
             else { focusSearch.current = true; setSearchTab(tab); }
           }}>{searching ? <CloseIcon size={22}/> : <SearchIcon size={22}/>}</button>}
-          {tab === 'messages' && scopeHost && scopeBot ? !isDispatcher(scopeBot) && (
+          {tab === 'messages' && scopeHost && scopeBot ? (
             <button type="button" className="mh-icon-button" aria-label={t('与 {0} 新建对话', scopeBot.name)} onClick={() => props.newChat(scopeHost.id, scopeBot.id)}><PlusIcon size={22}/></button>
           ) : tab !== 'me' && (
             <CreateMenu hostName={hosts.length === 1 ? activeHost?.name : undefined} disabled={hosts.length === 0} onCreate={create} />
@@ -267,7 +271,7 @@ const MobileHomeContent = memo(function MobileHome(props: MobileHomeProps) {
         </div>
         {searching && <SearchField key={tab} inputRef={searchInput} value={query} onChange={setQuery} close={closeSearch} scoped={tab === 'messages' && !!botScope} />}
         {tab === 'messages' && <div className="mh-filter-toolbar"><FilterBar value={filter} onChange={setFilter}/><MobileListOptions
-          hosts={hosts} activeHostId={activeHostId} scopedHostId={botScope?.hostId} visible={visible} disabled={!!bulk?.active}
+          hosts={hosts} registeredHostCount={totalHosts} activeHostId={activeHostId} scopedHostId={botScope?.hostId} visible={visible} disabled={!!bulk?.active}
           groupByHost={props.groupByHost ?? false} changeGroupByHost={props.changeGroupByHost}
           showDisconnectedBots={props.showDisconnectedBots ?? false} changeShowDisconnectedBots={props.changeShowDisconnectedBots}
         /></div>}
@@ -292,11 +296,14 @@ const MobileHomeContent = memo(function MobileHome(props: MobileHomeProps) {
 /** The desktop connection pill is hidden on phones. Keep recovery visible even
  * when filtering disconnected Bots leaves a nonempty list of groups. */
 function HomeConnectionNotice({ host, manage }: { host?: MobileHost; manage: () => void }) {
+  useLocale();
   if (!host || host.viewingHistory || host.connection.state.status === 'online') return null;
   const connection = host.connection, blocked = connection.isReadOnly || connection.isClosed;
+  const diagnosisMessage = routeDiagnosisMessage(connection.state.routeDiagnosis, host.name);
+  const reason = !blocked ? diagnosisMessage ?? (connection.state.error && connection.state.error !== t('暂时无法连接「{0}」，正在自动重试。', host.name) ? connection.state.error : undefined) : undefined;
   return <section className="mh-connection-notice" role="status" aria-label={t('主机连接状态')}>
     <WifiOff size={17} aria-hidden="true"/>
-    <div><strong>{blocked ? t('未连接到「{0}」', host.name) : t('正在连接「{0}」', host.name)}</strong><p>{blocked ? t('连接暂不可用，已缓存的记录仍保留。') : retainsOfflineNavigation(connection) ? t('正在自动重连，断线 5 分钟内保留对话列表。') : t('正在自动重连，对话记录仍保留。')}</p></div>
+    <div><strong>{blocked ? t('未连接到「{0}」', host.name) : t('正在连接「{0}」', host.name)}</strong><p>{blocked ? t('连接暂不可用，已缓存的记录仍保留。') : retainsOfflineNavigation(connection) ? t('正在自动重连，断线 5 分钟内保留对话列表。') : t('正在自动重连，对话记录仍保留。')}</p>{reason && <p className="mh-connection-reason">{reason}</p>}</div>
     {blocked ? <button type="button" onClick={manage}>{t('主机管理')}</button> : <button type="button" aria-label={t('重试连接')} disabled={connection.state.status === 'connecting'} onClick={() => connection.resume(true)}><RefreshCw size={15} aria-hidden="true"/>{t('重试')}</button>}
   </section>;
 }
@@ -316,14 +323,14 @@ type PaneProps = MobileHomeProps & {
 };
 
 function MessagesPane({
-  hosts, rows, hiddenConversations, activeHost, needle, query, filter, locale, select, newChat, settingsBot, create, open, searchHistory, botScope, botCounts, browseBot, openActions, groupByHost = false, showDisconnectedBots = false, visible: paneVisible = true,
+  hosts, registeredHostCount, rows, hiddenConversations, activeHost, needle, query, filter, locale, select, newChat, settingsBot, create, open, searchHistory, botScope, botCounts, browseBot, openActions, groupByHost = false, showDisconnectedBots = false, visible: paneVisible = true,
 }: PaneProps) {
   useHostFolderUpdates(hosts);
   const crossHostOrder = useCrossHostFolderOrder();
   if (hosts.length === 0) {
     return <EmptyState text={t('还没有可用的主机')} action={{ label: t('主机管理'), onClick: () => open('hosts') }} />;
   }
-  const multiHost = hosts.length > 1;
+  const multiHost = Math.max(hosts.length, registeredHostCount ?? 0) > 1;
   const grouped = multiHost && groupByHost && !botScope;
   const connectedBotAvailable = hosts.some(host => (!botScope || host.id === botScope.hostId)
     && host.connection.state.status === 'online' && host.bots.some(bot => bot.online && (!botScope || bot.id === botScope.botId)));
@@ -352,7 +359,8 @@ function MessagesPane({
   const hasVisibleRows = (host: MobileHost) => ordinary.some(row => row.hostId === host.id) || !filtered && !!host.connection.state.conversationFolders?.folders.length;
   const renderRow = (row: MobileConversationRow, showHost: boolean) => {
     const host = hostById.get(row.hostId); if (!host) return null;
-    return <AvatarProvider connection={host.connection} conversations={host.conversations} directory={host.bots}><BotReferences bots={host.bots}><ConversationRow row={row} connection={host.connection} conversations={host.conversations} dispatcher={row.conversation.type === 'direct' && !row.conversation.parentId && isDispatcher(host.bots.find(bot => bot.id === row.conversation.botIds[0]))} multiHost={showHost} locale={locale} attentionOnly={filter === 'attention'} onSelect={select} onActions={openActions}/></BotReferences></AvatarProvider>;
+    const dispatcherBotIds = row.conversation.botIds.filter(id => isDispatcher(host.bots.find(bot => bot.id === id)));
+    return <AvatarProvider connection={host.connection} conversations={host.conversations} directory={host.bots}><BotReferences bots={host.bots}><ConversationRow row={row} connection={host.connection} conversations={host.conversations} dispatcher={row.conversation.type === 'direct' && !row.conversation.parentId && dispatcherBotIds.length > 0} dispatcherBotIds={dispatcherBotIds} multiHost={showHost} locale={locale} attentionOnly={filter === 'attention'} onSelect={select} onActions={openActions}/></BotReferences></AvatarProvider>;
   };
   const renderFolders = (host: MobileHost, showHostBadge: boolean) => <FolderSections connection={host.connection} hostId={host.id} hostName={host.name} showHostBadge={showHostBadge} visible={paneVisible} holdActions rows={ordinary.filter(row => row.hostId === host.id)} filtered={!!needle || filter !== 'all' || !!botScope} renderRow={row => renderRow(row, false)}/>;
   const renderList = (items: MobileConversationRow[], showHost: boolean) => <ul className="mh-list">{items.map(row => <li key={row.key}>{renderRow(row, showHost)}</li>)}</ul>;
@@ -442,11 +450,12 @@ function MessagesPane({
   );
 }
 
-function ConversationRow({ row, connection, conversations, dispatcher, multiHost, locale, attentionOnly, onSelect, onActions }: {
+function ConversationRow({ row, connection, conversations, dispatcher, dispatcherBotIds, multiHost, locale, attentionOnly, onSelect, onActions }: {
   row: MobileConversationRow;
   connection: HubConnection;
   conversations: Conversation[];
   dispatcher: boolean;
+  dispatcherBotIds: readonly string[];
   multiHost: boolean;
   locale: Locale;
   attentionOnly: boolean;
@@ -492,7 +501,7 @@ function ConversationRow({ row, connection, conversations, dispatcher, multiHost
       onKeyDown={event => { if (event.key === 'ContextMenu' || event.key === 'F10' && event.shiftKey) { event.preventDefault(); onActions(event.currentTarget); } }}
       onClick={() => bulk?.active ? bulk.toggle(connection, conversation) : onSelect(row.hostId, target?.conversationId ?? conversation.id, target?.messageId)}
     >
-      <AgentAvatar signal={row.agent} size={avatarSize} className="mh-avatar" dispatcher={dispatcher} tickets={dispatcher ? { connection, botId: conversation.botIds[0]! } : undefined}>
+      <AgentAvatar signal={row.agent} size={avatarSize} className="mh-avatar" dispatcher={dispatcher} tickets={dispatcherBotIds.length ? { connection, botIds: dispatcherBotIds, conversationIds: isGroup ? [conversation.id, ...conversations.filter(child => child.parentId === conversation.id && !child.archived).map(child => child.id)] : [conversation.id] } : undefined}>
         <ConversationAvatar conversation={conversation} size={avatarSize}/>
         {row.unread > 0 && <span className="mh-badge"><span aria-hidden="true">{badgeText(row.unread)}</span></span>}
         {bulk?.active && <ConversationBulkCheck checked={bulk.checked(connection, conversation)}/>}
@@ -553,8 +562,7 @@ function BotRow({ host, bot, count, showHost, onBrowse, onNew, onSettings }: {
   return (
     <div className="mh-bot-row">
       <button type="button" className="mh-bot-main" aria-label={t('查看 {0} 的全部对话', bot.name)} onClick={() => onBrowse(host.id, bot.id)}>{body}</button>
-      {/* A dispatcher Bot keeps exactly one conversation. */}
-      {!isDispatcher(bot) && <button
+      <button
         type="button"
         className="mh-new-chat"
         aria-label={t('与 {0} 新建对话', bot.name)}
@@ -562,7 +570,7 @@ function BotRow({ host, bot, count, showHost, onBrowse, onNew, onSettings }: {
       >
         <PlusIcon size={16} />
         <span>{t('新对话')}</span>
-      </button>}
+      </button>
       <button type="button" className="mh-bot-settings" data-bot-settings={bot.id} data-settings-host={host.id} aria-label={t('{0} 的 Bot 设置', bot.name)} title={t('Bot 设置')} onClick={event => { event.currentTarget.focus(); onSettings(host.id, bot.id); }}><Settings size={20} /></button>
     </div>
   );

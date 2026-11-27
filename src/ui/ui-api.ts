@@ -76,7 +76,7 @@ function applyUiConfigPatch(
     ? applied.engine as InstanceConfig["engine"]
     : configEngine(config);
   if (targetEngine === "pi" && config.role === "dispatcher") {
-    throw new UiConfigValidationError("Pi is available for ordinary Bots, not Chief of Staff Bots.");
+    throw new UiConfigValidationError("Pi is available for ordinary Bots, not Superagent Bots.");
   }
   if (typeof applied.engine === "string") {
     applyEngineSelection(config, targetEngine);

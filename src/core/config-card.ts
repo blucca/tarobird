@@ -281,7 +281,7 @@ async function applyEngineAction(stateDir: string, value: string | undefined, lo
   const selected = value as InstanceEngine;
   const cfg = await loadInstanceConfig(stateDir);
   if (selected === "pi" && cfg.role === "dispatcher") {
-    return locale === "en" ? "Pi is available for ordinary Bots, not Chief of Staff Bots." : "Pi 仅用于普通 Bot，不支持幕僚长。";
+    return locale === "en" ? "Pi is available for ordinary Bots, not Superagent Bots." : "Pi 仅用于普通 Bot，不支持幕僚长。";
   }
   const engineChanged = cfg.engine !== selected;
   let resetSessionBindings = false;

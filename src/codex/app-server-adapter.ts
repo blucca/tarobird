@@ -1027,20 +1027,21 @@ export class CodexAppServerAdapter implements CodexAdapter {
         if (requestOptions.signal.aborted) throw new Error("quota_cancelled");
         return this.request(method, params, { ...requestOptions, idleBlocking: false, destroyOnTimeout: false });
       },
-      captureScope: () => this.quotaScope().revision, proofKey: this.quotaCache.proofKey,
+      captureScope: () => this.quotaScope().revision, proofKey: options.accountProofKey ?? this.quotaCache.proofKey,
       signal: options.signal, timeoutMs: Math.min(options.timeoutMs ?? 7000, 7000),
     });
     const after = this.quotaScope();
     if (after.revision !== scope.revision) return this.quotaCache.failure(after, "auth_changed");
-    return this.quotaCache.store(after, result);
+    return this.quotaCache.store(after, result, options.accountProofKey);
   }
 
-  /** Only the quota-owned helper calls this. Its caller owns termination and waits for actual close. */
+  /** Only the quota-owned helper calls this. Its caller owns termination and waits for actual close.
+   * Uses read-only, plugin-disabled args (matching Orca's short-lived probe) so startup stays fast and clean. */
   async readAccountQuotaFromOwnedProcess(options: {
     signal: AbortSignal; timeoutMs: number; proofKey: Uint8Array; captureScope: () => string; remainingMs: () => number;
   }) {
     if (options.signal.aborted) throw new Error("quota_cancelled");
-    await this.startChildAndInitialize(["app-server"]);
+    await this.startChildAndInitialize(["-c", "approval_policy=never", "-c", "features.plugins=false", "app-server"]);
     if (options.signal.aborted) throw new Error("quota_cancelled");
     return readCodexAccountQuota({ request: (method, params, requestOptions) => this.request(method, params, { ...requestOptions, idleBlocking: false, destroyOnTimeout: false }),
       // The first account/updated is startup discovery, later events fence a login/workspace switch.

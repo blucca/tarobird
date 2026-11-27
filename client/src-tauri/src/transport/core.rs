@@ -30,6 +30,15 @@ const MAX_PROOF: usize = 4096;
 pub const MAX_FRAME: usize = 1024 * 1024;
 
 #[derive(Debug)]
+struct PinMismatchError;
+impl std::fmt::Display for PinMismatchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("tls_identity_mismatch")
+    }
+}
+impl std::error::Error for PinMismatchError {}
+
+#[derive(Debug)]
 struct PinnedVerifier {
     normal: Arc<dyn ServerCertVerifier>,
     leaf: [u8; 32],
@@ -48,7 +57,7 @@ impl ServerCertVerifier for PinnedVerifier {
             .verify_server_cert(leaf, chain, name, ocsp, now)?;
         if Sha256::digest(leaf.as_ref()).as_slice() != self.leaf {
             return Err(rustls::Error::InvalidCertificate(
-                rustls::CertificateError::ApplicationVerificationFailure,
+                rustls::CertificateError::Other(rustls::OtherError(Arc::new(PinMismatchError))),
             ));
         }
         Ok(verified)
@@ -295,7 +304,7 @@ impl Network {
             .timeout(Duration::from_secs(5))
             .send()
             .await
-            .map_err(|_| "tls_connection_failed")?;
+            .map_err(|err| classify_reqwest_error(&err, "tls_connection_failed"))?;
         if response.status() != reqwest::StatusCode::OK {
             return Err("hub_tls_identity_required".into());
         }
@@ -352,7 +361,7 @@ pub async fn websocket(
         .timeout(Duration::from_secs(5))
         .send()
         .await
-        .map_err(|_| "native_socket_failed")?;
+        .map_err(|err| classify_reqwest_error(&err, "native_socket_failed"))?;
     let headers = response.headers();
     if response.status() != reqwest::StatusCode::SWITCHING_PROTOCOLS
         || headers
@@ -383,4 +392,142 @@ pub async fn websocket(
         .max_message_size(Some(MAX_FRAME))
         .max_frame_size(Some(MAX_FRAME));
     Ok(WebSocketStream::from_raw_socket(stream, Role::Client, Some(config)).await)
+}
+
+fn classify_error_chain(
+    root: &(dyn std::error::Error + 'static),
+    is_timeout: bool,
+    fallback: &'static str,
+) -> &'static str {
+    let mut pin_mismatch = false;
+    let mut tls_untrusted = false;
+    let mut connection_refused = false;
+    let mut dns_failed = false;
+    let mut timed_out = is_timeout;
+    let mut host_unreachable = false;
+
+    let mut stack: Vec<&(dyn std::error::Error + 'static)> = vec![root];
+    let mut visited = 0;
+    while let Some(err) = stack.pop() {
+        if visited >= 32 {
+            break;
+        }
+        visited += 1;
+        if err.downcast_ref::<PinMismatchError>().is_some() {
+            pin_mismatch = true;
+        }
+        if let Some(tls_err) = err.downcast_ref::<rustls::Error>() {
+            match tls_err {
+                rustls::Error::InvalidCertificate(rustls::CertificateError::Other(other))
+                    if other.0.downcast_ref::<PinMismatchError>().is_some() =>
+                {
+                    pin_mismatch = true;
+                }
+                rustls::Error::InvalidCertificate(_) => tls_untrusted = true,
+                rustls::Error::AlertReceived(alert)
+                    if matches!(
+                        alert,
+                        rustls::AlertDescription::BadCertificate
+                            | rustls::AlertDescription::UnsupportedCertificate
+                            | rustls::AlertDescription::CertificateRevoked
+                            | rustls::AlertDescription::CertificateExpired
+                            | rustls::AlertDescription::CertificateUnknown
+                            | rustls::AlertDescription::UnknownCA
+                    ) =>
+                {
+                    tls_untrusted = true;
+                }
+                _ => {}
+            }
+        }
+        if let Some(io_err) = err.downcast_ref::<std::io::Error>() {
+            match io_err.kind() {
+                std::io::ErrorKind::ConnectionRefused => connection_refused = true,
+                std::io::ErrorKind::TimedOut => timed_out = true,
+                std::io::ErrorKind::HostUnreachable
+                | std::io::ErrorKind::NetworkUnreachable
+                | std::io::ErrorKind::NetworkDown => host_unreachable = true,
+                _ => {}
+            }
+            // `io::Error::source()` skips the wrapped custom error itself and returns
+            // its inner source; push `get_ref()` explicitly so `tokio-rustls` errors
+            // wrapped in `io::Error::new(InvalidData, rustls::Error)` are classified.
+            if let Some(inner) = io_err.get_ref() {
+                stack.push(inner);
+            }
+        }
+        let lower = err.to_string().to_ascii_lowercase();
+        if lower.contains("dns error")
+            || lower.contains("failed to lookup address information")
+            || lower.contains("no such host")
+            || lower.contains("name or service not known")
+            || lower.contains("nodename nor servname")
+            || lower.contains("temporary failure in name resolution")
+        {
+            dns_failed = true;
+        }
+        if let Some(source) = err.source() {
+            stack.push(source);
+        }
+    }
+
+    if pin_mismatch {
+        "tls_identity_mismatch"
+    } else if tls_untrusted {
+        "native_tls_untrusted"
+    } else if connection_refused {
+        "native_connection_refused"
+    } else if dns_failed {
+        "native_dns_failed"
+    } else if timed_out {
+        "native_request_timeout"
+    } else if host_unreachable {
+        "native_host_unreachable"
+    } else {
+        fallback
+    }
+}
+
+pub fn classify_reqwest_error(error: &reqwest::Error, fallback: &'static str) -> &'static str {
+    classify_error_chain(error, error.is_timeout(), fallback)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io;
+
+    #[test]
+    fn classify_error_chain_maps_network_and_tls_causes_to_allowlisted_codes() {
+        let refused = io::Error::new(io::ErrorKind::ConnectionRefused, "connection refused");
+        assert_eq!(classify_error_chain(&refused, false, "native_request_failed"), "native_connection_refused");
+
+        let timed_out = io::Error::new(io::ErrorKind::TimedOut, "timed out");
+        assert_eq!(classify_error_chain(&timed_out, false, "native_request_failed"), "native_request_timeout");
+        assert_eq!(classify_error_chain(&io::Error::other("request failed"), true, "native_request_failed"), "native_request_timeout");
+
+        let host_unreach = io::Error::new(io::ErrorKind::HostUnreachable, "no route to host");
+        assert_eq!(classify_error_chain(&host_unreach, false, "native_request_failed"), "native_host_unreachable");
+
+        let net_unreach = io::Error::new(io::ErrorKind::NetworkUnreachable, "network is unreachable");
+        assert_eq!(classify_error_chain(&net_unreach, false, "native_request_failed"), "native_host_unreachable");
+
+        let dns = io::Error::other("dns error: failed to lookup address information: nodename nor servname provided, or not known");
+        assert_eq!(classify_error_chain(&dns, false, "tls_connection_failed"), "native_dns_failed");
+
+        let untrusted = io::Error::new(
+            io::ErrorKind::InvalidData,
+            rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer),
+        );
+        assert_eq!(classify_error_chain(&untrusted, false, "tls_connection_failed"), "native_tls_untrusted");
+
+        let pin_mismatch = io::Error::new(
+            io::ErrorKind::InvalidData,
+            rustls::Error::InvalidCertificate(rustls::CertificateError::Other(rustls::OtherError(Arc::new(PinMismatchError)))),
+        );
+        assert_eq!(classify_error_chain(&pin_mismatch, false, "native_request_failed"), "tls_identity_mismatch");
+
+        let unknown = io::Error::other("something else");
+        assert_eq!(classify_error_chain(&unknown, false, "native_request_failed"), "native_request_failed");
+    }
 }

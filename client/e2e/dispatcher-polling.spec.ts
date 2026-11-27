@@ -17,7 +17,7 @@ async function pair(page: Page, hub: HubServer) {
   await page.getByLabel("配对码", { exact: true }).waitFor({ state: "hidden" });
 }
 // Older reads (no summary) still count, so each assertion isolates one behaviour.
-const isList = (url: string) => /\/api\/bots\/disp\/tickets(\?summary=1(&capabilities=1)?)?$/.test(url);
+const isList = (url: string) => /\/api\/bots\/disp\/tickets(\?summary=1(&capabilities=1)?(&conversationId=[^&]+)?)?$/.test(url);
 const isAvatar = (url: string) => /\/api\/bots\/disp\/tickets\?open=1(&summary=1)?$/.test(url);
 const avatar = (page: Page) => page.locator('.bot-tree[data-bot-id="disp"] .bot-identity > .avatar');
 

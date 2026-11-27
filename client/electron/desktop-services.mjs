@@ -22,7 +22,7 @@ const schemas = {
   desktop_context_menu: z.object({ items: z.array(z.object({ item: z.enum([...Object.keys(menus), 'Separator']), text: z.string().max(80).optional() }).strict()).min(1).max(12), point }).strict(),
   desktop_open_url: z.object({ url: z.string().max(8192) }).strict(),
   desktop_launch_links: empty, desktop_autostart_get: empty, desktop_autostart_set: enabled,
-  unread_count: z.object({ count: z.number().int().min(0).max(1000000) }).strict(), desktop_notification_settings: empty,
+  unread_count: z.object({ count: z.number().int().min(0).max(1000000) }).strict(), desktop_notification_settings: empty, desktop_network_settings: empty,
 };
 
 export function externalURL(raw) {
@@ -177,6 +177,10 @@ export class DesktopServices {
           if (await shell.openPath('/System/Applications/System Settings.app')) throw new Error('notification_settings_unavailable');
         } else if (this.platform === 'win32') await shell.openExternal('ms-settings:notifications');
         else throw new Error('notification_settings_unavailable');
+        return null;
+      case 'desktop_network_settings':
+        if (this.platform === 'win32') await shell.openExternal('ms-settings:network-status');
+        else throw new Error('network_settings_unavailable');
         return null;
       default: throw new Error('unknown_desktop_command');
     }

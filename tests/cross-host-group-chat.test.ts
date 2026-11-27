@@ -9,8 +9,10 @@ import { conversationSchema, idSchema } from "../src/client-protocol/index.js";
 import { groupDiscussionRunSchema } from "../src/client-protocol/group-discussion.js";
 import { CROSS_HOST_GROUPS_CAPABILITY, groupMembersStateSchema } from "../src/client-protocol/group-members.js";
 import { createCoreServiceRuntime } from "../src/core/runtime.js";
+import { buildCoreConversationKey } from "../src/core/message-normalizer.js";
 import type { CoreBridgeLike } from "../src/core/types.js";
 import { attachGateway } from "../src/gateway/service.js";
+import { SessionStore } from "../src/state/session-store.js";
 import { deviceProof, hashSecret, HubAuth } from "../src/hub/auth.js";
 import { desktopTls } from "../src/hub/desktop-tls.js";
 import { groupMailSignaturePayload, HubCrossHostGroups } from "../src/hub/group-cross-host.js";
@@ -981,7 +983,7 @@ describe("Cross-host group chat, session-based members & Orca-style group settin
     expect((await clobberRes.json() as { error: string }).error).toBe("group_designated_client_update_required");
     expect((await hub.store.groupSettings("owner", group.id)).policy.mode).toBe("designated");
 
-    // 1.6.0 WS send WITHOUT mentions (with 1.6.0 reply guard) -> rejected with update-required & human-readable message!
+    // 1.6.0 WS send WITHOUT mentions (with 1.6.0 reply guard, even spoofing designatedCapable: true) -> rejected with update-required & human-readable message!
     legacy.ws.send(JSON.stringify({
       v: 1,
       type: "message.send",
@@ -990,6 +992,7 @@ describe("Cross-host group chat, session-based members & Orca-style group settin
       text: "unmentioned from 1.6.0",
       attachments: [],
       groupReplyGuard: { mode: "mentions", revision: parsedView.settings.revision },
+      designatedCapable: true,
     }));
     const errFrame = await waitFor(
       () => legacy.frames.find((f) => f.type === "error" && f.requestId === "v160_unmentioned"),
@@ -1274,5 +1277,151 @@ describe("Cross-host group chat, session-based members & Orca-style group settin
     restartedOffline.hub.crossHostGroups.registerPeer({ hostId: "peer_b", hostName: "studio-b", publicKey: b.hub.auth.publicKey, url: b.hub.url });
     const retried = await restartedOffline.hub.crossHostGroups.reconcileOrRetryQuestion("owner", group.id, qidOffline);
     expect(retried.status).toBe("delivered");
+  }, 20_000);
+
+  it("runs session-bound group messages in the member's single-chat saved workspace folder when it differs from the group conversation's workspace folder", async () => {
+    const { hub } = await startHub("macmini");
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "tb-group-ws-"));
+    dirs.push(root);
+    const bot1Dir = path.join(root, "bot1-state");
+    const bot2Dir = path.join(root, "bot2-state");
+    const wsDefault = path.join(root, "ws-default");
+    const wsSession = path.join(root, "ws-session");
+    const wsGroup = path.join(root, "ws-group");
+    await Promise.all([
+      fs.mkdir(bot1Dir, { recursive: true }),
+      fs.mkdir(bot2Dir, { recursive: true }),
+      fs.mkdir(wsDefault, { recursive: true }),
+      fs.mkdir(wsSession, { recursive: true }),
+      fs.mkdir(wsGroup, { recursive: true }),
+    ]);
+    await fs.writeFile(path.join(bot1Dir, "config.json"), JSON.stringify({ engine: "codex", workspacePath: wsDefault }, null, 2));
+    await fs.writeFile(path.join(bot2Dir, "config.json"), JSON.stringify({ engine: "codex", workspacePath: wsDefault }, null, 2));
+
+    const secret1 = randomBytes(24).toString("base64url");
+    const secret2 = randomBytes(24).toString("base64url");
+    await hub.store.db.run(
+      "INSERT INTO bots(id,name,engine,secret_hash,online,workspace_path) VALUES('bot_bound','Bound Bot','codex',?,0,?),('bot_plain','Plain Bot','codex',?,0,?)",
+      [hashSecret(secret1), wsDefault, hashSecret(secret2), wsDefault],
+    );
+
+    const boundCalls: Array<{ conversationKey?: string; workspaceOverride?: string; text: string }> = [];
+    const plainCalls: Array<{ conversationKey?: string; workspaceOverride?: string; text: string }> = [];
+    const makeBridge = (calls: typeof boundCalls): CoreBridgeLike => ({
+      checkAccess: async () => ({ kind: "allow" }),
+      handleAuthorizedMessage: async (input) => {
+        calls.push({ conversationKey: input.conversationKey, workspaceOverride: input.workspaceOverride, text: input.text });
+        return { text: `ok:${path.basename(input.workspaceOverride ?? "")}` };
+      },
+    });
+
+    const instanceWsUrl = `${(hub.instanceUrl || hub.url).replace(/^http/, "ws")}/instance`;
+    const gw1 = await attachGateway({
+      url: instanceWsUrl,
+      botId: "bot_bound",
+      secret: secret1,
+      stateDir: bot1Dir,
+      engine: "codex",
+      bridge: makeBridge(boundCalls),
+      runtime: createCoreServiceRuntime(),
+      recoverDeliveries: false,
+    });
+    gateways.push(gw1);
+    const gw2 = await attachGateway({
+      url: instanceWsUrl,
+      botId: "bot_plain",
+      secret: secret2,
+      stateDir: bot2Dir,
+      engine: "codex",
+      bridge: makeBridge(plainCalls),
+      runtime: createCoreServiceRuntime(),
+      recoverDeliveries: false,
+    });
+    gateways.push(gw2);
+
+    await waitFor(
+      async () => await hub.store.bots("owner"),
+      (bots) => bots.find((b) => b.id === "bot_bound")?.online === 1 && bots.find((b) => b.id === "bot_plain")?.online === 1,
+    );
+
+    // 1. Create single-chat session pinned to wsSession, and an unpinned single-chat session (uses bot default wsDefault).
+    const pinnedDirect = await hub.store.createConversation("owner", ["bot_bound"], "Bound Session Chat", "dir_pinned", {
+      type: "direct",
+      workspacePath: wsSession,
+    });
+    const unpinnedDirect = await hub.store.createConversation("owner", ["bot_bound"], "Default Workspace Chat", "dir_unpinned", {
+      type: "direct",
+    });
+
+    // 2. Create group conversation pinned to a DIFFERENT folder (wsGroup).
+    const group = await hub.store.createConversation("owner", ["bot_plain"], "Group With Own Folder", "grp_ws", {
+      type: "group",
+      workspacePath: wsGroup,
+    });
+    expect(group.workspacePath).toBe(wsGroup);
+
+    // Seed a stale group-level resume entry in bot_bound's session.json pointing at wsGroup
+    // to prove the bound single-chat session's saved workspace STILL wins over stale group state!
+    const bot1Sessions = new SessionStore(path.join(bot1Dir, "session.json"));
+    await bot1Sessions.upsert({
+      telegramChatId: 1001,
+      conversationKey: buildCoreConversationKey(group.id),
+      codexSessionId: "stale-group-thread",
+      resume: { sessionId: "stale-group-thread", workspacePath: wsGroup, dirName: "ws-group" },
+      status: "idle",
+      updatedAt: new Date().toISOString(),
+    });
+
+    // 3. Join bot_bound to the group bound to pinnedDirect (whose saved workspace is wsSession != wsGroup).
+    await hub.crossHostGroups.addMember("owner", group.id, {
+      botId: "bot_bound",
+      sessionId: pinnedDirect.id,
+      historyVisibility: { kind: "none" },
+    });
+
+    // Send group message mentioning @bot_bound -> MUST run in wsSession (NOT wsGroup!) under pinnedDirect's session key!
+    await hub.store.sendMessage("owner", {
+      conversationId: group.id,
+      clientMsgId: "grp_ws_bound_1",
+      text: "@bot_bound check bound workspace",
+      attachments: [],
+      mentions: ["bot_bound"],
+    });
+    await waitFor(() => boundCalls.length, (n) => n >= 1);
+    expect(boundCalls[0]).toMatchObject({
+      conversationKey: buildCoreConversationKey(pinnedDirect.id),
+      workspaceOverride: wsSession,
+    });
+
+    // 4. Switch bot_bound's group session to unpinnedDirect (no pinned workspace -> Bot's default wsDefault != wsGroup).
+    await hub.crossHostGroups.switchMemberSession("owner", group.id, "local:bot_bound", {
+      sessionId: unpinnedDirect.id,
+    });
+    await hub.store.sendMessage("owner", {
+      conversationId: group.id,
+      clientMsgId: "grp_ws_unpinned_2",
+      text: "@bot_bound check unpinned single-chat workspace",
+      attachments: [],
+      mentions: ["bot_bound"],
+    });
+    await waitFor(() => boundCalls.length, (n) => n >= 2);
+    expect(boundCalls[1]).toMatchObject({
+      conversationKey: buildCoreConversationKey(unpinnedDirect.id),
+      workspaceOverride: wsDefault,
+    });
+
+    // 5. Ordinary non-session-bound Bot (bot_plain) in the same group STILL uses the group's workspace folder (wsGroup).
+    await hub.store.sendMessage("owner", {
+      conversationId: group.id,
+      clientMsgId: "grp_ws_plain_3",
+      text: "@bot_plain check group workspace",
+      attachments: [],
+      mentions: ["bot_plain"],
+    });
+    await waitFor(() => plainCalls.length, (n) => n >= 1);
+    expect(plainCalls[0]).toMatchObject({
+      conversationKey: buildCoreConversationKey(group.id),
+      workspaceOverride: wsGroup,
+    });
   }, 20_000);
 });

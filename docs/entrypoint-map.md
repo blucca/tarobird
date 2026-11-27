@@ -2,7 +2,7 @@
 
 [Pi native engine](client/pi-engine.md) maps the native RPC adapter, shared
 discovery, provider/model selection, session controls and permission bridge.
-Pi is available for ordinary Bots, not Chancellor creation or conversion.
+Pi is available for ordinary Bots, not Superagent creation or conversion.
 Keep native session identity and provider/model pairs intact, and distinguish
 isolated RPC/browser evidence from installed-device acceptance. Native process,
 bridge, commands and state ownership are documented in the linked guide;
@@ -1156,7 +1156,7 @@ and the existing network/run/delete suites listed in that audit.
   in `bot-conversation-folds.css`; browser coverage is `bot-conversation-folds`
   and `bot-context-menu` in Chromium/WebKit. CLI has no corresponding local
   presentation surface. [Behavior and verification](client/bot-conversation-folds-2026-10-24.md).
-  Bot rows reserve one trailing action column, including Chancellor rows without
+  Bot rows reserve one trailing action column, including Superagent rows without
   a create button; source-host badges precede the count. Bot/group section headings
   have no total count.
   See [count alignment](client/sidebar-count-alignment-2026-11-02.md).
@@ -5414,7 +5414,7 @@ for shared-path measurements, lifecycle checks and unresolved frame-timing limit
 
 ## Dispatcher Bots (#110)
 
-Shown in the App as 幕僚长 / Chancellor. A dispatcher Bot is chosen at creation (`createBotSchema.role`), keeps one
+Shown in the App as 幕僚长 / Superagent. A dispatcher Bot is chosen at creation (`createBotSchema.role`), keeps one
 direct conversation and runs tickets directly on installed engine CLIs through
 hidden per-engine worker Bots (`BotManager.dispatchWorker`, `role: "worker"`)
 in hidden worker conversations. `hub/dispatch.ts` owns settings, the ticket ledger, dispatch,
@@ -5486,8 +5486,8 @@ approval gate or automatic preference store. See the [1.0.126 preflight](client/
 Evidence-led selection adds read-only `tickets capabilities --engine E [--match TEXT] [--offset N]` through the shared owner/Bot Hub route. User-scope metadata is partial/unverified; no worker creation, model-discovery process, automatic ranking or outcome memory. Acceptance criteria and quality-failure reassessment stay in the bounded per-turn contract. See [selection change and paired real-ticket evidence](client/dispatcher-evidence-selection-2026-11-02.md). Additional regressions: `dispatch-capabilities`, `dispatch-engine-capabilities`, `bot-capabilities`, `dispatcher-selection-contract`.
 Execution-time assistance adds `tickets assist` / `assist-status` for the authenticated current worker attempt and `tickets assists` for owner/dispatcher readback. `hub/dispatch-assistance.ts` defines bounded helper inputs/outcomes; `hub/dispatch.ts` owns parent yield, helper settlement and same-session continuation in the existing ticket slot. Schema 24 persists the separate ledger/allowance without changing strict App ticket/attempt markers. Gateway identifies worker turns from current Hub-owned `conversation.ticket`, not `config.role` (which only persists dispatcher). See [worker assistance and verification](client/dispatcher-worker-assistance-2026-11-02.md). New regressions: `hub-dispatch-assist`, `dispatch-assistance-boundaries`, `host-cli-assistance`, `gateway-worker-assistance-context`, `gateway-worker-assistance-lifecycle`.
 `DispatcherSettings` keeps edits local until explicit save, displays Host read/save status, and guards close/reload against unsaved draft loss. Ask/auto labels describe the existing policy. See [settings save feedback](client/dispatcher-settings-save-feedback-2026-11-03.md); browser regression: `dispatcher-settings-allowlist`.
-`DispatcherRoutingHelp` explains current model-selection tendencies beside the New Bot role checkbox and existing Chancellor settings; native hover plus touch/keyboard dialog access share localized copy. It changes no routing policy or CLI behavior. See [routing help](client/dispatcher-routing-help-2026-11-02.md).
-A same-source six-task [DeepSeek Chancellor follow-up](client/dispatcher-deepseek-coordinator-comparison-2026-11-02.md) verifies autonomous Claude/GPT selection, while retaining a missed protocol-design defect; completed execution is not accepted result quality.
+`DispatcherRoutingHelp` explains current model-selection tendencies beside the New Bot role checkbox and existing Superagent settings; native hover plus touch/keyboard dialog access share localized copy. It changes no routing policy or CLI behavior. See [routing help](client/dispatcher-routing-help-2026-11-02.md).
+A same-source six-task [DeepSeek Superagent follow-up](client/dispatcher-deepseek-coordinator-comparison-2026-11-02.md) verifies autonomous Claude/GPT selection, while retaining a missed protocol-design defect; completed execution is not accepted result quality.
 The [1.0.127 release audit](client/dispatcher-release-audit-2026-11-02.md) covers help/pause settlement and bounded `tickets assists` helper-result/continuation-delivery readback. Readback never resumes cancelled work; accepted delivery is not answer acceptance.
 Regressions: `hub-dispatch`, `hub-dispatch-efficiency`, `hub-dispatch-health`, `hub-dispatch-auth`, `host-cli-tickets`, `gateway-dispatch`,
 `gateway-dispatcher-context`, `client-dispatcher-settings`, `engine-override`,

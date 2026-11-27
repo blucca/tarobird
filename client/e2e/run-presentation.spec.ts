@@ -252,10 +252,11 @@ for (const phone of [false, true]) test(`${engine} ${phone ? "phone" : "desktop"
     const last = page.locator(".native-run").last(); await expect(last).toContainText("执行慢速任务");
     await last.getByRole("button", { name: "停止", exact: true }).click();
     const stopWarning = page.getByRole("dialog", { name: "停止当前消息？", exact: true });
-    if (engine === "claude") {
-      // Only a Claude stop first reads the worker's native tasks. This worker
-      // cannot list them, so what the stop reaches is unverified: nothing is
-      // sent, and the card does not wait, until the user confirms.
+    if (engine === "claude" || engine === "deepseek") {
+      // Engines whose foreground stop reaches background subagents first read
+      // the worker's native tasks. This worker cannot list them, so what the
+      // stop reaches is unverified: nothing is sent, and the card does not
+      // wait, until the user confirms.
       await expect(stopWarning).toContainText("后台任务列表暂时无法核对");
       await expect(last.locator(".run-stop")).toHaveText("停止"); await expect(last).toHaveAttribute("data-phase", "working");
       expect(input.abortSignal?.aborted).toBe(false);
@@ -268,4 +269,126 @@ for (const phone of [false, true]) test(`${engine} ${phone ? "phone" : "desktop"
     await expect(page.locator(".message.user [data-reply-state=stopped]")).toHaveText("已停止");
     expect(errors).toEqual([]);
   } finally { finish?.(); await observerContext.close(); await context.close(); await gateway?.disconnect(); await hub.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+test("to-do plan panel handles reconnect collapse, settled badges, a11y, truncation, focus ring, and system dark mode", async ({ browser }) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "run-plan-ui-")), stateDir = path.join(root, "bot"); await mkdir(stateDir);
+  await writeFile(path.join(stateDir, "config.json"), JSON.stringify({ engine: "antigravity", locale: "zh" }));
+  const hub = await HubServer.start({ stateDir: path.join(root, "hub"), clientDir: path.resolve("dist") });
+  const context = await browser.newContext({ viewport: { width: 1280, height: 860 }, colorScheme: "dark" });
+  const page = await context.newPage(), errors: string[] = [];
+  page.on("pageerror", error => errors.push(error.message));
+  let gateway: GatewayChannel | undefined, finish: (() => void) | undefined;
+  let input: Parameters<CoreBridgeLike["handleAuthorizedMessage"]>[0] | undefined;
+  try {
+    const secret = randomBytes(32).toString("base64url");
+    await hub.store.db.run("INSERT INTO bots(id,name,secret_hash,engine) VALUES('alpha','清单助手',?,'antigravity')", [hashSecret(secret)]);
+    const chat = await hub.store.createConversation("owner", ["alpha"], "清单验收", "direct");
+    gateway = await attachGateway({ stateDir, url: hub.instanceUrl.replace("http", "ws") + "/instance", secret, botId: "alpha", engine: "antigravity", runtime: createCoreServiceRuntime(), bridge: {
+      handleAuthorizedMessage: async value => { input = value; await new Promise<void>(resolve => { finish = resolve; value.abortSignal?.addEventListener("abort", resolve, { once: true }); }); return { text: "任务完成。" }; },
+    } });
+    await pair(page, hub); await enterMobileChat(page, chat.title);
+    await page.getByRole("textbox", { name: "消息", exact: true }).fill("执行多步计划");
+    await page.getByRole("button", { name: "发送消息", exact: true }).click();
+    await expect.poll(() => !!input).toBe(true);
+    const emit = async (event: Parameters<NonNullable<NonNullable<typeof input>["onEngineEvent"]>>[0]) => { await input!.onEngineEvent?.(event); };
+
+    // 1. Live active plan: expanded by default, shows 进行中 badge, sr-only statuses for completed/pending.
+    await emit({
+      type: "tool_use",
+      toolName: "TodoWrite",
+      toolUseId: "plan_1",
+      toolInput: {
+        todos: [
+          { content: "读取配置", status: "completed" },
+          { content: "修改适配层", status: "in_progress" },
+          { content: "运行测试", status: "pending" },
+        ],
+      },
+    });
+    const planCard = page.locator(".run-plan-card");
+    const header = planCard.locator(".run-plan-header");
+    await expect(planCard).toBeVisible();
+    await expect(header).toHaveAttribute("aria-expanded", "true");
+    await expect(planCard.locator(".run-plan-badge")).toHaveText("进行中");
+    await expect(planCard.locator(".run-plan-item.is-completed .run-plan-sr-only")).toHaveText("已完成");
+    await expect(planCard.locator(".run-plan-item.is-pending .run-plan-sr-only")).toHaveText("待执行");
+
+    // 2. Keyboard focus ring stays inset inside overflow:hidden card (outline-offset: -2px).
+    await page.locator(".native-run").focus();
+    for (let i = 0; i < 4; i++) {
+      if (await header.evaluate((node) => node === document.activeElement)) break;
+      await page.keyboard.press("Tab");
+    }
+    await expect(header).toBeFocused();
+    const headerFocus = await header.evaluate((node) => {
+      const s = getComputedStyle(node);
+      return { focusVisible: node.matches(":focus-visible"), outlineOffset: s.outlineOffset };
+    });
+    expect(headerFocus).toEqual({ focusVisible: true, outlineOffset: "-2px" });
+
+    // 3. User collapses panel; brief disconnect + reconnect must NOT forcibly re-expand it.
+    await header.click();
+    await expect(header).toHaveAttribute("aria-expanded", "false");
+    await gateway.transport.disconnect();
+    await expect(page.locator(".native-run-status")).toContainText("连接中断，当前状态待确认");
+    await gateway.transport.connect();
+    await expect(page.locator(".native-run-status")).not.toContainText("连接中断");
+    await expect(header).toHaveAttribute("aria-expanded", "false");
+
+    // 4. 55-item plan with 50 completed and 5 pending must show 50/55 and NOT is-complete / 全部完成.
+    const todos55 = Array.from({ length: 55 }, (_, i) => ({
+      content: `步骤 ${i + 1}`,
+      status: i < 50 ? "completed" : i === 50 ? "in_progress" : "pending",
+    }));
+    await emit({ type: "tool_use", toolName: "TodoWrite", toolUseId: "plan_1", toolInput: { todos: todos55 } });
+    await expect(planCard.locator(".run-plan-count")).toHaveText("50/55");
+    await expect(planCard).not.toHaveClass(/is-complete/);
+    await expect(planCard).not.toContainText("全部完成");
+
+    // 5. Turn settles while an item is still in_progress: expanding settled panel must NOT show 进行中 badge.
+    await emit({
+      type: "tool_use",
+      toolName: "TodoWrite",
+      toolUseId: "plan_1",
+      toolInput: {
+        todos: [
+          { content: "读取配置", status: "completed" },
+          { content: "收尾检查", status: "in_progress" },
+        ],
+      },
+    });
+    await expect(planCard.locator(".run-plan-count")).toHaveText("1/2");
+    finish!();
+    await expect(page.locator(".native-run-status")).toContainText("已完成");
+    await header.click();
+    await expect(header).toHaveAttribute("aria-expanded", "true");
+    await expect(planCard.locator(".run-plan-badge")).toHaveCount(0);
+    await expect(planCard.locator(".run-plan-item.is-in-progress .run-plan-sr-only")).toHaveText("执行中");
+
+    // 6. System Dark Mode completed plan uses high-contrast light green (#86efac), not light-mode #15803d.
+    const prevInput = input;
+    await page.getByRole("textbox", { name: "消息", exact: true }).fill("完成全部步骤");
+    await page.getByRole("button", { name: "发送消息", exact: true }).click();
+    await expect.poll(() => input !== prevInput).toBe(true);
+    await emit({
+      type: "tool_use",
+      toolName: "TodoWrite",
+      toolUseId: "plan_done",
+      toolInput: { todos: [{ content: "全部完成项", status: "completed" }] },
+    });
+    const doneCard = page.locator(".run-plan-card").last();
+    await expect(doneCard).toHaveClass(/is-complete/);
+    await page.evaluate(() => { document.documentElement.dataset.theme = "system"; });
+    const colors = await doneCard.evaluate((card) => {
+      const count = card.querySelector(".run-plan-count")!;
+      const marker = card.querySelector(".run-plan-item.is-completed .run-plan-marker")!;
+      return { countColor: getComputedStyle(count).color, markerColor: getComputedStyle(marker).color };
+    });
+    expect(colors.countColor).toBe("rgb(134, 239, 172)");
+    expect(colors.markerColor).toBe("rgb(134, 239, 172)");
+    finish!();
+    await expect(page.locator(".native-run-status").last()).toContainText("已完成");
+    expect(errors).toEqual([]);
+  } finally { finish?.(); await context.close(); await gateway?.disconnect(); await hub.close(); await rm(root, { recursive: true, force: true }); }
 });

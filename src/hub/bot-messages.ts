@@ -714,8 +714,8 @@ export class BotMessages {
     if (await this.memo(steeringDisabledKey(c.bot.id))) return "steering_disabled";
     const bot = await this.store.db.get<{ engine: string; role: string | null }>("SELECT engine,role FROM bots WHERE id=?", [c.bot.id]);
     if (!bot || !supportsBotMessageSteerEngine(bot.engine)) return "unsupported_engine";
-    // First version: a dispatcher's chats (and its internal workers) only queue.
-    if (bot.role === "dispatcher" || bot.role === "worker") return "unsupported_conversation";
+    // Internal ticket workers only queue; dispatchers follow ordinary Bot steering rules.
+    if (bot.role === "worker") return "unsupported_conversation";
     const conversation = await this.store.db.get<{ type: string; parent_id: string | null; ticket_json: string | null }>("SELECT type,parent_id,ticket_json FROM conversations WHERE id=?", [conversationId]);
     const members = await this.store.db.get<{ count: number }>("SELECT COUNT(*) AS count FROM conversation_members WHERE conversation_id=? AND member_type='bot'", [conversationId]);
     if (conversation?.type !== "direct" || conversation.parent_id || conversation.ticket_json || members?.count !== 1) return "unsupported_conversation";
@@ -966,8 +966,7 @@ export class BotMessages {
   private async steeringInTransaction(botId: string): Promise<BotMessageSteeringSnapshot> {
     const bot = await this.store.db.get<{ engine: string; role: string }>("SELECT engine,role FROM bots WHERE id=? AND deleted_at IS NULL AND role!='worker'", [botId]);
     if (!bot) throw new HubError("bot_not_found", 404);
-    // A dispatcher's chats only queue (hubSteerConditionsInTransaction): its switch would change nothing.
-    return { botId, allowed: !await this.memo(steeringDisabledKey(botId)), supported: supportsBotMessageSteerEngine(bot.engine) && bot.role !== "dispatcher" };
+    return { botId, allowed: !await this.memo(steeringDisabledKey(botId)), supported: supportsBotMessageSteerEngine(bot.engine) };
   }
   /** Receiving owner's switch "allow other Bots to steer this Bot" (default on). */
   /** `bot` is an ID or an exact unique name (IDs first); the snapshot names the ID. */

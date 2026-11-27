@@ -1679,6 +1679,11 @@ export class HubCrossHostGroups {
         return { blocked: false };
       }
       const member = this.mapMemberRow(row);
+      const sessionConv = await this.store.db.get<{ workspace_path: string | null }>(
+        "SELECT workspace_path FROM conversations WHERE id=?",
+        [member.sessionId],
+      );
+      const sessionWorkspacePath = sessionConv?.workspace_path?.trim() || undefined;
       const historyBackfilled = Boolean(row.history_backfilled);
       let contextMessages: Array<{ seq: number; authorName: string; text: string; createdAt: number }> = [];
       if (!historyBackfilled && member.historyVisibility.kind !== "none") {
@@ -1690,6 +1695,7 @@ export class HubCrossHostGroups {
           sessionId: member.sessionId,
           sessionTitle: member.sessionTitle,
           groupTitle: conversation.title,
+          ...(sessionWorkspacePath ? { workspacePath: sessionWorkspacePath } : {}),
           ...(contextMessages.length ? { contextMessages } : {}),
         },
         ...(!historyBackfilled && member.historyVisibility.kind !== "none"

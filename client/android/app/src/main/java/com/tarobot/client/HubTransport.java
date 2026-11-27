@@ -258,7 +258,7 @@ final class HubTransport implements AutoCloseable {
                 public void failed(Exception error) {
                     synchronized(HubTransport.this) {
                         if(slot.cancelled || slot.terminal) return;
-                        emit(slot,"error","error","native_socket_failed"); terminal(slot,1006,"",false);
+                        emit(slot,"error","error",HubTls.classifyError(error,"native_socket_failed")); terminal(slot,1006,"",false);
                     }
                     if(HubTls.trustFailure(error)) network.forget(origin,key,route);
                 }

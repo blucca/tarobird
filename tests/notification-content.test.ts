@@ -18,6 +18,11 @@ test("answers split into reply/file topics while approval and failure are attent
   expect(classifyNotification({ ...base, blocks: [run("interrupted")] })).toMatchObject({ kind: "error", incomplete: true, topics: ["needsAttention"] });
   expect(classifyNotification({ ...base, blocks: [run("working")] })).toBeUndefined();
   expect(classifyNotification({ ...base, authorType: "user" })).toBeUndefined();
+  // Host transcription cards are preparation bookkeeping, never a completed reply notice.
+  expect(classifyNotification({ ...base, status: "streaming", blocks: [{ type: "card", elements: [{ type: "markdown", text: "**正在转写音频…**" }], extra: { appTranscription: { version: 1, active: true, at: 1 } } }] })).toBeUndefined();
+  expect(classifyNotification({ ...base, status: "complete", blocks: [{ type: "card", elements: [{ type: "markdown", text: "**音频转写完成**" }, { type: "markdown", text: "你好" }], extra: { appTranscription: { version: 1, active: false, at: 1 } } }] })).toBeUndefined();
+  expect(classifyNotification({ ...base, status: "complete", blocks: [{ type: "card", elements: [{ type: "markdown", text: "**已停止转写**" }, { type: "markdown", text: "原录音仍保留在对话中。" }], extra: { appTranscription: { version: 1, active: false, at: 1 } } }] })).toBeUndefined();
+  expect(classifyNotification({ ...base, status: "error", blocks: [{ type: "card", elements: [{ type: "markdown", text: "**转写已中断**" }], extra: { appTranscription: { version: 1, active: false, at: 1 } } }] })).toBeUndefined();
 });
 
 test("a mixed reply is admitted when either applicable topic is on", () => {
