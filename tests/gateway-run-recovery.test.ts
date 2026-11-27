@@ -291,8 +291,11 @@ it("preserves nativeRunPlan with incremented revision when interrupting active f
     expect(cardStale.type === "card" ? cardStale.extra?.nativeRunPlan : undefined).toBeUndefined();
   } finally { await hub.close(); await rm(root, { recursive: true, force: true }); }
 });
+
 it.each([{ legacy: false, locale: "zh" as const }, { legacy: true, locale: "zh" as const }, { legacy: false, locale: "en" as const }])("settles orphan active transcription cards, unblocking clearMessages and group bot removal (%j)", async ({ legacy, locale }) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "transcription-recovery-"));
+  const hub = await HubServer.start({ stateDir: root });
+  try {
     for (const id of ["alpha", "beta"]) await hub.store.db.run("INSERT INTO bots(id,name,secret_hash) VALUES(?,?,?)", [id, id, hashSecret(randomBytes(32).toString("base64url"))]);
     const group = await hub.store.createConversation("owner", ["alpha", "beta"], "Voice group", "group");
     const add = async (id: string, pending: boolean, at: number, filename?: string) => {
@@ -310,10 +313,12 @@ it.each([{ legacy: false, locale: "zh" as const }, { legacy: true, locale: "zh" 
       const message = await hub.store.publishBotMessage("alpha", { conversationId: group.id, replyTo: input.message.id, blocks: [card], status: "streaming" });
       await hub.store.db.run("UPDATE messages SET created_at=? WHERE id=?", [at, message.id]);
       return { ...message, createdAt: at };
+    };
     const before = Date.now();
     const orphan = await add("old", false, before - 10, "meeting.m4a");
     const pending = await add("pending", true, before - 10);
     const current = await add("new", false, before);
+
     await hub.store.recoverOrphanRuns("alpha", before);
     const recovered = await hub.store.messageForUser("owner", orphan.id);
     expect(recovered.status).toBe("complete");
@@ -328,10 +333,12 @@ it.each([{ legacy: false, locale: "zh" as const }, { legacy: true, locale: "zh" 
     // Idempotent on repeat sweep.
     await hub.store.recoverOrphanRuns("alpha", before);
     expect(await hub.store.messageForUser("owner", orphan.id)).toEqual(recovered);
+
     // Does not override a completed foreground run's reply status.
     const done = await hub.store.publishBotMessage("alpha", { conversationId: group.id, replyTo: orphan.replyTo, blocks: [block("done", "completed_elsewhere")] });
     const source = await hub.store.messageForUser("owner", orphan.replyTo!);
     expect(userReplyStatuses([source, done, recovered], group.id, new Set(["alpha"])).get(source.id)?.[0]?.state).toBe("done");
+
     // Once the remaining deliveries/transcriptions settle, clearMessages and bot removal succeed.
     await hub.store.db.run("UPDATE deliveries SET status='accepted' WHERE message_id=?", [pending.replyTo!]);
     await hub.store.recoverOrphanRuns("alpha", before + 1);
@@ -339,8 +346,14 @@ it.each([{ legacy: false, locale: "zh" as const }, { legacy: true, locale: "zh" 
     expect(plan.throughId).toBeDefined();
     await expect(hub.store.clearMessages("owner", group.id, { throughId: plan.throughId! })).resolves.toMatchObject({ remaining: 0 });
     await expect(hub.store.updateGroup("owner", group.id, { title: "Voice group", botIds: ["beta"], expectedTitle: "Voice group", expectedBotIds: ["alpha", "beta"] })).resolves.toBeDefined();
+  } finally { await hub.close(); await rm(root, { recursive: true, force: true }); }
+});
+
 it("deleting a Bot cleanly settles its active transcription cards", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "transcription-bot-delete-"));
+  const hub = await HubServer.start({ stateDir: root });
+  try {
+    await hub.store.db.run("INSERT INTO bots(id,name,secret_hash) VALUES('alpha','Alpha',?)", [hashSecret("fixture")]);
     await hub.store.db.run("INSERT INTO managed_bots VALUES('alpha','owner','fixture','{}')");
     const chat = (await hub.store.createConversation("owner", ["alpha"], "Voice delete", "create")).id;
     const input = await hub.store.sendMessage("owner", { conversationId: chat, clientMsgId: "source", text: "Audio", attachments: [] });
@@ -349,8 +362,11 @@ it("deleting a Bot cleanly settles its active transcription cards", async () => 
       replyTo: input.message.id,
       status: "streaming",
       blocks: [{ type: "card", elements: [{ type: "markdown", text: "**正在转写音频…**" }], extra: { appTranscription: { version: 1, active: true, at: Date.now() } } }],
+    });
     await hub.store.deleteBot("owner", "alpha", "Alpha");
     const retired = await hub.store.messageForUser("owner", sent.id);
     expect(retired.status).toBe("complete");
     expect(isActiveTranscriptionMessage(retired)).toBe(false);
     expect(blocksText(retired.blocks)).toContain("转写已中断");
+  } finally { await hub.close(); await rm(root, { recursive: true, force: true }); }
+});
