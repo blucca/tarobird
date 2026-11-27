@@ -4,7 +4,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { createServer } from "./fixtures/vite.js";
-import { showDisconnectedBots, selectConversation } from "./fixtures/mobile.js";
+import { showDisconnectedBots, selectConversation, waitForClientOnline } from "./fixtures/mobile.js";
 import { settleReadingLayout, readingAnchor, anchorTop } from "./fixtures/reading-position.js";
 import { HubServer } from "../../src/hub/server.js";
 
@@ -343,6 +343,7 @@ for (const width of [1360, 390]) test(`two actual pages sharing IDB bridge the s
     await page.getByRole("button", { name: "发送消息", exact: true }).click();
     await expect.poll(() => !!releaseSend).toBe(true);
     await peer.setViewportSize({ width, height: 844 }); await peer.goto(url);
+    await waitForClientOnline(peer);
     if (width <= 760) await selectConversation(peer, "两个窗口");
     const pending = peer.locator(".message.user").filter({ hasText: "SHARED_WINDOW_SEND" });
     await expect(pending).toContainText("发送中…");
@@ -357,6 +358,7 @@ for (const width of [1360, 390]) test(`two actual pages sharing IDB bridge the s
     await expect.poll(() => peer.evaluate(() => (window as any).sharedHistory.held)).toBe(true);
     releaseSend!();
     await expect(page.locator(".message.user").filter({ hasText: "SHARED_WINDOW_SEND" })).toBeVisible();
+    await expect(page.locator(".message.user.is-pending-outbox").filter({ hasText: "SHARED_WINDOW_SEND" })).toHaveCount(0);
     await expect(page.locator(".queued-message").filter({ hasText: "SHARED_WINDOW_SEND" })).toHaveCount(0);
     // Force a real event after the sender has removed the shared durable entry.
     await hub.store.publishBotMessage("bot", { conversationId: chat.id, blocks: [{ type: "text", text: "AFTER_SENDER_ACK" }] });

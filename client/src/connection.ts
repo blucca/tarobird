@@ -19,6 +19,7 @@ import { CONVERSATION_BATCH_CAPABILITY, conversationBatchResultSchema, type Conv
 import { groupReplyWireFrame, changedGroupReply } from "./group-reply-guard.js";
 import { rememberGroupReplyCapabilities } from "./group-reply-mode-cache.js";
 import { UNAVAILABLE_CARD_ACTION, outboxFailureBlocks } from "./outbox-failure.js";
+import { clearRememberedPendingPreviews } from "./pending-messages.js";
 import { clearMessagesPlanSchema, clearMessagesResultSchema, MESSAGE_CLEAR_CAPABILITY } from "../../src/client-protocol/message-clear.js";
 import { deleteMessagesSchema, deleteMessagesResultSchema, MESSAGE_DELETE_CAPABILITY } from "../../src/client-protocol/message-deletion.js";
 import { timeoutSignal, anySignal } from "./abort-signals.js";
@@ -104,6 +105,8 @@ export class HubConnection {
   }
   private outboxSettlements = new Set<(receipt: OutboxSettlement) => void>();
   private outboxQueued = new Set<(frame: ClientFrame) => void>();
+  private seenClientMessages = new Set<string>();
+  private awaitingCanonical = new Map<string, { entry: OutboxEntry; conversationId: string; timer: ReturnType<typeof setTimeout> }>();
   private avatarLoads = new Map<string, Promise<Blob>>();
   private readonly passiveAttachments = new PassiveAttachments(
     id => this.cache.attachment(id).catch(() => undefined),
@@ -224,10 +227,36 @@ export class HubConnection {
   subscribe(listener: () => void): () => void { this.listeners.add(listener); return () => this.listeners.delete(listener); }
   subscribeOutboxSettlement(listener: (receipt: OutboxSettlement) => void): () => void { this.outboxSettlements.add(listener); return () => this.outboxSettlements.delete(listener); }
   subscribeOutboxQueued(listener: (frame: ClientFrame) => void): () => void { this.outboxQueued.add(listener); return () => this.outboxQueued.delete(listener); }
-  private settleOutbox(entry: OutboxEntry | undefined, messageAccepted: boolean): void {
+  private settleOutbox(entry: OutboxEntry | undefined, messageAccepted: boolean, revision = this.state.cacheRevision): void {
     if (!entry || this.closed) return;
-    const receipt = { entry, revision: this.state.cacheRevision, messageAccepted };
+    const receipt = { entry, revision, messageAccepted };
     this.outboxSettlements.forEach(listener => listener(receipt));
+  }
+  private noteCanonicalClientMessage(clientMsgId?: string): void {
+    if (!clientMsgId) return;
+    this.seenClientMessages.delete(clientMsgId);
+    this.seenClientMessages.add(clientMsgId);
+    if (this.seenClientMessages.size > 512) {
+      const oldest = this.seenClientMessages.values().next().value;
+      if (oldest !== undefined) this.seenClientMessages.delete(oldest);
+    }
+    const awaiting = this.awaitingCanonical.get(clientMsgId);
+    if (awaiting) {
+      clearTimeout(awaiting.timer);
+      this.awaitingCanonical.delete(clientMsgId);
+      this.settleOutbox(awaiting.entry, true);
+    }
+  }
+  private flushAwaitingCanonical(conversationId?: string): void {
+    const conversations = new Set<string>();
+    for (const [id, awaiting] of this.awaitingCanonical) {
+      if (conversationId && awaiting.conversationId !== conversationId) continue;
+      clearTimeout(awaiting.timer);
+      this.awaitingCanonical.delete(id);
+      this.settleOutbox(awaiting.entry, true);
+      conversations.add(awaiting.conversationId);
+    }
+    if (conversations.size) this.outboxChanged(...conversations);
   }
   private update(changes: Partial<ConnectionState> = {}, cacheChanged = false, scoped = false): void {
     if (changes.status) this.designShareStatus(changes.status === "online");
@@ -625,6 +654,10 @@ export class HubConnection {
             op.op === "appendText" && !op.path || op.op === "replaceBlock" && op.value.type === "text");
           if (deleted) this.groupDiscussionRevision++;
           if (event.kind === "turn.state" && typeof event.payload === "object" && event.payload && !Array.isArray(event.payload) && ("groupDiscussion" in event.payload || "groupSettings" in event.payload)) this.groupDiscussionRevision++;
+          const eventMessage = message ?? (typeof payload === "object" && payload && !Array.isArray(payload) ? payload as { authorType?: unknown; authorId?: unknown; clientMsgId?: unknown } : undefined);
+          if (eventMessage?.authorType === "user" && (!this.userId || eventMessage.authorId === this.userId) && typeof eventMessage.clientMsgId === "string") {
+            this.noteCanonicalClientMessage(eventMessage.clientMsgId);
+          }
           this.eventApplied(event.conversationId, deleted || textStream, () => pendingFrames > 0); return;
         }
         if (["snapshot.begin", "snapshot.message", "snapshot.end"].includes(frame.type)) {
@@ -634,6 +667,9 @@ export class HubConnection {
           // Older Hosts cannot advertise restore lineage. Retain the socket's
           // committed token while reading their existing snapshot protocol.
           if (snapshot.type === "snapshot.begin" && !lineageCapable) snapshot.lineage = expected?.lineage;
+          if (snapshot.type === "snapshot.message" && snapshot.message.authorType === "user" && (!this.userId || snapshot.message.authorId === this.userId) && snapshot.message.clientMsgId) {
+            this.noteCanonicalClientMessage(snapshot.message.clientMsgId);
+          }
           if (await this.cache.acceptSnapshot(snapshot, expected)) {
             if (snapshotLineage) {
               if (snapshotLineage.lineage) receivedLineages[snapshotLineage.conversationId] = snapshotLineage.lineage;
@@ -651,6 +687,7 @@ export class HubConnection {
         if (frame.type === "sync.conversation") {
           if (receiveFailed) return;
           if (!this.independentSync || !this.syncing || typeof frame.conversationId !== "string" || !this.pendingSync.delete(frame.conversationId)) throw new Error("unexpected_conversation_sync");
+          this.flushAwaitingCanonical(frame.conversationId);
           const total = this.state.syncProgress?.total ?? 0;
           const completed = total - this.pendingSync.size, now = performance.now();
           // A completion marker changes queue eligibility, not cached history.
@@ -662,7 +699,7 @@ export class HubConnection {
           } else if (this.replayEvents) this.update({}, false, true);
           await this.flush(); return;
         }
-        if (frame.type === "sync.complete") { if (receiveFailed) return; this.syncing = false; this.pendingSync.clear(); this.update({ syncProgress: undefined }, false, true); await this.flush(); return; }
+        if (frame.type === "sync.complete") { if (receiveFailed) return; this.syncing = false; this.pendingSync.clear(); this.flushAwaitingCanonical(); this.update({ syncProgress: undefined }, false, true); await this.flush(); return; }
         if (frame.type === "conversation-folders.updated") { await this.acceptConversationFolders(conversationFoldersSchema.parse(frame.folders), generation); return; }
         if (frame.type === "conversation.updated") { this.groupDiscussionRevision++; await this.cache.saveConversations([conversationSchema.parse(frame.conversation)]); if (typeof frame.clientActionId === "string") await this.ack(frame.clientActionId); this.update({}, true); return; }
         if (frame.type === "message.ack" && typeof frame.clientMsgId === "string") {
@@ -1052,8 +1089,27 @@ export class HubConnection {
     const removed = await this.cache.acknowledge(id, messageAccepted, acceptance);
     // Another window sharing this cache may have committed the deletion first.
     // Our own sent entry still proves what this authenticated ACK confirms.
-    this.settleOutbox(removed ?? (messageAccepted && this.inflightEntry?.id === id ? this.inflightEntry : undefined), messageAccepted);
     const owner = removed ?? (this.inflightEntry?.id === id ? this.inflightEntry : undefined);
+    // Hub sends message.ack concurrently with event broadcast. If the ACK
+    // arrives first, keep the accepted receipt bridged until the canonical
+    // event commits to IndexedDB so the bubble never vanishes between frames.
+    const conversationId = owner?.frame.type === "message.send" || owner?.frame.type === "message.forward"
+      ? owner.frame.conversationId : undefined;
+    if (messageAccepted && this.ws && owner && conversationId && !this.seenClientMessages.has(id)) {
+      const prior = this.awaitingCanonical.get(id);
+      if (prior) clearTimeout(prior.timer);
+      const timer = setTimeout(() => {
+        if (this.awaitingCanonical.get(id)?.timer === timer) {
+          this.awaitingCanonical.delete(id);
+          this.settleOutbox(owner, true);
+          this.outboxChanged(conversationId);
+        }
+      }, 5_000);
+      this.awaitingCanonical.set(id, { entry: owner, conversationId, timer });
+      this.settleOutbox(owner, true, Number.POSITIVE_INFINITY);
+    } else {
+      this.settleOutbox(owner, messageAccepted);
+    }
     this.outboxChanged(owner && frameConversation(owner.frame));
     if (this.inflightEntry?.id === id) this.inflightEntry = undefined;
     if (this.inflight === id) this.inflight = undefined;
@@ -1475,5 +1531,5 @@ export class HubConnection {
     this.close(true); this.update({ error: t("此设备已被吊销，请重新配对") });
     await this.cache.markIdentityRevoked(this.identity).catch(() => console.warn("device_revocation_cache_failed"));
   }
-  close(preserveDeparture = false): void { this.clearForegroundProbe(); this.probeAbort?.abort(); if (!preserveDeparture) this.departureRequest?.abort(); this.inflightEntry = undefined; window.removeEventListener("online", this.networkOnline); document.removeEventListener("visibilitychange", this.presence); window.removeEventListener("focus", this.presence); window.removeEventListener("blur", this.presence); this.started = false; this.starting = undefined; ++this.lifecycle; this.closed = true; this.passiveAttachments.cancelAll(new Error(t("连接已关闭，下载已停止。"))); if (this.outboxRetry) clearTimeout(this.outboxRetry); this.httpEpoch.abort(); this.update({ status: "offline", syncProgress: undefined, routeSync: undefined }); ++this.generation; if (this.reconnect) clearTimeout(this.reconnect); if (this.heartbeat) clearInterval(this.heartbeat); if (this.renewal) clearTimeout(this.renewal); if (this.probeTimer) clearInterval(this.probeTimer); if (this.handshake) clearTimeout(this.handshake); this.ws?.close(); }
+  close(preserveDeparture = false): void { clearRememberedPendingPreviews(this); for (const awaiting of this.awaitingCanonical.values()) clearTimeout(awaiting.timer); this.awaitingCanonical.clear(); this.seenClientMessages.clear(); this.clearForegroundProbe(); this.probeAbort?.abort(); if (!preserveDeparture) this.departureRequest?.abort(); this.inflightEntry = undefined; window.removeEventListener("online", this.networkOnline); document.removeEventListener("visibilitychange", this.presence); window.removeEventListener("focus", this.presence); window.removeEventListener("blur", this.presence); this.started = false; this.starting = undefined; ++this.lifecycle; this.closed = true; this.passiveAttachments.cancelAll(new Error(t("连接已关闭，下载已停止。"))); if (this.outboxRetry) clearTimeout(this.outboxRetry); this.httpEpoch.abort(); this.update({ status: "offline", syncProgress: undefined, routeSync: undefined }); ++this.generation; if (this.reconnect) clearTimeout(this.reconnect); if (this.heartbeat) clearInterval(this.heartbeat); if (this.renewal) clearTimeout(this.renewal); if (this.probeTimer) clearInterval(this.probeTimer); if (this.handshake) clearTimeout(this.handshake); this.ws?.close(); }
 }

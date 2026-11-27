@@ -6,6 +6,7 @@ import { nativePlatform } from "./native.js";
 import { Report } from "./Report.js";
 import { readWidget, readReport } from "../../src/client-protocol/widget.js";
 import { MessageOverlayOwnerContext, useMessageReader } from "./message-overlay.js";
+import { messageRowKey } from "./pending-messages.js";
 import { ImageGalleryContext, galleryImages, messageImages } from "./image-gallery.js";
 import { backgroundTaskNotice } from "../../src/client-protocol/background-task.js";
 import { BackgroundReport, isBackgroundReport } from "./BackgroundReport.js";
@@ -334,7 +335,7 @@ export const MessageContent = memo(function MessageContent({ message, connection
   useLocale();
   const groupedBlocks = new Set<number>();
   const rejectedInput = message.authorType === "user" && message.blocks.some(block => block.type === "steering" && block.outcome === "rejected");
-  return <MessageOverlayOwnerContext.Provider value={message.id}><div className={`message-blocks${reference ? " has-reference" : ""}`} onMouseDown={noteMessagePress} onClick={selectMessageBubble}>{reference}<ImageGalleryContext.Provider value={messageImages(message.blocks)}>{message.blocks.map((block, i) => {
+  return <MessageOverlayOwnerContext.Provider value={messageRowKey(message)}><div className={`message-blocks${reference ? " has-reference" : ""}`} onMouseDown={noteMessagePress} onClick={selectMessageBubble}>{reference}<ImageGalleryContext.Provider value={messageImages(message.blocks)}>{message.blocks.map((block, i) => {
     if (groupedBlocks.has(i)) return null;
     // Caption and images are already one persisted message. Give them one
     // visual surface too, including existing batch deliveries in history.

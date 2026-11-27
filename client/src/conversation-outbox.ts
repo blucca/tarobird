@@ -9,9 +9,10 @@ type Receipt = OutboxSettlement & { reconciling?: boolean };
 type View = { connection: HubConnection; conversationId: string; entries: OutboxEntry[]; readRevision: number };
 const initial = (connection: HubConnection, conversationId: string): View => ({ connection, conversationId, entries: [], readRevision: -1 });
 const belongs = (entry: OutboxEntry, conversationId: string) => "conversationId" in entry.frame && entry.frame.conversationId === conversationId;
-const waitingForHistory = (receipt: Receipt, historyRevision: number, messages: Message[]) => (receipt.messageAccepted || receipt.reconciling)
+const waitingForHistory = (receipt: Receipt, historyRevision: number, messages: Message[], authorId?: string) => (receipt.messageAccepted || receipt.reconciling)
   && (receipt.entry.frame.type === "message.send" || receipt.entry.frame.type === "message.forward")
-  && historyRevision <= receipt.revision && !messages.some(message => message.clientMsgId === receipt.entry.id);
+  && historyRevision <= receipt.revision
+  && !messages.some(message => message.authorType === "user" && (!authorId || message.authorId === authorId) && message.clientMsgId === receipt.entry.id);
 
 /** Fast pending feedback, with committed ACK receipts bridging slow history reads. */
 export function useConversationOutbox(connection: HubConnection, conversationId: string, visible: boolean, historyRevision: number, messages: Message[], scoped = false) {
@@ -121,12 +122,13 @@ export function useConversationOutbox(connection: HubConnection, conversationId:
     if (local) for (const [id, intent] of local) {
       if (intent.missingRevision !== undefined && historyRevision > intent.missingRevision) local.delete(id);
     }
+    const authorId = connection.state.user?.id;
     let removed = false;
     for (const [id, receipt] of settled) {
       const queued = view.entries.find(entry => entry.id === id);
       // Re-enqueuing an acknowledged ID creates a new outbox order. It is a
       // new send attempt, even when the Hub will deduplicate its message.
-      if (queued && queued.order > receipt.entry.order || !queued && view.readRevision > receipt.revision && !waitingForHistory(receipt, historyRevision, messages)) {
+      if (queued && queued.order > receipt.entry.order || !queued && view.readRevision > receipt.revision && !waitingForHistory(receipt, historyRevision, messages, authorId)) {
         settled.delete(id); removed = true;
       }
     }
@@ -134,13 +136,14 @@ export function useConversationOutbox(connection: HubConnection, conversationId:
   }, [connection, conversationId, visible, historyRevision, messages, view, settled, receiptVersion, tracked]);
 
   if (!visible) return [];
+  const authorId = connection.state.user?.id;
   const current = view?.connection === connection && view.conversationId === conversationId ? view : views.get(conversationId) ?? initial(connection, conversationId);
   const entries = new Map(current.entries.map(entry => [entry.id, { entry, sent: false, syncing: false }]));
   for (const [id, receipt] of settled) {
     if ((entries.get(id)?.entry.order ?? -1) > receipt.entry.order) continue;
     // Discard/card receipts mask older outbox snapshots immediately. A message
     // ACK additionally supplies its content even if the fast read never saw it.
-    if (waitingForHistory(receipt, historyRevision, messages)) entries.set(id, { entry: receipt.entry, sent: receipt.messageAccepted, syncing: !!receipt.reconciling });
+    if (waitingForHistory(receipt, historyRevision, messages, authorId)) entries.set(id, { entry: receipt.entry, sent: receipt.messageAccepted, syncing: !!receipt.reconciling });
     else entries.delete(id);
   }
   const ordered = [...entries.values()].sort((a, b) => a.entry.order - b.entry.order);
