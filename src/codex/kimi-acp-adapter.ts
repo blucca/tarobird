@@ -88,6 +88,8 @@ import {
 } from "../state/approval-mode.js";
 import { readValidatedConfigFile, resolveEngineOverride, type EngineOverride } from "../state/instance-config.js";
 import { readKimiModelConfig } from "./kimi-models.js";
+import { AdapterQuotaCache, type EngineQuotaReadOptions, type EngineQuotaReadResult } from "./adapter-account-quota.js";
+import { cancelOwnedKimiQuotaReads, readOwnedKimiQuota, type KimiQuotaSpawn } from "./kimi-account-quota.js";
 import { resolveSearchRoutingSync, SEARCH_CREDENTIAL_KEYS } from "../runtime/search-routing.js";
 import { KIMI_PROMPT_NOT_PROCESSED_MESSAGE } from "../runtime/error-classification.js";
 import { resolveSearchMcpServerInvocation } from "../../deepseek-harness-plugin/src/search-mcp-server.js";
@@ -2032,6 +2034,8 @@ export class KimiAcpAdapter implements CodexAdapter {
   private readonly historyWorkers = new Set<KimiWorker>();
   private readonly historyReaders = new Map<ClientConnection, KimiHistoryReplay>();
   private readonly historyControls = new Map<() => void, Promise<void>>();
+  private readonly quotaCache: AdapterQuotaCache;
+  private readonly quotaFetchFn?: typeof fetch;
 
   constructor(
     private readonly kimiExecutable: string,
@@ -2062,6 +2066,7 @@ export class KimiAcpAdapter implements CodexAdapter {
       readBackgroundTaskOwnershipFn?: ReadKimiBackgroundTaskOwnership;
       resolveTaskOriginFn?: ResolveKimiTaskOrigin;
       readTaskReviewTextFn?: ReadKimiTaskReviewText;
+      quotaFetchFn?: typeof fetch;
     },
   ) {
     this.childEnv = options?.childEnv ?? (() => {
@@ -2096,6 +2101,8 @@ export class KimiAcpAdapter implements CodexAdapter {
     this.killProcessTreeFn = options?.killProcessTreeFn ?? killProcessTree;
     this.mcpServers = options?.mcpServers ?? resolveDefaultKimiMcpServers(this.childEnv);
     this.syncWorkspaceInstructionsFn = options?.syncWorkspaceInstructionsFn ?? syncKimiWorkspaceInstructions;
+    this.quotaCache = new AdapterQuotaCache("kimi", kimiExecutable, this.childEnv, this.workspacePath, this.configPath);
+    this.quotaFetchFn = options?.quotaFetchFn;
     // Unit/fake spawners stay hermetic unless a test explicitly opts in. Real
     // service adapters enable the Kimi 0.32+ hook relay by default.
     this.hookRelayEnabled = options?.hookRelayEnabled ?? options?.spawnFn === undefined;
@@ -6427,6 +6434,25 @@ export class KimiAcpAdapter implements CodexAdapter {
     }
   }
 
+  async getAccountQuota(options: EngineQuotaReadOptions): Promise<EngineQuotaReadResult> {
+    const captureScope = () => this.quotaCache.capture("process");
+    const scope = captureScope();
+    if (this.destroyed || this.destroyPromise) return this.quotaCache.failure(scope, "cancelled");
+    const cached = this.quotaCache.response(scope, options);
+    if (cached) return cached;
+    return readOwnedKimiQuota({
+      executable: this.kimiExecutable,
+      cwd: this.workspacePath,
+      env: this.childEnv,
+      spawn: this.spawnKimi as unknown as KimiQuotaSpawn,
+      cache: this.quotaCache,
+      scope,
+      options,
+      captureScope,
+      fetchFn: this.quotaFetchFn,
+    });
+  }
+
   destroy(): Promise<void> {
     if (!this.destroyPromise) {
       this.destroyed = true;
@@ -6437,6 +6463,8 @@ export class KimiAcpAdapter implements CodexAdapter {
   }
 
   private async destroyInternal(): Promise<void> {
+    await cancelOwnedKimiQuotaReads(this.quotaCache).catch(() => undefined);
+    this.quotaCache.invalidate();
     const controls = [...this.historyControls];
     for (const [stop] of controls) stop();
     const controlResults = await Promise.allSettled(controls.map(([, finished]) => finished));

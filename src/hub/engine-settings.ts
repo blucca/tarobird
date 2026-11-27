@@ -1,4 +1,5 @@
 import { resolvePiExecutable } from "../runtime/pi-executable.js";
+import { resolveOmpExecutable } from "../runtime/omp-executable.js";
 import { createHash, randomUUID } from "node:crypto";
 import { open, rename, unlink } from "node:fs/promises";
 import path from "node:path";
@@ -6,6 +7,7 @@ import { withFileMutex } from "../state/file-mutex.js";
 import { resolveEngineExecutable } from "../runtime/engine-process.js";
 import { deepseekExecutableOverride, resolveDeepSeekExecutable } from "../runtime/deepseek-executable.js";
 import { EngineSettingsReadError, ENGINE_COMMANDS, ENGINE_ENV_KEYS, engineSettingsFile, hostEngineEnvironment, readHostEngineSettings, type StoredEngineSettings } from "../runtime/host-engine-settings.js";
+import { refreshWindowsRegistryPath } from "../runtime/windows-registry-path.js";
 import { engineSettingsUpdateSchema, hostEngineSchema, type EngineSettingsState, type EngineSettingsUpdate } from "../client-protocol/engine-settings.js";
 import { HubError } from "./store.js";
 
@@ -15,13 +17,16 @@ export class HubEngineSettings {
     try { return readHostEngineSettings(this.directory); }
     catch (error) { if (error instanceof EngineSettingsReadError) throw new HubError(error.message, 503); throw error; }
   }
+  async refresh(force = true): Promise<void> {
+    await refreshWindowsRegistryPath(this.base(), { force });
+  }
   status(requestId?: string): EngineSettingsState {
     const settings = this.read(), base = this.base(), env = hostEngineEnvironment(this.directory, base, settings);
     const receipt = requestId ? settings.receipts.find(item => item.requestId === requestId) : settings.receipts.at(-1);
     return { revision: settings.revision, platform: process.platform, searchPaths: (env.PATH ?? "").split(path.delimiter).filter(Boolean),
       receipt: receipt ? { requestId: receipt.requestId, revision: receipt.revision } : null,
       engines: hostEngineSchema.options.map(id => {
-        const command = id === "pi" ? resolvePiExecutable(env) : id === "deepseek" ? resolveDeepSeekExecutable(env) : env[ENGINE_ENV_KEYS[id]] || ENGINE_COMMANDS[id];
+        const command = id === "pi" ? resolvePiExecutable(env) : id === "omp" ? resolveOmpExecutable(env) : id === "deepseek" ? resolveDeepSeekExecutable(env) : env[ENGINE_ENV_KEYS[id]] || ENGINE_COMMANDS[id];
         const executable = resolveEngineExecutable(command, env) ?? null;
         const explicit = id === "deepseek" ? deepseekExecutableOverride(base) !== undefined : !!base[ENGINE_ENV_KEYS[id]];
         return { id, override: settings.paths[id] ?? null, source: settings.paths[id] ? "setting" : explicit ? "environment" : "auto", command, executable, available: !!executable };

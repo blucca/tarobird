@@ -1,10 +1,11 @@
-import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { createHash, generateKeyPairSync, randomBytes, randomUUID, sign } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { networkInterfaces } from "node:os";
 import path from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import { hashSecret } from "../src/hub/auth.js";
+import { WebSocket } from "ws";
+import { deviceProof, hashSecret } from "../src/hub/auth.js";
 import { BotManager } from "../src/hub/bot-manager.js";
 import { messageHostId } from "../src/hub/bot-messages.js";
 import { desktopTls } from "../src/hub/desktop-tls.js";
@@ -16,6 +17,7 @@ import { HubServer } from "../src/hub/server.js";
 import { startHubControl } from "../src/hub/service.js";
 import { loadHubTls } from "../src/hub/tls.js";
 import { LocalHostClient } from "../src/host-cli/client.js";
+import { updateInstanceConfig } from "../src/state/instance-config.js";
 import { initializeHost } from "../src/host-cli/setup.js";
 import { runTicketsCommand } from "../src/host-cli/tickets.js";
 import { BOT_PASSPORT_TTL_MS, type BotPassport } from "../src/client-protocol/bot-messages.js";
@@ -266,9 +268,8 @@ it("enforces remote authorization, dispatches across 2 real TLS Hubs in parallel
   // 3. Plan & dispatch 4 items (2 per node -> 2 parallel tickets: 1 on macmini, 1 on studio-b).
   const defaultChat = (await a.store.conversations("owner")).find(c => c.botIds.includes("d"))!;
   await a.store.db.run("INSERT INTO bots(id,name,secret_hash,engine,model,effort) VALUES('other','Other','fixture','codex','','')");
-  const origin = await a.store.createConversation("owner", ["other"], "Batch group", "batch_group", { type: "group" });
-  // The integration branch's multiple-conversation support permits this membership.
-  await a.store.db.run("INSERT INTO conversation_members VALUES(?,'bot','d',0)", [origin.id]);
+  const origin = await a.store.createConversation("owner", ["d", "other"], "Batch group", "batch_group", { type: "group" });
+  const homeTicket = await a.dispatch.create(owner, "d", { requestId: "home-ticket", conversationId: defaultChat.id, title: "Independent", request: "Keep this ticket separate" });
   const turn = await a.store.sendMessage("owner", { conversationId: origin.id, clientMsgId: "batch-turn", text: "Plan a batch", attachments: [], mentions: ["d"] });
   await a.store.db.run("UPDATE deliveries SET dispatched=1 WHERE message_id=? AND bot_id='d'", [turn.message.id]);
   const actor = { kind: "bot" as const, botId: "d", contextMessage: turn.message.id };
@@ -286,6 +287,21 @@ it("enforces remote authorization, dispatches across 2 real TLS Hubs in parallel
   expect(plan.batches).toHaveLength(2);
   expect(plan.tickets).toHaveLength(2);
   expect(plan.tickets!.map(ticket => ticket.conversationId)).toEqual([origin.id, origin.id]);
+  const closeSourceControl = await startHubControl(aDir,
+    { running: true, pid: process.pid, url: a.url, instanceUrl: a.instanceUrl, publicKey: a.auth.publicKey },
+    () => {}, { enrollController: value => a.enrollLocalController(value) });
+  const ownerClient = await LocalHostClient.connect(aDir, { enroll: true });
+  try {
+    const scoped = await ownerClient.request<{ tickets: DispatchTicket[]; otherCount: number }>(
+      `/api/bots/d/tickets?summary=1&crossHostDispatch=1&conversationId=${origin.id}`,
+    );
+    expect(scoped.tickets.map(ticket => ticket.id).sort()).toEqual(plan.tickets!.map(ticket => ticket.id).sort());
+    expect(scoped.otherCount).toBe(2); // The earlier unauthorized dispatch and the independent home ticket.
+    await ownerClient.request("/api/bots/d/tickets/bulk-action", "POST", { requestId: "pause-home", action: "pause", conversationId: defaultChat.id });
+    expect((await a.dispatch.show(owner, homeTicket.id)).paused).toBe(true);
+    for (const ticket of plan.tickets!) expect((await a.dispatch.show(owner, ticket.id)).paused).toBe(false);
+  } finally { ownerClient.close(); await closeSourceControl(); }
+  await expect(a.dispatch.dispatch(actor, "d", { requestId: "wrong-conversation", ticketId: homeTicket.id, engine: "codex", hostId: studioId })).rejects.toThrow("dispatch_conversation_mismatch");
   const byHost = new Map(plan.tickets!.map(t => [t.hostId!, t]));
   const localTicket = byHost.get(macId)!;
   const remoteTicket = byHost.get(studioId)!;
@@ -934,4 +950,131 @@ it("fixes planner edge cases, plan idempotency, idle ask-mode probe suppression,
 
   // Database schema version is bumped to 28.
   expect(await a.store.db.get("SELECT value FROM meta WHERE key='schema_version'")).toEqual({ value: "28" });
+});
+
+it.each([
+  { phase: "waiting_approval", kind: "approval", actionId: "approve", values: {} },
+  { phase: "waiting_answer", kind: "answer", actionId: "answer", values: { response: "Fixture answer" } },
+] as const)("routes $kind through the receiving owner's actual interaction socket only", async ({ phase, kind, actionId, values }) => {
+  await authorizeStudioFromMac();
+  const sockets: WebSocket[] = [];
+  async function open(url: string) {
+    const ws = new WebSocket(url.replace(/^http/, "ws"), { rejectUnauthorized: false });
+    sockets.push(ws);
+    const frames: Array<Record<string, unknown>> = [];
+    ws.on("message", raw => frames.push(JSON.parse(String(raw))));
+    await new Promise<void>((resolve, reject) => { ws.once("open", resolve); ws.once("error", reject); });
+    return {
+      send: (frame: object) => ws.send(JSON.stringify({ v: 1, ...frame })),
+      async next(type: string, predicate: (frame: Record<string, unknown>) => boolean = () => true) {
+        const find = () => frames.findIndex(frame => frame.type === type && predicate(frame));
+        await expect.poll(find, { timeout: 3000 }).toBeGreaterThanOrEqual(0);
+        return frames.splice(find(), 1)[0]!;
+      },
+    };
+  }
+  async function clientPeer(hub: HubServer, deviceId: string, userId = "owner") {
+    const keys = generateKeyPairSync("ed25519");
+    const nonce = randomBytes(32).toString("base64url");
+    const pair = await hub.auth.pair({
+      deviceId, name: deviceId, platform: "web",
+      publicKey: keys.publicKey.export({ type: "spki", format: "der" }).toString("base64"),
+    }, deviceId);
+    await hub.auth.approve(pair.code, "local-owner", userId);
+    const peer = await open(hub.url + "/ws");
+    peer.send({ type: "hello", deviceId, nonce, protocolVersions: [1], capabilities: ["cards.v1", "dispatch.v1"], cursors: {} });
+    const challenge = await peer.next("challenge");
+    peer.send({ type: "auth", signature: sign(null, deviceProof(deviceId, String(challenge.nonce), nonce), keys.privateKey).toString("base64") });
+    return { ...peer, ready: await peer.next("ready") };
+  }
+
+  try {
+    const ticket = await a.dispatch.create(owner, "d", { requestId: "interactive-ticket", title: "Receiving owner interaction", request: "Fixture request" });
+    const running = await a.dispatch.dispatch(owner, "d", { requestId: "interactive-dispatch", ticketId: ticket.id, hostId: studioId, engine: "codex" });
+    const attempt = running.attempts.at(-1)!;
+    const receiver = await clientPeer(b, "receiving-owner");
+    const source = await clientPeer(a, "source-owner");
+    await b.store.db.run("INSERT INTO users VALUES('member','Member','member')");
+    const member = await clientPeer(b, "receiving-member", "member");
+    expect(member.ready.conversations).not.toEqual(expect.arrayContaining([expect.objectContaining({ id: attempt.conversationId })]));
+    expect(receiver.ready.conversations).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: attempt.conversationId, hidden: true, title: ticket.title }),
+    ]));
+    expect(source.ready.conversations).not.toEqual(expect.arrayContaining([expect.objectContaining({ id: attempt.conversationId })]));
+
+    const secret = randomBytes(32).toString("base64url");
+    await b.store.db.run("UPDATE bots SET secret_hash=? WHERE id=?", [hashSecret(secret), attempt.botId]);
+    const worker = await open(b.instanceUrl + "/instance");
+    worker.send({ type: "instance.hello", botId: attempt.botId, secret, engine: "codex", model: "", effort: "", capabilities: ["bot-messages.v1"] });
+    await worker.next("instance.ready");
+    expect(await worker.next("instance.message")).toMatchObject({ message: { id: attempt.inputMessageId }, conversation: { id: attempt.conversationId } });
+    const message = await b.store.publishBotMessage(attempt.botId, {
+      conversationId: attempt.conversationId, replyTo: attempt.inputMessageId, status: "complete",
+      blocks: [{ type: "card", elements: [{ type: "button", actionId, text: "Resolve" }],
+        extra: { nativeRun: { runId: "interactive-run", engine: "codex", phase, revision: 1, startedAt: 1, updatedAt: 2 } } }],
+    });
+    await a.dispatch.sweep();
+    expect((await a.dispatch.show(owner, ticket.id)).attempts.at(-1)?.waitingFor).toEqual({ kind, messageId: message.id });
+
+    const submit = { type: "interaction.submit", conversationId: attempt.conversationId, messageId: message.id, actionId, values };
+    source.send({ ...submit, clientActionId: "source-attempt" });
+    expect(await source.next("error")).toMatchObject({ code: expect.stringMatching(/^(message_not_found|conversation_forbidden)$/) });
+    member.send({ ...submit, clientActionId: "member-attempt" });
+    expect(await member.next("error")).toMatchObject({ code: "conversation_forbidden" });
+    expect(await b.store.pendingActions(attempt.botId)).toEqual([]);
+    receiver.send({ ...submit, clientActionId: "receiver-action" });
+    expect(await receiver.next("interaction.ack")).toMatchObject({ clientActionId: "receiver-action" });
+    const call = await worker.next("instance.call", frame => frame.method === "interaction");
+    expect(call.params).toMatchObject({ userId: "owner", conversationId: attempt.conversationId, messageId: message.id, actionId, values });
+    worker.send({ type: "instance.result", id: call.id, result: { ok: true } });
+    await expect.poll(() => b.store.pendingActions(attempt.botId)).toEqual([]);
+    worker.send({ type: "instance.request", id: "publish-running", method: "publish", params: {
+      id: message.id, conversationId: attempt.conversationId, replyTo: attempt.inputMessageId, status: "complete", version: 2,
+      blocks: [{ type: "card", elements: [{ type: "markdown", text: "Running again" }],
+        extra: { nativeRun: { runId: "interactive-run", engine: "codex", phase: "running", revision: 2, startedAt: 1, updatedAt: 3 } } }],
+    } });
+    await worker.next("instance.result", frame => frame.id === "publish-running");
+    await a.dispatch.sweep();
+    expect((await a.dispatch.show(owner, ticket.id)).attempts.at(-1)?.waitingFor).toBeUndefined();
+  } finally {
+    for (const ws of sockets) ws.terminate();
+  }
+});
+
+it("preserves the unsafe remote worker 409 across signed Host transport and keeps recovery details local", async () => {
+  await authorizeStudioFromMac();
+  const warning = vi.fn();
+  const manager = new BotManager(b.store, bDir, {
+    entrypoint: path.resolve("tests/fixtures/managed-bot-worker.mjs"),
+    env: { ...process.env, CODEX_EXECUTABLE: process.execPath },
+  }, () => b.instanceUrl, async () => {}, warning);
+  try {
+    const worker = await manager.remoteDispatchWorker(macId, "codex");
+    await updateInstanceConfig(path.join(bDir, "bots", worker), cfg => { cfg.approvalMode = "bypass"; });
+    const receiverWorkers = b.dispatch.workers!;
+    const workers = { ...receiverWorkers, remoteDispatchWorker: manager.remoteDispatchWorker.bind(manager) };
+    b.dispatch.workers = workers;
+    const ticket = await a.dispatch.create(owner, "d", { requestId: "unsafe-create", title: "Legacy worker rejection", request: "Fixture request" });
+    await expect(a.dispatch.dispatch(owner, "d", {
+      requestId: "unsafe-dispatch", ticketId: ticket.id, hostId: studioId, engine: "codex",
+    })).rejects.toMatchObject({ status: 409, code: "dispatch_worker_permissions_unsafe", message: "dispatch_worker_permissions_unsafe" });
+    const closeControl = await startHubControl(aDir, { running: true, pid: process.pid, url: a.url, instanceUrl: a.instanceUrl, publicKey: a.auth.publicKey },
+      () => {}, { enrollController: value => a.enrollLocalController(value) });
+    const cli = await LocalHostClient.connect(aDir, { enroll: true });
+    try {
+      await expect(runTicketsCommand(aDir, "dispatch", ticket.id, {
+        engine: "codex", bot: "d", host: studioId, "request-id": "unsafe-cli-dispatch",
+      }, () => {})).rejects.toMatchObject({
+        status: 409, code: "dispatch_worker_permissions_unsafe", message: expect.stringContaining("tarobot logs"),
+      });
+    } finally {
+      cli.close();
+      await closeControl();
+    }
+    expect(warning).toHaveBeenCalledWith(expect.stringContaining(`tarobot bots delete ${worker} --expected-name='Remote · Codex' --yes`));
+    expect((await a.dispatch.show(owner, ticket.id)).attempts).toEqual([]);
+    expect(await b.store.db.get("SELECT 1 FROM remote_dispatch_tickets WHERE bot_id=?", [worker])).toBeUndefined();
+  } finally {
+    await manager.close();
+  }
 });

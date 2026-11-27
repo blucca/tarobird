@@ -40,6 +40,8 @@ import {
   PiTurnMapper, buildPiPrompt, isPiDialog, piDialogQuestion, piDialogResponse, piNativeTree, piQuestionWithDetail, piUsageCostBreakdown, piUserEntryText,
 } from "./pi-turn-mapper.js";
 import { piSkippedImagesNotice } from "./pi-turn-mapper.js";
+import { unavailableQuota } from "./account-quota.js";
+import type { EngineQuotaReadOptions, EngineQuotaReadResult } from "./adapter-account-quota.js";
 
 export interface PiRpcAdapterOptions {
   launch: PiLaunchSpec;
@@ -753,6 +755,17 @@ export class PiRpcAdapter implements CodexAdapter {
     } finally {
       this.endTurn(turn);
     }
+  }
+
+  private readonly quotaRevision = randomUUID();
+
+  /** Pi 1.6.x exposes only local session token/cost stats (`get_session_stats`) and no provider account
+   * quota RPC; report `mode_not_supported` explicitly rather than "not yet implemented". */
+  async getAccountQuota(_options: EngineQuotaReadOptions): Promise<EngineQuotaReadResult> {
+    return {
+      revision: this.quotaRevision,
+      snapshot: unavailableQuota("pi", "mode_not_supported", Date.now(), "other"),
+    };
   }
 
   async destroy(): Promise<void> {

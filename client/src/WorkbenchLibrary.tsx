@@ -1,10 +1,11 @@
 import { useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { ArrowUpRight, CheckSquare, ChevronDown, FileText, FolderOpen, LayoutGrid, RefreshCw, Search, SquarePen, Trash2 } from "lucide-react";
+import { ArrowUpRight, CheckSquare, ChevronDown, Download, FileText, FolderOpen, LayoutGrid, RefreshCw, Search, SquarePen, Trash2 } from "lucide-react";
 import type { HubConnection } from "./connection.js";
 import { CreationDialog } from "./CreationDialog.js";
 import { RuntimeHostContext } from "./RuntimeHost.js";
 import { WorkbenchLibraryContext, type WorkbenchFileTarget, type WorkbenchLibraryHost } from "./workbench-library-context.js";
-import { listWorkbenchLibrary, deleteWorkbenchLibraryEntries, type WorkbenchLibraryEntry, type WorkbenchLibraryDeleteStatus } from "./workbench-library.js";
+import { listWorkbenchLibrary, deleteWorkbenchLibraryEntries, exportStoredDesign, type WorkbenchLibraryEntry, type WorkbenchLibraryDeleteStatus } from "./workbench-library.js";
+import { saveDesignBackup } from "./workbench-design-export.js";
 import { workbenchErrorText } from "./workbench-error.js";
 import { useLocale } from "./i18n.js";
 import "./workbench-library.css";
@@ -125,6 +126,15 @@ export function WorkbenchLibrary({ connection, active, onBusy, onOpened, openLoc
     } catch (cause) { if (mounted.current && generation.current === version) setError(workbenchErrorText(cause instanceof Error ? cause.message : "workbench_failed", locale)); }
     finally { operation.current = false; if (mounted.current) setBusy(false); }
   }
+  /** A design the App no longer opens (a Baoyu canvas from 1.6.0 or earlier) is saved as a project backup; nothing is opened or changed. */
+  async function exportProject(row: Row) {
+    if (operation.current) return;
+    operation.current = true; setBusy(true); setError(""); setOperationNote("");
+    const version = generation.current;
+    try { await saveDesignBackup(await exportStoredDesign(row.host.connection, row.scope, row.id, row.label), row.label); }
+    catch (cause) { if (mounted.current && generation.current === version) setError(workbenchErrorText(cause instanceof Error ? cause.message : "workbench_failed", locale)); }
+    finally { operation.current = false; if (mounted.current) setBusy(false); }
+  }
   async function remove() {
     if (!confirmation || operation.current) return;
     const captured = [...confirmation], version = generation.current, key = sourceKeyRef.current;
@@ -177,10 +187,14 @@ export function WorkbenchLibrary({ connection, active, onBusy, onOpened, openLoc
     {error && <p role="alert" className="error-text">{error}</p>}
     {!!results.length && <div className="workbench-library-result" role="status"><p>{word(`已清理 ${removed} 项${failed.length ? `，${failed.length} 项未删除` : ""}。`, `${removed} items cleared${failed.length ? `; ${failed.length} not deleted` : ""}.`)}</p>{!!failed.length && <ul>{failed.map(result => <li key={result.row.key}><strong>{result.row.label}</strong> · {resultText(result.status, result.error)}</li>)}</ul>}</div>}
     {loading ? <p role="status" className="workbench-library-empty">{word("正在读取文件列表…", "Loading files…")}</p> : !filtered.length ? <div className="workbench-library-empty"><FolderOpen size={24} aria-hidden="true"/><p>{rows.length ? word("没有匹配的文件，试试调整筛选。", "No matches. Try different filters.") : word("当前没有可显示的工作台文件。", "No workbench files to show.")}</p></div> : <ul className="workbench-library-list">
-      {shown.map(row => { const Icon = row.kind === "markdown" ? FileText : row.kind === "design" ? LayoutGrid : SquarePen; const canOpen = ["open", "closed", "orphan"].includes(row.state) && !row.layoutInvalid && !row.conversationMissing && !row.conversationArchived && !!(library || openLocalFile); return <li key={row.key} data-selected={selected.has(row.key)}>
+      {shown.map(row => { const Icon = row.kind === "markdown" ? FileText : row.kind === "design" ? LayoutGrid : SquarePen; const canOpen = ["open", "closed", "orphan"].includes(row.state) && !row.layoutInvalid && !row.conversationMissing && !row.conversationArchived && !!(library || openLocalFile);
+        // Not a deck with a Tab: a Baoyu canvas, which is no longer opened, or a design without a Tab. Its stored project can still be saved.
+        const exportable = row.kind === "design" && row.state !== "missing" && row.designFormat !== "slides";
+        const openButton = <button type="button" disabled={busy || !canOpen} title={!canOpen ? word("所属对话或文件不可打开，仍可清理此记录", "The conversation or file is unavailable; this record can still be cleaned up") : undefined} aria-label={word(`打开：${row.label}`, `Open: ${row.label}`)} onClick={() => void open(row)}><ArrowUpRight size={15} aria-hidden="true"/>{word("打开", "Open")}</button>;
+        return <li key={row.key} data-selected={selected.has(row.key)}>
         <input type="checkbox" checked={selected.has(row.key)} disabled={busy || !selected.has(row.key) && selected.size >= MAX_SELECTION} aria-label={word(`选择：${row.label}`, `Select: ${row.label}`)} onChange={() => toggle(row)}/><Icon className="workbench-library-kind" size={19} aria-hidden="true"/>
         <div className="workbench-library-description"><strong title={row.label}>{row.label}</strong><span>{row.host.name} · {row.conversationTitle || word("对话已移除", "Conversation removed")}</span><small>{typeName(row.kind)} · {stateName(row.state)}{row.conversationArchived && word(" · 对话已归档", " · Conversation archived")}{row.layoutInvalid && word(" · 标签记录异常", " · Invalid tab record")}</small></div>
-        <button type="button" disabled={busy || !canOpen} title={!canOpen ? word("所属对话或文件不可打开，仍可清理此记录", "The conversation or file is unavailable; this record can still be cleaned up") : undefined} aria-label={word(`打开：${row.label}`, `Open: ${row.label}`)} onClick={() => void open(row)}><ArrowUpRight size={15} aria-hidden="true"/>{word("打开", "Open")}</button>
+        {exportable ? <span className="workbench-library-row-actions"><button type="button" disabled={busy} title={word("导出项目备份（.tarobot-design.json）", "Export a project backup (.tarobot-design.json)")} aria-label={word(`导出：${row.label}`, `Export: ${row.label}`)} onClick={() => void exportProject(row)}><Download size={15} aria-hidden="true"/>{word("导出", "Export")}</button>{openButton}</span> : openButton}
       </li>; })}
     </ul>}
     {pages > 1 && <nav className="workbench-library-pagination" aria-label={word("工作台文件分页", "Workbench files pagination")}><button disabled={disabled || current === 0} onClick={() => setPage(current - 1)}>{word("上一页", "Previous")}</button><span>{current + 1} / {pages}</span><button disabled={disabled || current + 1 >= pages} onClick={() => setPage(current + 1)}>{word("下一页", "Next")}</button></nav>}

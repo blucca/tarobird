@@ -51,6 +51,7 @@ export interface CoreChannelLike {
   /** Optional authenticated-surface preparation, executed inside the conversation queue. */
   prepareConversation?(chatId: string): Promise<void>;
   canSteerConversation?(chatId: string): Promise<boolean>;
+  conversationWorkspace?(conversationId: string): Promise<string | undefined>;
   profile?: import("./channel-profile.js").ChannelProfile;
   send(to: string, input: unknown, opts?: CoreSendOptions): Promise<{ messageId: string }>;
   stream(to: string, input: {
@@ -207,6 +208,10 @@ export interface CoreBridgeLike {
   listTasks?(input: { chatId: number; conversationKey: string }): Promise<EngineTaskSnapshot>;
   /** The engine's own slash commands for the command menu, when it advertises them. */
   advertisedCommands?(): Array<{ name: string; description: string }>;
+  /** Whether the engine has delivered an authoritative advertised-command snapshot yet. */
+  hasReceivedAdvertisedCommands?(): boolean;
+  /** Stop background native work (such as an active Antigravity swarm) after its initiating turn ended. */
+  stopBackgroundWork?(input: { chatId: number; conversationKey: string; locale?: "en" | "zh"; scope?: "swarm" | "all" }): Promise<{ stopped: boolean; summary?: string }>;
   getPiSession?(input: { chatId: number; conversationKey: string; isCurrentSession?: () => Promise<boolean> }): Promise<PiSessionSnapshot>;
   changePiSession?(input: { chatId: number; conversationKey: string; isCurrentSession?: () => Promise<boolean> } & Pick<PiSessionChange, "expectedSession" | "action" | "value">): Promise<PiSessionResult>;
   stopTask?(input: { chatId: number; conversationKey: string; taskId: string; isCurrentSession?: () => Promise<boolean> }): Promise<EngineTaskControlResult>;

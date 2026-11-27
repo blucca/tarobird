@@ -13,10 +13,18 @@ import { requestTicketAssistanceSchema } from "../client-protocol/dispatch-assis
 import { instanceEndpoint } from "./bot-messages.js";
 import { HostCliError, LocalHostClient } from "./client.js";
 
-export type TicketOptions = { bot?: string; engine?: string; title?: string; text?: string; "text-file"?: string; model?: string; effort?: string; force?: boolean; status?: string; note?: string;
+export type TicketOptions = { bot?: string; conversation?: string; engine?: string; title?: string; text?: string; "text-file"?: string; model?: string; effort?: string; force?: boolean; status?: string; note?: string;
   open?: boolean; match?: string; offset?: string; assist?: string; "request-id"?: string; "context-message"?: string; "dispatch-mode"?: string; "max-concurrent"?: string; allow?: string; revision?: string;
   host?: string; total?: string; "per-node"?: string; create?: boolean; dispatch?: boolean; action?: string; batch?: string; from?: string; allowed?: string };
 const OWNER_ONLY = ["pause", "resume", "cancel", "accept", "remove", "engine-reset", "settings", "bulk-action", "allow-remote", "revoke-remote", "load", "remote-grants"];
+const scopedTicketListSchema = z.object({
+  tickets: z.array(z.object({ conversationId: z.string() }).passthrough()),
+}).passthrough();
+function filterTicketList(value: unknown, conversationId: string | undefined): unknown {
+  if (conversationId === undefined) return value;
+  const list = scopedTicketListSchema.parse(value);
+  return { ...list, tickets: list.tickets.filter(ticket => ticket.conversationId === conversationId) };
+}
 function contextError(missing: boolean, status?: number): HostCliError {
   const error = new HostCliError("dispatch_context_not_active", status);
   error.message += missing
@@ -24,6 +32,12 @@ function contextError(missing: boolean, status?: number): HostCliError {
     : ": 主机拒绝了本次工单操作：消息上下文未生效、已过期或不属于当前 Bot。请核对本轮指引的 --context-message ID；若本轮 ID 仍被拒绝，报告具体阻塞。";
   error.message += " 这不是工单接口未启用。不要猜测消息 ID、改用主人身份或移除 Bot 环境变量；不要直接启动引擎 CLI 绕过工单。已有操作编号须保留，结果不确定时先读取工单核对。";
   return error;
+}
+function explainRemoteWorkerError(error: unknown): never {
+  if (error instanceof HostCliError && error.code === "dispatch_worker_permissions_unsafe" && error.status === 409) {
+    error.message += ": 接收主机上的旧执行 Bot 权限过宽。请接收方主人先结束或停止正在进行的工作，再在接收主机运行 tarobot logs，按日志指引清理这个旧 Bot，然后重新派发。";
+  }
+  throw error;
 }
 const required = (value: string | undefined, message: string) => { if (!value) throw new Error(message); return value; };
 async function textOf(options: TicketOptions, name = "--text"): Promise<string | undefined> {
@@ -42,6 +56,7 @@ export function allowedEnginesOption(value: string | undefined): DispatcherSetti
 export async function runTicketsCommand(directory: string, sub: string | undefined, argument: string | undefined, options: TicketOptions, receipt: (id: string) => void): Promise<unknown> {
   const commands = ["list", "show", "targets", "nodes", "plan", "capabilities", "create", "dispatch", "update", "assist", "assist-status", "assists", "engines", ...OWNER_ONLY];
   if (!sub || !commands.includes(sub)) throw new Error(`请使用 tickets ${commands.join("|")}。`);
+  if (options.conversation !== undefined && !["list", "create", "plan"].includes(sub)) throw new Error("--conversation 仅支持 tickets list、tickets create 或 tickets plan。");
   const capabilityQuery = sub === "capabilities" ? dispatchCapabilitiesRequestSchema.parse({ engine: required(options.engine, "缺少 --engine。"), ...(options.match !== undefined ? { match: options.match } : {}), ...(options.offset !== undefined ? { offset: Number(options.offset) } : {}) }) : undefined;
   const botId = process.env.TAROBOT_ACTIVE_INSTANCE ?? process.env.TAROBOT_INSTANCE;
   if (botId) {
@@ -54,10 +69,13 @@ export async function runTicketsCommand(directory: string, sub: string | undefin
       try { return await endpoint.post("/api/instance/tickets", { operation, ...(contextMessage ? { contextMessage } : {}), data }); }
       catch (error) {
         if (error instanceof HostCliError && error.code === "dispatch_context_not_active" && error.status === 403) throw contextError(false, error.status);
-        throw error;
+        explainRemoteWorkerError(error);
       }
     };
-    if (sub === "list") return call("list", options.open ? { open: true } : {});
+    if (sub === "list") {
+      const list = await call("list", { ...(options.open ? { open: true } : {}), ...(options.conversation ? { conversationId: options.conversation } : {}) });
+      return filterTicketList(list, options.conversation);
+    }
     if (sub === "engines") return { engines: (await call("list", { open: true })).engines };
     if (sub === "show") return call("show", { ticketId: required(argument, "缺少工单 ID。") });
     if (sub === "targets") return call("targets");
@@ -75,7 +93,7 @@ export async function runTicketsCommand(directory: string, sub: string | undefin
       throw new HostCliError("dispatch_host_update_required");
     }
     const request = <T = unknown>(route: string, method?: string, body?: unknown) =>
-      client.request<T>(dispatchWireRoute(route, crossHostSupported), method, body);
+      client.request<T>(dispatchWireRoute(route, crossHostSupported), method, body).catch(explainRemoteWorkerError);
     if (sub === "load") return request("/api/dispatch/load");
     if (sub === "remote-grants") return request("/api/dispatch/cross-host-grants");
     if (sub === "allow-remote" || sub === "revoke-remote") {
@@ -100,7 +118,12 @@ export async function runTicketsCommand(directory: string, sub: string | undefin
       const engine = required(argument, `缺少引擎名称：${DISPATCH_ENGINES.join("|")}。`);
       return { engines: await request(`/api/dispatch/engines/${encodeURIComponent(engine)}/reset`, "POST", {}) };
     }
-    if (sub === "list") return request(`/api/bots/${dispatcher().id}/tickets${options.open ? "?open=1" : ""}`);
+    if (sub === "list") {
+      const query = new URLSearchParams();
+      if (options.open) query.set("open", "1");
+      if (options.conversation) query.set("conversationId", options.conversation);
+      return filterTicketList(await request(`/api/bots/${dispatcher().id}/tickets${query.size ? `?${query}` : ""}`), options.conversation);
+    }
     if (sub === "show") return request(ticketRoute(required(argument, "缺少工单 ID。")));
     if (sub === "assists") return request(`${ticketRoute(required(argument, "缺少工单 ID。"))}/assists`);
     if (sub === "targets") return request(`/api/bots/${dispatcher().id}/dispatch-targets`);
@@ -177,7 +200,7 @@ async function mutation(sub: string, argument: string | undefined, options: Tick
   }
   if (sub === "create") {
     const requestId = options["request-id"] ?? randomUUID(); receipt(requestId);
-    return { requestId, title: required(options.title, "缺少 --title。"), request: required(await textOf(options), "缺少 --text 或 --text-file（工单要求）。") };
+    return { requestId, title: required(options.title, "缺少 --title。"), request: required(await textOf(options), "缺少 --text 或 --text-file（工单要求）。"), ...(options.conversation ? { conversationId: options.conversation } : {}) };
   }
   if (sub === "plan") {
     const requestId = options["request-id"] ?? randomUUID();
@@ -185,6 +208,7 @@ async function mutation(sub: string, argument: string | undefined, options: Tick
     const request = required(await textOf(options), "缺少 --text 或 --text-file（待拆分任务要求）。");
     const hostIds = options.host !== undefined ? options.host.split(",").map(item => item.trim()).filter(Boolean) : undefined;
     return dispatchSplitPlanRequestSchema.parse({
+      ...(options.conversation ? { conversationId: options.conversation } : {}),
       requestId,
       request,
       ...(options.title !== undefined ? { title: options.title } : {}),

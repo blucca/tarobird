@@ -3,12 +3,13 @@ import { createPortal } from "react-dom";
 import { Users, X, RotateCw } from "lucide-react";
 import { useLocale } from "./i18n.js";
 import { designFrame } from "./design-frame.js";
+import { workbenchErrorText } from "./workbench-error.js";
 import type { WorkbenchController } from "./workbench-controller.js";
 import type { DesignSession } from "./workbench-design-session.js";
 import { designShareListActions, designShareManager, type DesignShareManager, type DesignShareMember, type DesignShareView } from "./workbench-design-collaboration.js";
 import "./workbench-design-sharing.css";
 
-// Authenticated collaboration on one Baoyu document: only through this Host's
+// Authenticated collaboration on one Workbench document: only through this Host's
 // signed App connection, to members of this conversation or the owner's other
 // devices. No links, no LAN service. A joined copy has no offline fallback.
 type Word = (zh: string, en: string) => string;
@@ -21,7 +22,8 @@ export function shareErrorText(error: unknown, word: Word) {
   if (code === "design_share_forbidden" || code === "design_share_revoked" || code === "design_share_not_member") return word("你没有这个共享的访问权限。", "You do not have access to this share.");
   if (code === "design_share_closed") return word("这个共享已经结束。", "This share has ended.");
   if (code === "design_share_limit" || code === "design_share_full") return word("共享人数或数量已达上限。", "The share limit has been reached.");
-  if (code === "design_share_format_unsupported") return word("只有画布和 PPT 可以共享。", "Only canvases and PPTs can be shared.");
+  if (code === "design_canvas_removed") return workbenchErrorText("design_canvas_removed", word("zh", "en") === "en" ? "en" : "zh");
+  if (code === "design_share_format_unsupported") return word("只有 PPT 可以共享。", "Only PPT projects can be shared.");
   if (code === "design_share_outcome_unknown") return word("结果未确认。请刷新列表后再试，不会重复执行。", "The result is not confirmed. Refresh and try again.");
   return word("操作没有完成，请重试。", "That did not complete. Try again.");
 }
@@ -30,8 +32,9 @@ export function shareErrorText(error: unknown, word: Word) {
  * (for example, deleted while offline). Ending asks first and never deletes a design. */
 export function DesignShareRow({ share, word, disabled, ending, onOpen, onEnding, onEnd }: { share: DesignShareView; word: Word; disabled: boolean; ending: boolean; onOpen(): void; onEnding(value: boolean): void; onEnd(): void }) {
   const actions = designShareListActions(share);
+  const removedCanvas = share.format !== "slides";
   return <li className={ending ? "design-sharing-ending" : undefined}>
-    <span><strong>{share.title}</strong><span className="design-sharing-muted"> · {share.ownerName} · {shareRoleLabel(share.role, word)} · {share.sourceOnline ? word("源设备在线", "Source online") : word("源设备离线", "Source offline")}</span></span>
+    <span><strong>{share.title}</strong><span className="design-sharing-muted"> · {share.ownerName} · {shareRoleLabel(share.role, word)} · {share.sourceOnline ? word("源设备在线", "Source online") : word("源设备离线", "Source offline")}{removedCanvas ? ` · ${word("画布已移除，不支持打开", "Canvas removed, unsupported")}` : ""}</span></span>
     {actions.open && <button disabled={disabled} onClick={onOpen}>{word("打开", "Open")}</button>}
     {actions.end && !ending && <button className="danger" disabled={disabled} aria-label={word(`结束共享：${share.title}`, `End share: ${share.title}`)} onClick={() => onEnding(true)}>{word("结束共享", "End share")}</button>}
     {actions.end && ending && <div className="design-sharing-confirm" role="alertdialog" aria-label={word(`结束共享：${share.title}`, `End share: ${share.title}`)}>
@@ -68,7 +71,7 @@ export function WorkbenchDesignSharing({ controller, session, title }: { control
   const row = (share: DesignShareView) => <DesignShareRow key={share.shareId} share={share} word={word} disabled={busy || !online} ending={ending === share.shareId}
     onOpen={() => void run(async () => { await manager.join(share, { windowId, user }); setViewing(share.shareId); setOpen(false); })}
     onEnding={value => setEnding(value ? share.shareId : undefined)} onEnd={() => void run(async () => { await manager.closeShare(share.shareId); setEnding(undefined); await refresh(); })}/>;
-  const shareable = format === "canvas" || format === "slides";
+  const shareable = format === "slides";
   return <span className="design-sharing">
     <button disabled={busy && !open} aria-expanded={open} onClick={toggle} title={entry ? (entry.source.attached ? word("正在共享", "Sharing") : word("共享已暂停或离线", "Sharing paused or offline")) : word("共享与协作", "Share and collaborate")}>
       <Users size={14}/>{word("共享", "Share")}{entry ? (entry.source.attached && online ? " ●" : " ○") : ""}
@@ -80,7 +83,7 @@ export function WorkbenchDesignSharing({ controller, session, title }: { control
         {!entry ? <>
           <p className="design-sharing-muted">{word("与本对话的成员或你的其他设备一起编辑。只经过已登录的主机连接，不生成链接；这台设备离线时无法同步。", "Edit together with members of this conversation or your other devices. Only through the signed-in Host connection, no links; nothing syncs while this device is offline.")}</p>
           {shareable ? <button className="primary" disabled={busy || !online} onClick={() => void run(async () => { await manager.share(session, { conversationId, windowId, title }); await refresh(); })}>{word("开始共享", "Start sharing")}</button>
-            : <p className="design-sharing-muted">{shareErrorText(Object.assign(new Error("design_share_format_unsupported"), { code: "design_share_format_unsupported" }), word)}</p>}
+            : <p className="design-sharing-muted">{shareErrorText(Object.assign(new Error(format === "canvas" ? "design_canvas_removed" : "design_share_format_unsupported"), { code: format === "canvas" ? "design_canvas_removed" : "design_share_format_unsupported" }), word)}</p>}
         </> : <>
           <p role="status">{entry.source.attached && online ? word("正在从这台设备共享。", "Sharing from this device.") : word("已离线：恢复连接后会自动从这台设备重新提供。", "Offline: this device will serve again when the connection returns.")}</p>
           <p className="design-sharing-muted">{word("你的其他设备可在「共享给我的」中打开。", "Your other devices can open it from “Shared with me”.")}</p>
@@ -119,7 +122,14 @@ function SharedDesignViewer({ manager, shareId, online, word, onClose }: { manag
   const entry = manager.mirrorFor(shareId), state = entry?.mirror.state(), surface = useRef<HTMLDivElement>(null);
   const [error, setError] = useState<string>(), [busy, setBusy] = useState(false), [leaveFailed, setLeaveFailed] = useState(false);
   const usable = !!entry && !!state && !state.disconnected && !state.revoked;
-  useEffect(() => { if (usable && entry && surface.current) return designFrame(entry.mirror.session).attach(surface.current, setError, () => {}); }, [usable, entry]);
+  const locale = word("zh", "en") === "en" ? "en" : "zh";
+  useEffect(() => {
+    if (usable && entry && surface.current) {
+      return designFrame(entry.mirror.session).attach(surface.current, code => {
+        setError(!code ? undefined : code === "design_canvas_removed" ? workbenchErrorText(code, locale) : word("编辑器尚未就绪或保存失败。", "The editor is not ready or a save failed."));
+      }, () => {});
+    }
+  }, [usable, entry, locale]);
   if (!entry || !state) return null;
   // Leave saves the last edits while this copy can still write. If that fails the
   // copy stays open (retry, or leave without saving); it is never reported as saved.
@@ -145,7 +155,7 @@ function SharedDesignViewer({ manager, shareId, online, word, onClose }: { manag
       : !state.sourceOnline ? <p role="status">{word("源设备离线：可以查看，保存会失败。", "The source device is offline: you can look, but saving fails.")}</p>
       : <p className="design-shared-viewer-note">{word("这里的评论会同步给所有者，但不能从这里发给 Bot；需要 Bot 处理时，请在共享它的设备上发送。", "Comments here sync to the owner, but cannot be sent to a Bot from here; send them from the device that shares this design.")}</p>}
     {leaveFailed && <p role="alert">{word("最后的修改没能保存，副本仍然打开。可以重试，或不保存直接离开。", "Your last changes could not be saved, so the copy stays open. Retry, or leave without saving.")}</p>}
-    {error && <p role="alert">{word("编辑器尚未就绪或保存失败。", "The editor is not ready or a save failed.")}</p>}
+    {error && <p role="alert">{error}</p>}
     <div ref={surface} className="design-shared-viewer-surface"/>
   </div>, document.body);
 }

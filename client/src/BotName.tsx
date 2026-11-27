@@ -7,7 +7,8 @@ import claude from "./assets/model-brands/claude.svg";
 import gemini from "./assets/model-brands/gemini.svg";
 import deepseek from "./assets/model-brands/deepseek.svg";
 import kimi from "./assets/model-brands/kimi.svg";
-const icons = { openai, claude, gemini, deepseek, kimi };
+import omp from "./assets/model-brands/omp.svg";
+const icons = { openai, claude, gemini, deepseek, kimi, omp };
 
 /** Current Bot configuration, not attribution of a past message to a model. */
 export function BotName({ id, name, bot, compact = false }: { id: string; name: string; bot?: ModelIdentity; compact?: boolean }) {

@@ -51,6 +51,12 @@
 .dispatch-node-header{position:sticky;top:0;z-index:1;display:flex;align-items:center;gap:6px;padding:5px 8px;background:var(--surface);border-bottom:1px solid var(--border);font-size:11.5px;color:var(--text)}
 .dispatch-node-header>span{font-weight:550}
 .dispatch-node-header>small{margin-left:auto;font-size:11px;color:var(--muted)}
+.dispatch-ticket-scope{display:inline-flex;gap:2px;margin:2px 6px 6px;padding:2px;border-radius:8px;background:var(--surface)}
+.dispatch-ticket-scope>button{min-height:24px;padding:2px 8px;border:0;border-radius:6px;background:transparent;color:var(--muted);font-size:11px;font-weight:500}
+.dispatch-ticket-scope>button[aria-pressed=true]{background:var(--bg);color:var(--text);box-shadow:0 1px 2px rgba(0,0,0,.06)}
+.dispatch-ticket-empty{margin:4px 8px 8px;color:var(--muted);font-size:11.5px;line-height:1.5}
+.dispatch-ticket-origin{flex:none;max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:1px 6px;border:0;border-radius:999px;background:var(--surface);color:var(--muted);font-size:10.5px;line-height:1.5;min-height:0}
+.dispatch-ticket-origin:hover{color:var(--text);background:var(--hover)}
 .dispatch-ticket-list{list-style:none;margin:0 0 4px;padding:0 2px;max-height:min(232px,32dvh);overflow:auto;overscroll-behavior:contain;border-top:1px solid var(--border)}
 .dispatch-node-tickets{max-height:none;overflow:visible;border-top:0;margin:0}
 .dispatch-ticket{padding:8px 6px 4px;border-bottom:1px solid var(--border)}
@@ -75,7 +81,7 @@
 .dispatch-ticket-meta>span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.dispatch-ticket-meta>time{flex:none;margin-left:auto}
 .dispatch-ticket-actions{display:flex;flex-wrap:wrap;gap:2px;margin:2px 0 0 -6px}
 .dispatch-ticket>.prompt-queue-confirm{margin:6px 0 4px}
-@media(max-width:760px),(pointer:coarse){.dispatch-tickets-trigger{min-height:36px}.dispatch-engines button,.dispatch-ticket-actions button,.dispatch-bulk-buttons button{min-height:36px;padding:4px 8px}}
+@media(max-width:760px),(pointer:coarse){.dispatch-tickets-trigger{min-height:36px}.dispatch-engines button,.dispatch-ticket-actions button,.dispatch-bulk-buttons button,.dispatch-ticket-scope>button,.dispatch-ticket-origin{min-height:36px;padding:4px 8px}}
 /* Phone tickets keep the secondary information and controls on one row.
  * Full-width notices and cancellation confirmation stay in reading order. */
 @media(max-width:760px){

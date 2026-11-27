@@ -74,6 +74,7 @@ export interface CoreApprovalCardInput {
   requestId: string;
   toolName: string;
   toolInput?: unknown;
+  workerName?: string;
   approvalScopes?: EngineApprovalScopes;
   replyInThread?: boolean;
   locale?: Locale;
@@ -2027,9 +2028,13 @@ export function renderCoreApprovalCard(input: CoreApprovalCardInput): Record<str
   const fence = "`".repeat(fenceWidth);
   const toolInput = details === undefined ? "" : `\n\n${fence}json\n${details}\n${fence}`;
   const labels = approvalCardLabels(input.locale ?? "zh");
+  const workerTag = input.workerName?.trim()
+    ? (input.locale === "en" ? ` (from \`@${input.workerName.trim()}\`)` : `（来自 \`@${input.workerName.trim()}\`）`)
+    : "";
+  const workerSummary = input.workerName?.trim() ? `@${input.workerName.trim()} · ` : "";
 
   const elements: unknown[] = [
-    markdownElement(`**${labels.header}**\n${input.toolName}${toolInput}`),
+    markdownElement(`**${labels.header}**${workerTag}\n${input.toolName}${toolInput}`),
   ];
   if (input.approvalScopes?.session === "always") {
     elements.push(markdownElement(input.locale === "en"
@@ -2056,8 +2061,8 @@ export function renderCoreApprovalCard(input: CoreApprovalCardInput): Record<str
       update_multi: true,
       summary: {
         content: input.decidedStatus
-          ? `${input.decidedStatus} — ${input.toolName}`
-          : labels.summary(input.toolName),
+          ? `${workerSummary}${input.decidedStatus} — ${input.toolName}`
+          : `${workerSummary}${labels.summary(input.toolName)}`,
       },
     },
     body: {

@@ -38,6 +38,8 @@ export interface CoreActiveRun {
   startedAt?: number;
   /** The queued input this run executes, for an exactly targeted Stop. */
   sourceMessageId?: string;
+  /** True while preparing attachments / transcribing audio before any engine turn starts. */
+  preparingMedia?: boolean;
 }
 
 export interface CoreQueuePolicy {
@@ -107,6 +109,8 @@ export interface PendingCoreApproval {
   replyInThread?: boolean;
   askUserQuestionInput?: unknown;
   approvalEngine?: EngineApprovalRequest["engine"];
+  /** Optional swarm/subagent worker name requesting the approval or question. */
+  approvalWorkerName?: string;
   /** Tool name/input of a regular (non-AskUserQuestion) approval, kept so the decision handler can re-render the card in place as resolved. */
   approvalToolName?: string;
   approvalToolInput?: unknown;

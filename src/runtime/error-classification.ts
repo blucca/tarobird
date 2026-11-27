@@ -1,5 +1,7 @@
 import { SessionHistoryPendingError } from "../state/session-history-error.js";
 import { PiRpcCommandError } from "../codex/pi-rpc-client.js";
+import { OmpRpcCommandError, OmpStartupError } from "../codex/omp-rpc-client.js";
+import { OmpFrameError, OmpProtocolVersionError } from "../codex/omp-rpc-protocol.js";
 import { ENGINE_CONFIG_ERROR_CODE, EngineConfigError } from "../state/engine-config-error.js";
 import { FileWorkflowPreparationError } from "./file-workflow.js";
 import { EngineHistoryBusyError, EngineIncompleteResponseError } from "../codex/adapter.js";
@@ -85,6 +87,21 @@ export function renderEngineSettingsError(error: unknown, locale: "zh" | "en"): 
   if (error instanceof PiRpcCommandError && error.kind === "no-model") return locale === "zh"
     ? "Pi 尚无可用模型。请在运行 Bot 的主机上执行 `pi auth login` 或配置提供商凭据，然后重新读取模型列表并重试。"
     : "Pi has no available model. Run `pi auth login` or configure provider credentials on the host running this Bot, then refresh the model list and retry.";
+  if (error instanceof OmpRpcCommandError) {
+    const code = error.code?.toLowerCase();
+    if (code === "no_model" || code === "no-model") return locale === "zh"
+      ? "omp 尚无可用模型。请在运行 Bot 的主机上运行 `omp` 并执行 `/login`（或配置提供商凭据），然后重新读取模型列表并重试。"
+      : "omp has no available model. Run `omp` and `/login` (or configure provider credentials) on the host running this Bot, then refresh the model list and retry.";
+    if (code === "goal_continuation_disabled") return locale === "zh"
+      ? "此 omp 运行时未启用 RPC 目标自动续接，目标模式无法自动推进。请检查主机上的 omp 配置或更新 omp 后重试。"
+      : "RPC goal continuation is disabled in this omp runtime, so Goal Mode cannot advance automatically. Check your omp configuration or update omp on the host and retry.";
+    if (code === "model_unavailable" || code === "model-unavailable" || code === "invalid_model") return locale === "zh"
+      ? "所选模型在 omp 中不可用。请检查模型名称和供应商登录状态，或选择可用模型后重试。"
+      : "The selected model is not available in omp. Check the model name and provider sign-in, or select an available model and retry.";
+    if (code === "invalid_thinking_level") return locale === "zh"
+      ? "所选模型不支持此思考强度。请在 Bot 的思考强度设置中调整，或选择跟随默认；无需重启。"
+      : "The selected model does not support this thinking level. Change the Bot effort or follow its default; no restart is needed.";
+  }
   if (error instanceof EngineConfigError && error.setting === "budget" || normalizeErrorText(error).includes(`${ENGINE_CONFIG_ERROR_CODE}: Bot budget configuration is invalid`)) return locale === "zh"
     ? "无法确认 Bot 的预算配置，自动恢复已停止。请修复主机上此 Bot 的 config.json 后继续；原会话已保留。"
     : "The Bot budget configuration could not be verified, so automatic recovery stopped. Repair this Bot’s config.json on the host before continuing; the conversation is preserved.";
@@ -108,6 +125,9 @@ export function renderEngineSettingsError(error: unknown, locale: "zh" | "en"): 
       ? "DeepSeek Harness 未确认此 Bot 的模型选择，为避免用错模型，本轮未执行。请重试；若持续出现，请在 Bot 的模型设置中重新选择模型。不会自动换成其他模型。"
       : "DeepSeek Harness did not confirm this Bot's model selection, so this turn did not run to avoid using the wrong model. Retry; if it persists, choose the model again in the Bot's model settings. No other model is substituted.";
   }
+  if (isOmpModelUnavailable(normalizeErrorText(error))) return locale === "zh"
+    ? "所选模型在 omp 中不可用。请检查模型名称和供应商登录状态，或选择可用模型后重试。"
+    : "The selected model is not available in omp. Check the model name and provider sign-in, or select an available model and retry.";
   if (isPiModelUnavailable(normalizeErrorText(error))) return locale === "zh"
     ? "所选模型在 Pi 中不可用。请检查模型名称和供应商登录状态，或选择可用模型后重试。"
     : "The selected model is not available in Pi. Check the model name and provider sign-in, or select an available model and retry.";
@@ -203,8 +223,10 @@ const NAMED_ENGINE_RE = /(?:^|[^a-z0-9_./-])(?:codex|claude|kimi|deepseek|dsh|an
 // or one of our typed adapter error names before treating it as this engine.
 const PI_RUNTIME_LABEL_RE = /(?:^|[^a-z0-9_./-])pi (?:cli|rpc|adapter|bridge)(?=$|[^a-z0-9_./-])/;
 const PI_RUNTIME_ERROR_RE = /(?:^|[\r\n])pi(?:startup|rpc(?:command|closed|timeout)|bridge(?:control|handshake)|nativebridgeunavailable)error(?:$|[\r\n:])/;
+const OMP_RUNTIME_LABEL_RE = /(?:^|[^a-z0-9_./-])(?:omp|oh-my-pi) (?:cli|rpc|adapter|bridge|session|worker)(?=$|[^a-z0-9_./-])/;
+const OMP_RUNTIME_ERROR_RE = /(?:^|[\r\n])omp(?:startup|protocolversion|frame|rpccommand)error(?:$|[\r\n:])/;
 function hasNamedEngineSignal(text: string): boolean {
-  return NAMED_ENGINE_RE.test(text) || PI_RUNTIME_LABEL_RE.test(text) || PI_RUNTIME_ERROR_RE.test(text);
+  return NAMED_ENGINE_RE.test(text) || PI_RUNTIME_LABEL_RE.test(text) || PI_RUNTIME_ERROR_RE.test(text) || OMP_RUNTIME_LABEL_RE.test(text) || OMP_RUNTIME_ERROR_RE.test(text);
 }
 // Exact messages thrown by deepseek-harness-adapter.ts while selecting the Bot's model before a
 // prompt. Only the adapter's own bounded message matches; native or tool text is never scanned.
@@ -214,6 +236,9 @@ function deepSeekSelectionFailure(error: unknown): string | undefined {
 }
 function isPiModelUnavailable(text: string): boolean {
   return /invalid model selection: [^\r\n]{1,512} is not available in pi\./i.test(text);
+}
+function isOmpModelUnavailable(text: string): boolean {
+  return /invalid model selection: [^\r\n]{1,512} is not available in omp\./i.test(text);
 }
 const ENGINE_RUNTIME_RE =
   /\b(?:runtime|process|spawn|adapter|binary|cli|app-server|startup|start|starting|transport|stream|session|turn|exited|exit code)\b/;
@@ -228,7 +253,7 @@ function hasEngineCliSignal(text: string): boolean {
     return true;
   }
 
-  return PI_RUNTIME_ERROR_RE.test(text) || hasNamedEngineSignal(text) && (ENGINE_RUNTIME_RE.test(text) || ENGINE_FAILURE_RE.test(text));
+  return PI_RUNTIME_ERROR_RE.test(text) || OMP_RUNTIME_ERROR_RE.test(text) || hasNamedEngineSignal(text) && (ENGINE_RUNTIME_RE.test(text) || ENGINE_FAILURE_RE.test(text));
 }
 
 
@@ -248,6 +273,22 @@ export function classifyFailure(error: unknown): FailureCategory {
     if (error.kind === "no-model" || error.kind === "model-unavailable") return "engine-settings";
     if (error.kind === "auth") return "auth";
     if (error.kind === "busy" || error.kind === "compacting") return "engine-busy";
+  }
+  if (error instanceof OmpProtocolVersionError || error instanceof OmpFrameError || error instanceof OmpStartupError) {
+    return "engine-cli";
+  }
+  if (error instanceof OmpRpcCommandError) {
+    const code = error.code?.toLowerCase();
+    if (code === "cost_cap" || code === "budget_exceeded" || code === "quota_exceeded") return "engine-quota";
+    if (code === "no_model" || code === "no-model" || code === "model_unavailable" || code === "model-unavailable" || code === "invalid_model" || code === "invalid_thinking_level" || code === "goal_continuation_disabled") {
+      return "engine-settings";
+    }
+    if (code === "auth" || code === "unauthorized" || code === "unauthenticated" || error.httpStatus === 401) return "auth";
+    if (code === "rate_limit" || code === "rate_limited" || error.httpStatus === 429) return "engine-rate-limit";
+    if (code === "session_busy" || code === "busy" || code === "compacting") return "engine-busy";
+    if (error.httpStatus !== undefined) {
+      return error.httpStatus >= 500 || error.httpStatus === 408 ? "engine-backend" : "engine-request-rejected";
+    }
   }
   if (error instanceof Error && ["EngineRecoveryUnconfirmedError", "EngineRecoveryExhaustedError"].includes(error.name)) return "engine-incomplete";
   if (error instanceof Error && error.name === "EngineRecoveryBudgetError") return "engine-quota";
@@ -277,7 +318,7 @@ export function classifyFailure(error: unknown): FailureCategory {
   // Native Pi labels can contain Unicode or spaces. Recognize that bounded
   // diagnostic as settings, while rendering only the safe identifier above.
   if (deepSeekSelectionFailure(error)) return "engine-settings";
-  if (extractModelEffortMismatch(text) || /invalid model selection: [^\r\n]{1,512} has no "(?:off|minimal|low|medium|high|xhigh|max|ultra)" effort \(available: [a-z, ]{1,80}\)/.test(text) || isPiModelUnavailable(text) || /invalid model selection: \S{1,512} does not support effort/.test(text)) return "engine-settings";
+  if (extractModelEffortMismatch(text) || /invalid model selection: [^\r\n]{1,512} has no "(?:off|minimal|low|medium|high|xhigh|max|ultra)" effort \(available: [a-z, ]{1,80}\)/.test(text) || isPiModelUnavailable(text) || isOmpModelUnavailable(text) || /invalid model selection: \S{1,512} does not support effort/.test(text)) return "engine-settings";
 
   // A Codex thread whose writer lock is held elsewhere. The adapter appends an
   // actionable diagnosis naming the holder; keep it as its own category so the

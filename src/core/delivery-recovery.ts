@@ -4,6 +4,7 @@
 // a mock channel. Best-effort: a redelivery failure marks the row failed (a
 // later boot retries up to the attempts cap) and never blocks startup.
 
+import path from "node:path";
 import {
   markDeliveryAbandoned,
   markDeliveryAttempting,
@@ -12,6 +13,8 @@ import {
   readDeliveryObligationContent,
   sweepRecoverableDeliveries,
 } from "../state/delivery-obligation-store.js";
+import { SessionStore } from "../state/session-store.js";
+import { resolveConversationResume } from "../runtime/conversation-resume.js";
 import { appendTimelineEventBestEffort } from "../runtime/timeline-events.js";
 import { buildCoreRecoveryResponse, deliverCoreResponse } from "./delivery.js";
 import { preflightCoreResponseDeliveryDirectives } from "./delivery-followup.js";
@@ -25,6 +28,7 @@ import { isGatewayChannel } from "./channel-profile.js";
 export interface CoreRedeliveryChannel {
   profile?: "gateway" | "feishu";
   inConversation?<T>(chatId: string, operation: () => T): T;
+  conversationWorkspace?: CoreChannelLike["conversationWorkspace"];
   send(to: string, input: unknown, opts?: { replyTo?: string; replyInThread?: boolean }): Promise<unknown>;
   uploadImage?: CoreChannelLike["uploadImage"];
   managedCards?: CoreChannelLike["managedCards"];
@@ -61,12 +65,22 @@ export async function redeliverRecoveredCoreObligations(input: {
       const conversationKey = row.conversationKey ?? `lark:${row.chatId}`;
       try {
         const content = await readDeliveryObligationContent(input.stateDir, row);
+        let resumedWorkspace: string | undefined;
+        try {
+          const session = await new SessionStore(path.join(input.stateDir, "session.json")).findByConversationKeySafe(conversationKey);
+          resumedWorkspace = session.warning ? undefined : resolveConversationResume(session.record, undefined)?.workspacePath;
+        } catch {
+          resumedWorkspace = undefined;
+        }
+        const workspaceOverride = resumedWorkspace
+          ?? (await input.channel.conversationWorkspace?.(row.chatId))
+          ?? input.workspaceOverride;
         const safeReplay = buildCoreRecoveryResponse(content).trim() || (input.locale === "en"
           ? "A recovered reply contained only actions that are unsafe to rerun, so those actions were skipped."
           : "恢复的回复只包含不适合自动重跑的操作，因此已跳过这些操作。");
         const replayPreflight = await preflightCoreResponseDeliveryDirectives(safeReplay, {
           stateDir: input.stateDir,
-          workspaceOverride: input.workspaceOverride,
+          workspaceOverride,
         });
         // A failed row was already attempted and its deterministic path errors
         // were surfaced to the user. Replaying valid siblings cannot fix a
@@ -113,7 +127,7 @@ export async function redeliverRecoveredCoreObligations(input: {
             ? `${recoveredReplyMarker(input.locale)}\n\n${safeReplay}`
             : safeReplay,
           stateDir: input.stateDir,
-          workspaceOverride: input.workspaceOverride,
+          workspaceOverride,
           conversationKey,
           bridgeChatId: stableCoreNumericId(conversationKey),
           ...(row.replyTo ? { replyTo: row.replyTo } : {}),

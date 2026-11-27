@@ -1,6 +1,8 @@
 import { SessionHistoryPendingError } from "../state/session-history-error.js";
 import { EngineHistoryBusyError } from "../codex/adapter.js";
 import { PiRpcCommandError, PiStartupError } from "../codex/pi-rpc-client.js";
+import { OmpRpcCommandError, OmpStartupError } from "../codex/omp-rpc-client.js";
+import { OmpFrameError, OmpProtocolVersionError } from "../codex/omp-rpc-protocol.js";
 import { CodexThreadMissingError } from "../codex/app-server-adapter.js";
 import { archiveReadErrorMessage } from "../runtime/zip-archive.js";
 import { classifyFailure, extractQuotaResetHint, renderEngineSettingsError, renderEngineBusyError, renderMalformedToolInputError, renderDeepSeekOfficeTimeout, renderPiProviderFailure } from "../runtime/error-classification.js";
@@ -156,14 +158,32 @@ export function renderCoreUserFacingError(
   const piProvider = renderPiProviderFailure(error, category, locale);
   if (piProvider) return piProvider;
   const errorText = error instanceof Error ? `${error.name}\n${error.message}` : String(error);
+  if (error instanceof OmpProtocolVersionError) return locale === "en"
+    ? "Error: engine could not start because this oh-my-pi (omp) RPC protocol version is not supported. Update TaroBird or oh-my-pi on the host, then retry."
+    : "错误：无法启动引擎，当前主机上的 oh-my-pi (omp) RPC 协议版本不受支持。请更新主机上的 TaroBird 或 oh-my-pi 后重试。";
+  if (error instanceof OmpFrameError) return locale === "en"
+    ? "Error: engine runtime failed because an oh-my-pi (omp) RPC frame was malformed or interrupted. The conversation is preserved; retry or check the omp version on the host."
+    : "错误：引擎运行失败，oh-my-pi (omp) RPC 通信帧损坏或中断。原会话已保留，请重试或检查主机上的 omp 版本。";
   // ENOENT from spawn can mean either the executable/interpreter or cwd is missing.
   const missingLaunchPath = /^spawn [^\r\n]+ ENOENT(?:\r?\n|$)/.test(error instanceof Error ? error.message : String(error));
-  if (phase === "engine" && (missingLaunchPath || error instanceof PiStartupError && error.reason === "spawn" && error.message === "Pi executable was not found")) return locale === "en"
+  if (phase === "engine" && (missingLaunchPath || error instanceof PiStartupError && error.reason === "spawn" && error.message === "Pi executable was not found" || error instanceof OmpStartupError && error.reason === "spawn" && error.message === "omp executable was not found")) return locale === "en"
     ? "Error: the engine could not start because its executable or working directory was not found. Check the CLI installation, host PATH and Bot workspace, then retry. In Settings > Engine programs, the host owner can check detection and set the executable path."
     : "错误：无法启动引擎，找不到启动程序或工作目录。请检查主机的 CLI 安装、启动路径（PATH）和 Bot 工作目录后重试。主机所有者可到「设置 → 引擎程序」检查检测结果或指定程序路径。";
+  if (error instanceof OmpRpcCommandError && error.code?.toLowerCase() === "cost_cap") return locale === "en"
+    ? "Error: this omp session reached its cost cap (usage quota is exhausted for this budget). Adjust or clear the cap in omp, or start a new conversation."
+    : "错误：此 omp 会话已达到费用上限（当前预算使用额度已用完）。请在 omp 中调整或清除上限，或新开对话。";
   if (category === "auth" && error instanceof PiRpcCommandError) return locale === "zh"
     ? "Pi 提供商凭据缺失或已失效。请在运行 Bot 的主机上执行 `pi auth login` 或更新提供商凭据后重试；原会话已保留。"
     : "Pi provider credentials are missing or expired. Run `pi auth login` or update the provider credentials on the host running this Bot, then retry. Chat history is preserved.";
+  if (category === "auth" && error instanceof OmpRpcCommandError) return locale === "zh"
+    ? "omp 提供商凭据缺失或已失效。请在运行 Bot 的主机上运行 `omp` 并执行 `/login`（或更新提供商凭据）后重试；原会话已保留。"
+    : "omp provider credentials are missing or expired. Run `omp` and `/login` (or update provider credentials) on the host running this Bot, then retry. Chat history is preserved.";
+  if (category === "engine-request-rejected" && error instanceof OmpRpcCommandError) {
+    const label = [error.httpStatus !== undefined ? `HTTP ${error.httpStatus}` : "", error.code ?? ""].filter(Boolean).join(" · ");
+    return locale === "zh"
+      ? `错误：模型服务拒绝了本轮 omp 请求${label ? `（${label}）` : ""}。请检查所选模型、思考强度和附件后重试；重启实例无效。原会话已保留，未自动重发请求。`
+      : `Error: the model service refused this omp request${label ? ` (${label})` : ""}. Check the selected model, thinking level and attachments, then retry; restarting the instance will not help. The conversation is preserved and the request was not resent.`;
+  }
   const isAntigravityAuth = category === "auth" && /(?:antigravity|\bagy\b)/i.test(errorText);
   const isClaudeAuth = category === "auth" && error instanceof Error && error.name === "ClaudeError";
   const isKimiAuth = category === "auth" && error instanceof Error && /^Kimi Code authentication required(?:$|\n)/.test(error.message);

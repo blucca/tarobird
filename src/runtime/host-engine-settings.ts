@@ -3,9 +3,16 @@ import path from "node:path";
 import { z } from "zod";
 import { enginePathSchema, hostEngineSchema } from "../client-protocol/engine-settings.js";
 import { discoverEngineDirectories } from "../host-cli/engine-discovery.js";
+import {
+  cachedWindowsRegistryPathDirectories,
+  envLookupCaseInsensitive,
+  mergeWindowsPathEntries,
+  readWindowsPathEntries,
+  setCanonicalWindowsPath,
+} from "./windows-registry-path.js";
 
-export const ENGINE_COMMANDS = { codex: "codex", claude: "claude", antigravity: "agy", kimi: "kimi", deepseek: "dsh", pi: "pi" } as const;
-export const ENGINE_ENV_KEYS = { codex: "CODEX_EXECUTABLE", claude: "CLAUDE_EXECUTABLE", antigravity: "ANTIGRAVITY_EXECUTABLE", kimi: "KIMI_EXECUTABLE", deepseek: "DSH_EXECUTABLE", pi: "PI_EXECUTABLE" } as const;
+export const ENGINE_COMMANDS = { codex: "codex", claude: "claude", antigravity: "agy", kimi: "kimi", deepseek: "dsh", pi: "pi", omp: "omp" } as const;
+export const ENGINE_ENV_KEYS = { codex: "CODEX_EXECUTABLE", claude: "CLAUDE_EXECUTABLE", antigravity: "ANTIGRAVITY_EXECUTABLE", kimi: "KIMI_EXECUTABLE", deepseek: "DSH_EXECUTABLE", pi: "PI_EXECUTABLE", omp: "OMP_EXECUTABLE" } as const;
 export const engineSettingsFile = (directory: string) => path.join(directory, "engine-settings.json");
 export const storedEngineSettingsSchema = z.object({
   format: z.literal(1), revision: z.string().min(1).max(100), paths: z.partialRecord(hostEngineSchema, enginePathSchema),
@@ -36,18 +43,42 @@ export function readHostEngineSettings(directory: string): StoredEngineSettings 
   } catch { throw new EngineSettingsReadError(); }
   finally { closeSync(fd); }
 }
-export function hostEngineEnvironment(directory: string, base: NodeJS.ProcessEnv, settings = readHostEngineSettings(directory)): NodeJS.ProcessEnv {
+export function hostEngineEnvironment(
+  directory: string,
+  base: NodeJS.ProcessEnv,
+  settings = readHostEngineSettings(directory),
+  platform: NodeJS.Platform = process.platform,
+): NodeJS.ProcessEnv {
   // The entrypoint already built the baseline PATH. Do not prepend the desktop
   // defaults again: callers can deliberately supply an isolated environment.
-  const env = { ...base }, home = process.platform === "win32" ? base.USERPROFILE ?? base.HOME : base.HOME ?? base.USERPROFILE;
-  if (process.platform === "win32") {
+  const windows = platform === "win32";
+  const env = { ...base };
+  const home = windows
+    ? envLookupCaseInsensitive(base, "USERPROFILE") ?? envLookupCaseInsensitive(base, "HOME")
+    : base.HOME ?? base.USERPROFILE;
+  if (windows) {
     // Canonicalize only a real inherited override, never an auto-discovered
     // path. Worker-local bot.env must not outrank a differently-cased Host key.
     const explicit = base.DSH_EXECUTABLE ?? Object.entries(base).find(([key, value]) => key.toUpperCase() === "DSH_EXECUTABLE" && value !== undefined)?.[1];
     for (const key of Object.keys(env)) if (key !== "DSH_EXECUTABLE" && key.toUpperCase() === "DSH_EXECUTABLE") delete env[key];
     if (explicit !== undefined) env.DSH_EXECUTABLE = explicit;
+    // Merge inherited PATH/Path (canonicalizing key casing so no duplicate Path/PATH
+    // keys fight in child processes), cached live registry PATH, and common Windows CLI dirs.
+    const inherited = readWindowsPathEntries(base);
+    const merged = mergeWindowsPathEntries([
+      inherited.entries,
+      cachedWindowsRegistryPathDirectories(base, "win32"),
+      discoverEngineDirectories(home ?? "", base, "win32"),
+    ]);
+    setCanonicalWindowsPath(env, merged, inherited.hasKey);
+  } else if (home) {
+    env.PATH = [...new Set([...(base.PATH ?? "").split(":").filter(Boolean), ...discoverEngineDirectories(home, base, platform)])].join(":");
   }
-  if (home && process.platform !== "win32") env.PATH = [...new Set([...(base.PATH ?? "").split(path.delimiter).filter(Boolean), ...discoverEngineDirectories(home, base, process.platform)])].join(path.delimiter);
-  for (const engine of hostEngineSchema.options) if (settings.paths[engine]) env[ENGINE_ENV_KEYS[engine]] = settings.paths[engine];
+  for (const engine of hostEngineSchema.options) {
+    if (!settings.paths[engine]) continue;
+    const key = ENGINE_ENV_KEYS[engine];
+    if (windows) for (const existing of Object.keys(env)) if (existing !== key && existing.toUpperCase() === key) delete env[existing];
+    env[key] = settings.paths[engine];
+  }
   return env;
 }

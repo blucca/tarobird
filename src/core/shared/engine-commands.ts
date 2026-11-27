@@ -9,9 +9,9 @@ import { applyEngineSelection } from "../../state/instance-config.js";
 import type { CommandMessage } from "../../runtime/command-message.js";
 import type { InstanceEngine } from "../../state/instance-config.js";
 
-const ENGINE_CHOICES: InstanceEngine[] = ["claude", "codex", "kimi", "deepseek", "antigravity", "pi"];
-const ENGINE_USAGE_EN = "Usage: /engine [claude|codex|kimi|deepseek|antigravity|pi]";
-const ENGINE_USAGE_ZH = "用法: /engine [claude|codex|kimi|deepseek|antigravity|pi]";
+const ENGINE_CHOICES: InstanceEngine[] = ["claude", "codex", "kimi", "deepseek", "antigravity", "pi", "omp"];
+const ENGINE_USAGE_EN = "Usage: /engine [claude|codex|kimi|deepseek|antigravity|pi|omp]";
+const ENGINE_USAGE_ZH = "用法: /engine [claude|codex|kimi|deepseek|antigravity|pi|omp]";
 
 function isCompactCommand(text: string): boolean {
   return /^\/compact(?:@\w+)?(?:\s|$)/i.test(text.trim());
@@ -23,6 +23,10 @@ function isUltrareviewCommand(text: string): boolean {
 
 function isContextCommand(text: string): boolean {
   return /^\/context(?:@\w+)?(?:\s|$)/i.test(text.trim());
+}
+
+function isSwarmCommand(text: string): boolean {
+  return /^\/swarm(?:@\w+)?(?:\s|$)/i.test(text.trim());
 }
 
 function renderContextUsage(usage: EngineContextUsage | null, locale: Locale, engineName = "DeepSeek Harness"): string {
@@ -187,21 +191,23 @@ export async function handleLocalEngineCoreCommand(input: {
         ? [
             `当前引擎：${cfg.engine}`,
             "用 /engine <名称> 选择引擎：",
-            ...ENGINE_CHOICES.filter(engine => engine !== "pi" || cfg.role !== "dispatcher").map((engine) => `/engine ${engine}`),
+            ...ENGINE_CHOICES.filter(engine => (engine !== "pi" && engine !== "omp") || cfg.role !== "dispatcher").map((engine) => `/engine ${engine}`),
             "切换后重启此实例以生效。",
           ].join("\n")
         : [
             `Current engine: ${cfg.engine}`,
             "Choose an engine with /engine <name>:",
-            ...ENGINE_CHOICES.filter(engine => engine !== "pi" || cfg.role !== "dispatcher").map((engine) => `/engine ${engine}`),
+            ...ENGINE_CHOICES.filter(engine => (engine !== "pi" && engine !== "omp") || cfg.role !== "dispatcher").map((engine) => `/engine ${engine}`),
             "Restart this instance after switching to apply the change.",
           ].join("\n");
       await context.api.sendMessage(normalized.chatId, engineMessage);
     } else if (engineCmd.invalid || !ENGINE_CHOICES.includes(engineCmd.engine as InstanceEngine)) {
       engineMessage = locale === "zh" ? ENGINE_USAGE_ZH : ENGINE_USAGE_EN;
       await context.api.sendMessage(normalized.chatId, engineMessage);
-    } else if (engineCmd.engine === "pi" && cfg.role === "dispatcher") {
-      engineMessage = locale === "zh" ? "Pi 仅用于普通 Bot，不支持幕僚长。" : "Pi is available for ordinary Bots, not Chief of Staff Bots.";
+    } else if ((engineCmd.engine === "pi" || engineCmd.engine === "omp") && cfg.role === "dispatcher") {
+      engineMessage = engineCmd.engine === "omp"
+        ? (locale === "zh" ? "omp 仅用于普通 Bot，不支持幕僚长。" : "omp is available for ordinary Bots, not Superagent Bots.")
+        : (locale === "zh" ? "Pi 仅用于普通 Bot，不支持幕僚长。" : "Pi is available for ordinary Bots, not Superagent Bots.");
       await context.api.sendMessage(normalized.chatId, engineMessage);
     } else {
       const selectedEngine = engineCmd.engine as InstanceEngine;
@@ -247,8 +253,8 @@ export async function handleLocalEngineCoreCommand(input: {
   }
 
   if (isCompactCommand(normalized.text)) {
-    // Keep Pi's native command suffix, extension callbacks and turn scope.
-    if (cfg.engine === "pi") return false;
+    // Keep Pi/OMP's native command suffix, extension callbacks and turn scope.
+    if (cfg.engine === "pi" || cfg.engine === "omp") return false;
     const agyAcp = cfg.engine === "antigravity" && cfg.antigravityRuntime === "acp";
     if (cfg.engine !== "claude" && cfg.engine !== "kimi" && cfg.engine !== "deepseek" && !agyAcp) {
       const msg = locale === "zh"
@@ -280,7 +286,7 @@ export async function handleLocalEngineCoreCommand(input: {
         locale,
         text: "/compact",
         files: [],
-        workspaceOverride: cfg.resume?.workspacePath,
+        workspaceOverride: cfg.resume?.workspacePath ?? cfg.workspacePath,
         disableRuntimeTimeout: cfg.disableRuntimeTimeout === true,
         abortSignal: context.abortSignal,
       });
@@ -346,7 +352,7 @@ export async function handleLocalEngineCoreCommand(input: {
       locale,
       text: "/ultrareview",
       files: [],
-      workspaceOverride: cfg.resume?.workspacePath,
+      workspaceOverride: cfg.resume?.workspacePath ?? cfg.workspacePath,
       disableRuntimeTimeout: cfg.disableRuntimeTimeout === true,
       abortSignal: context.abortSignal,
     });
@@ -366,14 +372,14 @@ export async function handleLocalEngineCoreCommand(input: {
   }
 
   if (isContextCommand(normalized.text)) {
-    if (cfg.engine === "deepseek" || cfg.engine === "pi" || cfg.engine === "antigravity" && cfg.antigravityRuntime === "acp") {
+    if (cfg.engine === "deepseek" || cfg.engine === "pi" || cfg.engine === "omp" || cfg.engine === "antigravity" && cfg.antigravityRuntime === "acp") {
       const usage = await bridge.getContextUsage?.({
         chatId: normalized.chatId,
         messageThreadId: normalized.messageThreadId,
         conversationKey: normalized.conversationKey,
-        workspaceOverride: cfg.engine === "pi" ? cfg.workspacePath ?? cfg.resume?.workspacePath : cfg.resume?.workspacePath,
+        workspaceOverride: cfg.engine === "pi" || cfg.engine === "omp" ? cfg.workspacePath ?? cfg.resume?.workspacePath : cfg.resume?.workspacePath ?? cfg.workspacePath,
       }) ?? null;
-      const msg = renderContextUsage(usage, locale, cfg.engine === "pi" ? "Pi" : cfg.engine === "antigravity" ? "Antigravity" : "DeepSeek Harness");
+      const msg = renderContextUsage(usage, locale, cfg.engine === "omp" ? "oh-my-pi (omp)" : cfg.engine === "pi" ? "Pi" : cfg.engine === "antigravity" ? "Antigravity" : "DeepSeek Harness");
       await context.api.sendMessage(normalized.chatId, msg);
       await appendCommandSuccessAuditEventBestEffort(stateDir, context, normalized, {
         startedAt,
@@ -406,7 +412,7 @@ export async function handleLocalEngineCoreCommand(input: {
       locale,
       text: "/context",
       files: [],
-      workspaceOverride: cfg.resume?.workspacePath,
+      workspaceOverride: cfg.resume?.workspacePath ?? cfg.workspacePath,
       disableRuntimeTimeout: cfg.disableRuntimeTimeout === true,
       abortSignal: context.abortSignal,
     });
@@ -421,6 +427,22 @@ export async function handleLocalEngineCoreCommand(input: {
       startedAt,
       command: "context",
       responseText: result.text,
+    });
+    return true;
+  }
+
+  if (isSwarmCommand(normalized.text)) {
+    if (cfg.engine !== "antigravity") return false;
+    if (cfg.antigravityRuntime === "acp") return false;
+    const msg = locale === "zh"
+      ? "当前 Antigravity Bot 运行在 print 模式，不支持 `/swarm`（仅 `agy acp` 交互运行时支持 `/swarm`）。本次未向模型发送任何内容；请新建使用 ACP 运行时的 Antigravity Bot 后重试。"
+      : "`/swarm` is not available on Antigravity's print runtime (only the `agy acp` interactive runtime supports `/swarm`). Nothing was sent to the model; create a new Antigravity Bot on the ACP runtime to use `/swarm`.";
+    await context.api.sendMessage(normalized.chatId, msg);
+    await appendCommandSuccessAuditEventBestEffort(stateDir, context, normalized, {
+      startedAt,
+      command: "swarm",
+      responseText: msg,
+      metadata: { rejected: "print-runtime" },
     });
     return true;
   }

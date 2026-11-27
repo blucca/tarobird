@@ -261,9 +261,10 @@ export class Bridge {
   ) {
     this.supportsTurnScopedEnv = adapter.supportsTurnScopedEnv !== false;
     this.history = new ConversationHistoryController(sessionManager, adapter as CodexAdapter & NativeConversationHistoryAdapter,
-      sessionId => (this.sideSessionReaders.get(sessionId) ?? 0) > 0 || !!this.sessionTurnOwner(sessionId),
+      sessionId => !!this.sessionTurnOwner(sessionId),
       sessionId => { if (this.historyMutations.has(sessionId) || (this.sideSessionReaders.get(sessionId) ?? 0) > 0) return undefined;
-        this.historyMutations.add(sessionId); return () => { this.historyMutations.delete(sessionId); }; });
+        this.historyMutations.add(sessionId); return () => { this.historyMutations.delete(sessionId); }; },
+      sessionId => (this.sideSessionReaders.get(sessionId) ?? 0) > 0);
   }
 
   async readAccountQuota(options: import("../codex/adapter.js").EngineQuotaReadOptions): Promise<import("../codex/adapter.js").EngineQuotaReadResult | undefined> {
@@ -557,7 +558,7 @@ export class Bridge {
         return;
       }
       if (event.type === "subagent_activity") {
-        if (event.kind === "completed") unfinishedAgents.delete(event.agentId);
+        if (event.kind === "completed" || (event.kind === "interrupted" && event.terminal)) unfinishedAgents.delete(event.agentId);
         else unfinishedAgents.add(event.agentId); // An interrupt request alone is not a terminal receipt.
       }
       if (event.type === "background_task_started") unfinishedBackground.add(event.taskId);
@@ -979,6 +980,20 @@ export class Bridge {
 
   advertisedCommands(): Array<{ name: string; description: string }> {
     return this.adapter.advertisedCommands?.() ?? [];
+  }
+
+  hasReceivedAdvertisedCommands(): boolean {
+    return this.adapter.hasReceivedAdvertisedCommands?.() ?? false;
+  }
+
+  async stopBackgroundWork(input: { chatId: number; conversationKey: string; locale?: "en" | "zh"; scope?: "swarm" | "all" }): Promise<{ stopped: boolean; summary?: string }> {
+    if (!this.adapter.stopBackgroundWork || !this.sessionManager.getExistingSession) return { stopped: false };
+    const session = await this.sessionManager.getExistingSession(this.conversationScope(input));
+    if (!session) return { stopped: false };
+    return this.adapter.stopBackgroundWork(session.sessionId, {
+      locale: input.locale,
+      ...(input.scope ? { scope: input.scope } : {}),
+    });
   }
 
   async listTasks(input: { chatId: number; conversationKey: string }): Promise<EngineTaskSnapshot> {

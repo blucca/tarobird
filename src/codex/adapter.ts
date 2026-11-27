@@ -275,9 +275,11 @@ export interface EngineApprovalScopes {
 }
 
 export interface EngineApprovalRequest {
-  engine: "claude" | "codex" | "antigravity" | "kimi" | "deepseek" | "pi";
+  engine: "claude" | "codex" | "antigravity" | "kimi" | "deepseek" | "pi" | "omp";
   toolName: string;
   toolInput: unknown;
+  /** Name of the worker / subagent requesting approval or asking a question (e.g. swarm worker). */
+  workerName?: string;
   cwd?: string;
   sessionId?: string;
   abortSignal?: AbortSignal;
@@ -319,6 +321,9 @@ type UnscopedEngineStreamEvent =
       type: "subagent_activity";
       id: string;
       kind: "started" | "interacted" | "interrupted" | "completed";
+      /** True when an "interrupted" receipt is already confirmed settled by the
+       * engine (no separate "completed" receipt follows). */
+      terminal?: boolean;
       agentId: string;
       label: string;
       model?: string;
@@ -566,6 +571,10 @@ export interface CodexAdapter {
   controlNativeInput?(sessionId: string, input: { inputId: string; action: NativeInputAction }): Promise<NativeInputControlResult>;
   /** Slash commands the engine advertised (ACP available_commands_update); absent means none. */
   advertisedCommands?(): Array<{ name: string; description: string }>;
+  /** Whether an authoritative advertised-commands snapshot has arrived. */
+  hasReceivedAdvertisedCommands?(): boolean;
+  /** Stop background native work (such as an active swarm) after its initiating turn ended. */
+  stopBackgroundWork?(sessionId: string, input?: { locale?: "en" | "zh"; scope?: "swarm" | "all" }): Promise<{ stopped: boolean; summary?: string }>;
   /** Native live tasks; absent means unsupported. Handles must be worker-scoped. */
   listTasks?(sessionId: string): Promise<EngineTaskSnapshot>;
   stopTask?(sessionId: string, input: { taskId: string }): Promise<EngineTaskControlResult>;

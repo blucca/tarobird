@@ -77,7 +77,7 @@ const RESUME_SCAN_TTL_MS = 10 * 60 * 1000;
 const ANTIGRAVITY_CONVERSATION_ID_PATTERN =
   /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
 
-type PendingResumeScanKind = "claude" | "antigravity" | "kimi" | "deepseek" | "pi";
+type PendingResumeScanKind = "claude" | "antigravity" | "kimi" | "deepseek" | "pi" | "omp";
 
 const pendingResumeScans = new Map<string, {
   kind: PendingResumeScanKind;
@@ -213,6 +213,7 @@ interface LocalSessionCommandInput {
   startedAt: number;
   locale: Locale;
   cfg: SessionCommandConfig;
+  workspaceOverride?: string;
   normalized: CommandMessage;
   context: CoreTurnContext;
   sessionStore: SessionCommandStore;
@@ -227,10 +228,11 @@ interface LocalSessionCommandInput {
   scanRecentKimiSessions?: () => Promise<ScannedSession[]>;
   scanRecentDeepSeekSessions?: () => Promise<ScannedSession[]>;
   scanRecentPiSessions?: () => Promise<ScannedSession[]>;
+  scanRecentOmpSessions?: () => Promise<ScannedSession[]>;
   formatSessionListMessage?: (sessions: ScannedSession[], locale: Locale) => string;
   formatAntigravityConversationListMessage?: (sessions: ScannedSession[], locale: Locale) => string;
   sendResumeScanResult?: (input: {
-    kind: "claude" | "antigravity" | "kimi" | "deepseek" | "pi";
+    kind: "claude" | "antigravity" | "kimi" | "deepseek" | "pi" | "omp";
     sessions: ScannedSession[];
     visibleSessions: ScannedSession[];
     locale: Locale;
@@ -249,6 +251,7 @@ async function handleLocalSessionCommandUnlocked(input: LocalSessionCommandInput
     startedAt,
     locale,
     cfg,
+    workspaceOverride,
     normalized,
     context,
     sessionStore,
@@ -260,6 +263,7 @@ async function handleLocalSessionCommandUnlocked(input: LocalSessionCommandInput
     scanRecentKimiSessions,
     scanRecentDeepSeekSessions,
     scanRecentPiSessions,
+    scanRecentOmpSessions,
     formatSessionListMessage = formatSessionList,
     formatAntigravityConversationListMessage = formatAntigravityConversationList,
     sendResumeScanResult,
@@ -306,11 +310,11 @@ async function handleLocalSessionCommandUnlocked(input: LocalSessionCommandInput
 
   const resumeCmd = parseResumeCommand(normalized.text);
   if (resumeCmd) {
-    if (cfg.engine === "kimi" || cfg.engine === "deepseek" || cfg.engine === "pi") {
+    if (cfg.engine === "kimi" || cfg.engine === "deepseek" || cfg.engine === "pi" || cfg.engine === "omp") {
       const isDeepSeek = cfg.engine === "deepseek";
       const scanKind = cfg.engine;
-      const engineName = cfg.engine === "pi" ? "Pi" : isDeepSeek ? "DeepSeek Harness" : "Kimi";
-      const scanRecentHarnessSessions = cfg.engine === "pi" ? scanRecentPiSessions : isDeepSeek ? scanRecentDeepSeekSessions : scanRecentKimiSessions;
+      const engineName = cfg.engine === "omp" ? "omp" : cfg.engine === "pi" ? "Pi" : isDeepSeek ? "DeepSeek Harness" : "Kimi";
+      const scanRecentHarnessSessions = cfg.engine === "omp" ? scanRecentOmpSessions : cfg.engine === "pi" ? scanRecentPiSessions : isDeepSeek ? scanRecentDeepSeekSessions : scanRecentKimiSessions;
       if (resumeCmd.kind === "scan") {
         if (!scanRecentHarnessSessions) {
           const msg = locale === "zh"
@@ -394,7 +398,9 @@ async function handleLocalSessionCommandUnlocked(input: LocalSessionCommandInput
         if (!validateCodexThread) {
           throw new Error("external session validation unsupported");
         }
-        validatedSession = await validateCodexThread(sessionId);
+        validatedSession = workspaceOverride
+          ? await validateCodexThread(sessionId, { workspaceOverride })
+          : await validateCodexThread(sessionId);
         const candidate = validatedSession?.cwd ?? selectedSession?.workspacePath;
         if (!candidate) {
           throw new Error(`${engineName} session workspace is unavailable`);
@@ -587,7 +593,11 @@ async function handleLocalSessionCommandUnlocked(input: LocalSessionCommandInput
         if (!validateCodexThread) {
           throw new Error("codex thread validation unsupported");
         }
-        await validateCodexThread(resumeCmd.threadId);
+        if (workspaceOverride) {
+          await validateCodexThread(resumeCmd.threadId, { workspaceOverride });
+        } else {
+          await validateCodexThread(resumeCmd.threadId);
+        }
       } catch (error) {
         const detail = error instanceof Error ? error.message : String(error);
         const isNotFound = /could not resume thread|thread not found|no rollout found/i.test(detail);
@@ -809,9 +819,17 @@ async function handleLocalSessionCommandUnlocked(input: LocalSessionCommandInput
               ? (locale === "zh"
                 ? "已断开当前 DeepSeek Harness session，并恢复到 /resume 之前的对话。"
                 : "Detached from the current DeepSeek Harness session and restored the previous conversation.")
-            : (locale === "zh"
-              ? "已断开恢复的 session，并恢复到 /resume 之前的对话。"
-              : "Detached from resumed session and restored the previous conversation.");
+              : cfg.engine === "pi"
+                ? (locale === "zh"
+                  ? "已断开当前 Pi session，并恢复到 /resume 之前的对话。"
+                  : "Detached from the current Pi session and restored the previous conversation.")
+                : cfg.engine === "omp"
+                  ? (locale === "zh"
+                    ? "已断开当前 omp session，并恢复到 /resume 之前的对话。"
+                    : "Detached from the current omp session and restored the previous conversation.")
+                  : (locale === "zh"
+                    ? "已断开恢复的 session，并恢复到 /resume 之前的对话。"
+                    : "Detached from resumed session and restored the previous conversation.");
       await context.api.sendMessage(normalized.chatId, detachMessage);
     } else if (currentResume) {
       if (currentResume.symlinkPath) {
@@ -830,7 +848,7 @@ async function handleLocalSessionCommandUnlocked(input: LocalSessionCommandInput
         ? "已断开恢复的 session，回到 bot 默认工作区。"
         : "Detached from resumed session. Back to default workspace.";
       await context.api.sendMessage(normalized.chatId, detachMessage);
-    } else if (cfg.engine === "codex" || cfg.engine === "antigravity" || cfg.engine === "kimi" || cfg.engine === "deepseek" || cfg.engine === "pi") {
+    } else if (cfg.engine === "codex" || cfg.engine === "antigravity" || cfg.engine === "kimi" || cfg.engine === "deepseek" || cfg.engine === "pi" || cfg.engine === "omp") {
       const removed = await removeSessionForConversation(sessionStore, normalized);
       if (cfg.engine === "codex") {
         detachMessage = removed
@@ -858,6 +876,8 @@ async function handleLocalSessionCommandUnlocked(input: LocalSessionCommandInput
             : "No active Kimi session.");
       } else if (cfg.engine === "pi") {
         detachMessage = removed ? (locale === "zh" ? "已断开当前 Pi 会话。下一条消息会新建会话。" : "Detached from the current Pi session. The next message starts a fresh session.") : (locale === "zh" ? "当前没有绑定的 Pi 会话。" : "No active Pi session.");
+      } else if (cfg.engine === "omp") {
+        detachMessage = removed ? (locale === "zh" ? "已断开当前 omp 会话。下一条消息会新建会话。" : "Detached from the current omp session. The next message starts a fresh session.") : (locale === "zh" ? "当前没有绑定的 omp 会话。" : "No active omp session.");
       } else {
         detachMessage = removed
           ? (locale === "zh"

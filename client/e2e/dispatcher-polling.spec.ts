@@ -17,7 +17,7 @@ async function pair(page: Page, hub: HubServer) {
   await page.getByLabel("配对码", { exact: true }).waitFor({ state: "hidden" });
 }
 // Older reads (no summary) still count, so each assertion isolates one behaviour.
-const isList = (url: string) => /\/api\/bots\/disp\/tickets(\?summary=1(&capabilities=1)?(&excerpts=1)?)?$/.test(url);
+const isList = (url: string) => new URL(url).pathname === "/api/bots/disp/tickets";
 const isAvatar = (url: string) => /\/api\/bots\/disp\/tickets\?open=1(&summary=1)?$/.test(url);
 const avatar = (page: Page) => page.locator('.bot-tree[data-bot-id="disp"] .bot-identity > .avatar');
 
@@ -333,5 +333,64 @@ test("collapsed polling omits excerpts, expanded polling includes excerpts, and 
     );
     await expect(row.locator(".dispatch-ticket-detail")).toContainText("FINAL UPDATED RESULT", { timeout: 10_000 });
     await expect(row.locator(".dispatch-ticket-detail")).toContainText("report.md");
+  });
+});
+
+test("bulk actions wait for the selected ticket scope", async ({ page }) => {
+  await dispatcher(page, async hub => {
+    const original = (await hub.store.db.get<{ conversation_id: string }>("SELECT conversation_id FROM dispatch_tickets WHERE id='t_work'"))!;
+    const second = await hub.store.createConversation("owner", ["disp"], "另一对话", "other-dispatch");
+    for (const [id, conversationId, title] of [
+      ["t_home_extra", original.conversation_id, "本对话待办"],
+      ["t_other_extra", second.id, "另一对话待办"],
+    ]) {
+      await hub.store.db.run("INSERT INTO dispatch_tickets(id,dispatcher_bot_id,conversation_id,request_id,title,request,status,created_at,updated_at) VALUES(?,'disp',?,?,?,?,'queued',?,?)",
+        [id, conversationId, id, title, title, Date.now(), Date.now()]);
+    }
+    await openDispatcher(page);
+    const pane = page.locator(".host-workspace:not([hidden]) .dispatch-tickets");
+    const cancel = pane.getByRole("button", { name: "全部取消", exact: true });
+    const confirm = pane.getByRole("button", { name: "确认全部取消", exact: true });
+    const globalScope = pane.getByRole("button", { name: /^全部 \(\d+\)$/ });
+    const localScope = pane.getByRole("button", { name: /^当前对话 \(\d+\)$/ });
+
+    let globalRead: Route | undefined;
+    let holdGlobal = true;
+    let legacyLocal = false;
+    await page.route(url => isList(url.href) && url.searchParams.get("capabilities") === "1", async route => {
+      const url = new URL(route.request().url());
+      if (holdGlobal && !url.searchParams.has("conversationId")) { globalRead = route; return; }
+      if (legacyLocal && url.searchParams.has("conversationId")) {
+        url.searchParams.delete("conversationId");
+        const response = await route.fetch({ url: url.href });
+        const list = await response.json();
+        list.tickets.find((ticket: { id: string }) => ticket.id === "t_home_extra").title = "旧主机返回的本对话待办";
+        await route.fulfill({ response, json: list });
+        return;
+      }
+      await route.continue();
+    });
+    await cancel.click();
+    await expect(confirm).toBeVisible();
+    await globalScope.click();
+    await expect.poll(() => !!globalRead).toBe(true);
+    await expect(confirm).toHaveCount(0);
+    await expect(cancel).toHaveCount(0);
+    holdGlobal = false;
+    await globalRead!.continue();
+
+    await expect(pane.getByText("另一对话待办", { exact: true })).toBeVisible();
+    await cancel.click();
+    await expect(pane.getByText("取消全部 3 张未完成工单？", { exact: true })).toBeVisible();
+    legacyLocal = true;
+    const legacyResponse = page.waitForResponse(response => isList(response.url()) && new URL(response.url()).searchParams.has("conversationId"));
+    await localScope.click();
+    await legacyResponse;
+    await expect(confirm).toHaveCount(0);
+    await expect(pane.getByText("旧主机返回的本对话待办", { exact: true })).toBeVisible();
+    await expect(cancel).toHaveCount(0);
+    await expect(pane.getByText("另一对话待办", { exact: true })).toHaveCount(0);
+    await globalScope.click();
+    await expect(cancel).toBeVisible();
   });
 });

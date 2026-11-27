@@ -1,4 +1,5 @@
 import { CORE_SLASH_COMMANDS } from "../core/slash-command-registry.js";
+import { ANTIGRAVITY_APP_COMMANDS, ANTIGRAVITY_EXCLUDED_COMMANDS } from "./antigravity-commands.js";
 import { GatewayGroupModeStore, gatewayRequiresMention } from "./group-mode.js";
 import { PI_APP_COMMANDS } from "./pi-commands.js";
 
@@ -33,18 +34,45 @@ export function gatewayCommands(engine: string, query = "", engineCommands: Read
         },
       },
     });
-  if (engine === "antigravity" && engineCommands.length) {
+  if (engine === "omp" && engineCommands.length) {
     const prefix = query.replace(/^\//, "").toLowerCase();
     const taken = new Set(CORE_SLASH_COMMANDS.map(({ command }) => command));
     const seen = new Set<string>();
-    const agy = engineCommands.flatMap(({ name, description }) => {
+    const omp = engineCommands.flatMap(({ name, description }) => {
       const command = name.toLowerCase();
       if (taken.has(command) || seen.has(command) || !command.startsWith(prefix)) return [];
       seen.add(command);
       const text = description?.trim() || name;
       return [{ command: name, description: { defaultValue: text, i18n: { en_us: text, zh_cn: text } } }];
     });
-    return [...shared, ...agy];
+    return [...shared, ...omp];
+  }
+  if (engine === "antigravity") {
+    const prefix = query.replace(/^\//, "").toLowerCase();
+    const taken = new Set(CORE_SLASH_COMMANDS.map(({ command }) => command));
+    const seen = new Set<string>();
+    const curated = ANTIGRAVITY_APP_COMMANDS.filter(({ command }) => {
+      const lower = command.toLowerCase();
+      if (taken.has(lower) || seen.has(lower)) return false;
+      seen.add(lower);
+      return lower.startsWith(prefix);
+    });
+    const agy = engineCommands.flatMap(({ name, description }) => {
+      const command = name.toLowerCase();
+      if (taken.has(command) || seen.has(command) || ANTIGRAVITY_EXCLUDED_COMMANDS.has(command) || !command.startsWith(prefix)) return [];
+      seen.add(command);
+      let text = description?.trim() || name;
+      if (command === "swarm" && !/preview/i.test(text)) {
+        text = text === name ? "Start a multi-agent swarm (Preview & Quota Heavy)" : `${text} (Preview & Quota Heavy)`;
+      }
+      const zh = command === "swarm"
+        ? (text.includes("Preview & Quota Heavy")
+          ? "启动多智能体协作 Swarm（Preview & Quota Heavy · 预览 · 高配额消耗）"
+          : `${text}（Preview & Quota Heavy）`)
+        : text;
+      return [{ command: name, description: { defaultValue: text, i18n: { en_us: text, zh_cn: zh } } }];
+    });
+    return [...shared, ...curated, ...agy];
   }
   if (engine !== "pi") return shared;
   const native = new Map(PI_APP_COMMANDS.map(command => [command.command, command]));
@@ -110,6 +138,9 @@ export function renderGatewayHelp(engine: string, locale: "en" | "zh"): string {
     engine === "pi" ? english
       ? "Pi model and thinking commands apply to the current conversation; Bot defaults remain separate. While Pi is replying, plain-text Send supplements that task; choose Next turn to use the Host queue. If the task can no longer receive input and delivery is definitely rejected, the unchanged message goes to the next turn; uncertain delivery is never resent automatically. Extension commands wait for their own turn; templates and skills can supplement the current task. Use Pi conversation settings to adjust the live model. Login, logout and terminal-only actions explain their native terminal route."
       : "Pi 的模型和思考强度命令只调整当前对话，Bot 默认设置另行管理。回复中发送纯文字会补充当前任务；选择「下一轮」进入主机队列。任务已不能接收补充且确认未送达时，未改动的消息会转到下一轮；结果待确认时不会自动重发。扩展命令会单独排队执行；模板和技能可补充当前任务。「Pi 对话设置」可调整运行中的模型。登录、退出登录和终端专属操作会说明原生终端入口。"
+      : engine === "antigravity" ? english
+      ? "Antigravity Bots support native workflow commands (`/swarm`, `/swarm board`, `/grill-me`, `/plan`, `/teamwork`, `/run-workflow`, `/browser`, `/goal`, `/learn`, `/schedule`, `/boost`) directly in chat, plus live workspace skills advertised by Antigravity ACP. Side questions use TaroBird's Side Conversation or `/btw`. Desktop-only `/automation` guides you to TaroBird `/cron` or `/schedule`."
+      : "Antigravity Bot 支持在对话中直接使用原生工作流命令（`/swarm`、`/swarm board`、`/grill-me`、`/plan`、`/teamwork`、`/run-workflow`、`/browser`、`/goal`、`/learn`、`/schedule`、`/boost`）以及 Antigravity ACP 动态广播的工作区 Skill。侧边追问继续使用 TaroBird 侧边对话或 `/btw`；桌面端专属命令 `/automation` 会指引使用 TaroBird `/cron` 或 `/schedule`。"
       : english
       ? "Send queues a separate turn while a task is running. Use Steer for a plain-text instruction to the current task; Codex app-server and DeepSeek Harness integrations support this. The App does not apply the automatic /steer window. Engine-specific unsupported operations explain their limits. Engine changes require an idle restart from Operations."
       : "任务执行中，普通发送会排队另起一轮。点击「引导」将纯文字补充给当前任务；Codex app-server／DeepSeek Harness 接入支持此操作。App 不使用 /steer 自动引导窗口。不支持的引擎能力会明确说明。切换引擎后，在「运行状态」安排空闲后重启。",

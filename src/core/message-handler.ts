@@ -1,4 +1,5 @@
 import { isBotControl } from "../client-protocol/bot-messages.js";
+import { isGeneratedVoiceFilename } from "../client-protocol/voice-presentation.js";
 import { backgroundTaskBody, backgroundTaskContext, backgroundTaskReplyTo } from "./background-task-notice.js";
 import { createRunRecord, recordRunEvent } from "./run-record.js";
 import { createScopedRunPresentation, finishScopedRunPresentation } from "./scoped-run-presentation.js";
@@ -154,13 +155,14 @@ import {
   stableCoreNumericId,
   type CoreChatMode,
   type CoreIncomingMessage,
+  type CoreNormalizedAttachment,
   type CoreNormalizedBridgeMessage,
 } from "./message-normalizer.js";
 import { sendManagedCard, updateManagedCard, updateManagedCardElement, type ManagedCardHandle } from "./managed-card.js";
 import { redactCoreErrorDetail } from "./redaction.js";
 import { isTaroCubCoreSlashCommand } from "./slash-command-registry.js";
 import { verifyCoreNumericIds } from "./id-map.js";
-import type { CoreQueueCardRef, CoreServiceRuntime, PendingCoreBatch } from "./runtime.js";
+import type { CoreActiveRun, CoreQueueCardRef, CoreServiceRuntime, PendingCoreBatch } from "./runtime.js";
 import { type LarkReactionSettings, withLarkMessageReactions } from "./reactions.js";
 import type { CoreBridgeLike, CoreChannelLike, CoreFetchedMessage, CoreSendOptions } from "./types.js";
 import type { Locale } from "../runtime/locale.js";
@@ -482,7 +484,7 @@ async function runAcceptedCoreMessage(
       });
       return true;
     }
-    const stopped = await stopCoreConversation(input.runtime, normalized.conversationKey, input.stateDir);
+    const stopped = await stopCoreConversation(input.runtime, normalized.conversationKey, input.stateDir, input.bridge, messageLocale);
     const { active, droppedBurst } = stopped;
     const stopText = renderCoreConversationStop(stopped, messageLocale);
     if (stopText) {
@@ -493,7 +495,7 @@ async function runAcceptedCoreMessage(
     }
     await appendCoreTimelineEvent(input.stateDir, normalized, {
       type: "command.handled",
-      outcome: active || droppedBurst ? "success" : "noop",
+      outcome: active || droppedBurst || stopped.backgroundStopped ? "success" : "noop",
       detail: "/stop",
       ...(droppedBurst ? { metadata: { cancelledPendingBurst: droppedBurst.members.length } } : {}),
     });
@@ -541,7 +543,7 @@ async function runAcceptedCoreMessage(
   // Codex goal controls must remain reachable while an ordinary turn runs.
   // Native Claude commands still execute through its serialized input stream.
   // Never switch the App's selected session underneath a live turn here.
-  if (isCoreGoalControlCommand(commandText) && (await loadInstanceConfig(input.stateDir)).engine === "codex"
+  if (isCoreGoalControlCommand(commandText) && ["codex", "omp"].includes((await loadInstanceConfig(input.stateDir)).engine)
     && (!input.channel.canSteerConversation || await input.channel.canSteerConversation(normalized.chatId))) {
     if (!(await checkPreQueueAccess("/goal"))) return true;
     if (await tryHandleCoreGoalControlBeforeQueue({ ...input, requestApproval: requestCoreApproval, createRunCard: createCoreRunCardController }, normalized, commandText)) return true;
@@ -1046,10 +1048,9 @@ async function transitionQueuedCoreCardToStarted(
     return;
   }
 
+  const profile = channel.profile === "gateway" ? "gateway" : channelProfile();
   const hasMedia = normalized.attachments.some((attachment) =>
-    attachment.kind === "audio"
-    || attachment.kind === "video"
-    || (attachment.kind === "file" && hasTranscribableMediaExtension(attachment.fileName ?? "")));
+    isTranscribableCoreAttachment(attachment, undefined, profile));
   const hasAttachments = normalized.attachments.length > 0;
   const progressText = locale === "en"
     ? hasMedia
@@ -1725,7 +1726,7 @@ async function runNormalizedCoreMessage(
     });
   }
   cfg.resume = conversationResume;
-  const workspaceOverride = input.workspaceOverride ?? normalized.workspaceOverride ?? resolveInstanceWorkspacePath(cfg);
+  const workspaceOverride = input.workspaceOverride ?? conversationResume?.workspacePath ?? normalized.workspaceOverride ?? resolveInstanceWorkspacePath(cfg);
 
   const commandText = extractCoreMessageBody(normalized.text);
 
@@ -1740,17 +1741,19 @@ async function runNormalizedCoreMessage(
   //   this attached turn first and to the pursuit only when nothing else runs;
   // - /goal clear (abortGoal) still always ends the pursuit.
   let abortController: AbortController | undefined;
+  let activeRun: CoreActiveRun | undefined;
   let releaseRunSlot: (() => void) | undefined;
   let workflowRecordId: string | undefined;
   let workflowOutcome: "not_started" | "failed" | "delivered" = "not_started";
   const activateRun = (): AbortController => {
     if (!abortController) {
       abortController = new AbortController();
-      releaseRunSlot = claimCoreRunSlot(input.runtime, normalized.conversationKey, {
+      activeRun = {
         abortController,
         startedAt: Date.now(),
         sourceMessageId: normalized.messageId,
-      });
+      };
+      releaseRunSlot = claimCoreRunSlot(input.runtime, normalized.conversationKey, activeRun);
     }
     return abortController;
   };
@@ -1796,160 +1799,165 @@ async function runNormalizedCoreMessage(
       const workflowDownloads = downloadedAttachments.filter((attachment) => !isTranscribableCoreMedia(attachment));
       const engineVideoPaths: string[] = [];
       if (mediaDownloads.length > 0) {
-        const transcribeMedia = input.runtime.transcribeMedia ?? defaultTranscribeLarkMedia;
-        const prepareLarkVideoInput = input.runtime.prepareVideoInput ?? defaultPrepareLarkVideoInput;
-        for (const media of mediaDownloads) {
-          const isVideo = isVideoCoreMedia(media);
-          if (isVideo) {
-            let prepared: PreparedVideoInput;
+        if (activeRun) activeRun.preparingMedia = true;
+        try {
+          const transcribeMedia = input.runtime.transcribeMedia ?? defaultTranscribeLarkMedia;
+          const prepareLarkVideoInput = input.runtime.prepareVideoInput ?? defaultPrepareLarkVideoInput;
+          for (const media of mediaDownloads) {
+            const isVideo = isVideoCoreMedia(media);
+            if (isVideo) {
+              let prepared: PreparedVideoInput;
+              try {
+                prepared = await prepareLarkVideoInput(media.localPath, {
+                  abortSignal: runController.signal,
+                });
+              } catch (error) {
+                if (runController.signal.aborted) {
+                  throw error;
+                }
+                prepared = { durationSeconds: null, framePaths: [], mode: "direct" };
+              }
+              engineVideoPaths.push(...prepared.framePaths, media.localPath);
+              const fileName = media.attachment.fileName ?? path.basename(media.localPath);
+              const preparationBlock = formatPreparedVideoInput(fileName, prepared);
+              requestText = requestText.trim()
+                ? `${requestText.trim()}\n${preparationBlock}`
+                : preparationBlock;
+
+              // Long/unprobeable clips are handed directly to the agent. It can
+              // choose its own inspection strategy instead of paying for an
+              // automatic full-audio transcription the user did not request.
+              if (prepared.mode === "direct") {
+                continue;
+              }
+            }
             try {
-              prepared = await prepareLarkVideoInput(media.localPath, {
+              // Message text enables the 强制云端转写/强制本地转写 routing
+              // overrides; stateDir hosts cloud ASR job dirs (`asr-jobs/`).
+              const transcript = await transcribeMedia(media.localPath, {
+                messageText: normalized.asrRoutingText ?? normalized.text,
+                mediaKind: isVideo ? "video" : media.attachment.kind === "audio" ? "audio" : "unknown",
+                stateDir: input.stateDir,
+                ...(channelProfile() === "gateway" ? { reuse: { conversationId: normalized.chatId, attachmentId: media.attachment.fileKey } } : {}),
+                // /stop and the run-card stop button must actually kill a cloud
+                // transcription: without this the child ran to its wall clock while
+                // the chat's queue slot stayed held and the stop reported success.
                 abortSignal: runController.signal,
               });
-            } catch (error) {
-              if (runController.signal.aborted) {
-                throw error;
-              }
-              prepared = { durationSeconds: null, framePaths: [], mode: "direct" };
-            }
-            engineVideoPaths.push(...prepared.framePaths, media.localPath);
-            const fileName = media.attachment.fileName ?? path.basename(media.localPath);
-            const preparationBlock = formatPreparedVideoInput(fileName, prepared);
-            requestText = requestText.trim()
-              ? `${requestText.trim()}\n${preparationBlock}`
-              : preparationBlock;
-
-            // Long/unprobeable clips are handed directly to the agent. It can
-            // choose its own inspection strategy instead of paying for an
-            // automatic full-audio transcription the user did not request.
-            if (prepared.mode === "direct") {
-              continue;
-            }
-          }
-          try {
-            // Message text enables the 强制云端转写/强制本地转写 routing
-            // overrides; stateDir hosts cloud ASR job dirs (`asr-jobs/`).
-            const transcript = await transcribeMedia(media.localPath, {
-              messageText: normalized.asrRoutingText ?? normalized.text,
-              mediaKind: isVideo ? "video" : media.attachment.kind === "audio" ? "audio" : "unknown",
-              stateDir: input.stateDir,
-              ...(channelProfile() === "gateway" ? { reuse: { conversationId: normalized.chatId, attachmentId: media.attachment.fileKey } } : {}),
-              // /stop and the run-card stop button must actually kill a cloud
-              // transcription: without this the child ran to its wall clock while
-              // the chat's queue slot stayed held and the stop reported success.
-              abortSignal: runController.signal,
-            });
-            if (transcript.trim()) {
-              const fileName = media.attachment.fileName ?? path.basename(media.localPath);
-              const transcriptBlock = formatBridgeMediaTranscript(fileName, transcript);
-              requestText = requestText.trim() ? `${requestText.trim()}\n${transcriptBlock}` : transcriptBlock;
-            } else if (media.attachment.kind === "file") {
-              const fileName = (media.attachment.fileName ?? path.basename(media.localPath))
-                .replace(/[\r\n\t]+/g, " ")
-                .slice(0, 240);
-              const marker = `[Bridge media transcription unavailable for ${fileName}; inspect or transcribe the attached file if needed.]`;
-              requestText = requestText.trim() ? `${requestText.trim()}\n${marker}` : marker;
-            } else if (!isVideo) {
-              // An empty voice transcript has no usable engine input. Use the
-              // existing failure path instead of dispatching an empty turn.
-              throw new Error("empty_voice_transcript");
-            }
-          } catch (error) {
-            // An operator stop is not a transcription failure: reporting it as
-            // one produced a misleading "转写失败" notice plus an error timeline
-            // entry right after the user pressed stop. The turn's own abort path
-            // already reports the interruption.
-            if (isCloudAsrCancelledError(error) || runController.signal.aborted) {
-              throw error;
-            }
-            if (isPartialMediaTranscriptionError(error)) {
-              const transcriptBlock = formatBridgePartialMediaTranscript(
-                media.attachment.fileName ?? path.basename(media.localPath),
-                error.transcript,
-                error.failedChunkNumbers,
-                error.totalChunks,
-              );
-              requestText = requestText.trim()
-                ? `${requestText.trim()}\n${transcriptBlock}`
-                : transcriptBlock;
-              await appendCoreTimelineEvent(input.stateDir, normalized, {
-                type: "file.accepted",
-                outcome: "partial",
-                detail: "media transcription incomplete; partial transcript preserved",
-                metadata: {
-                  fileName: media.attachment.fileName,
-                  kind: media.attachment.kind,
-                  failedChunkNumbers: error.failedChunkNumbers,
-                  totalChunks: error.totalChunks,
-                  phase: "prepare",
-                },
-              });
-              continue;
-            }
-            if (isCloudAsrRequiredError(error)) {
-              const marker = "[Bridge cloud-only transcription did not produce usable text. Do not automatically re-upload, retry transcription, or switch to local. Explain the result to the user; wait for an explicit retry request.]";
-              requestText = requestText.trim() ? `${requestText.trim()}\n${marker}` : marker;
-            }
-            // A video always has a usable fallback: extracted frames for a
-            // short clip, or the original local path for a long/unprobeable
-            // one. Silent clips and ASR outages must not prevent the model from
-            // seeing the visual content.
-            if (isVideo) {
-              await appendCoreTimelineEvent(input.stateDir, normalized, {
-                type: "file.accepted",
-                outcome: "accepted",
-                detail: "video audio transcription failed; visual input passed through",
-                metadata: {
-                  fileName: media.attachment.fileName,
-                  kind: media.attachment.kind,
-                  phase: "prepare",
-                },
-              });
-              continue;
-            }
-            // A PROMOTED file (a recording sent as a document) still has the
-            // file itself to work with, so a failed transcription must NOT end
-            // the turn with "转写失败" — before this promotion existed the file
-            // simply reached the engine. Log it and fall through; the engine
-            // gets the path and can handle it. A genuine voice/video MESSAGE
-            // has nothing else, so it keeps the failure reply.
-            if (media.attachment.kind === "file") {
-              const fileName = (media.attachment.fileName ?? path.basename(media.localPath))
-                .replace(/[\r\n\t]+/g, " ")
-                .slice(0, 240);
-              if (!isCloudAsrRequiredError(error)) {
+              if (transcript.trim()) {
+                const fileName = media.attachment.fileName ?? path.basename(media.localPath);
+                const transcriptBlock = formatBridgeMediaTranscript(fileName, transcript);
+                requestText = requestText.trim() ? `${requestText.trim()}\n${transcriptBlock}` : transcriptBlock;
+              } else if (media.attachment.kind === "file") {
+                const fileName = (media.attachment.fileName ?? path.basename(media.localPath))
+                  .replace(/[\r\n\t]+/g, " ")
+                  .slice(0, 240);
                 const marker = `[Bridge media transcription unavailable for ${fileName}; inspect or transcribe the attached file if needed.]`;
                 requestText = requestText.trim() ? `${requestText.trim()}\n${marker}` : marker;
+              } else if (!isVideo) {
+                // An empty voice transcript has no usable engine input. Use the
+                // existing failure path instead of dispatching an empty turn.
+                throw new Error("empty_voice_transcript");
               }
+            } catch (error) {
+              // An operator stop is not a transcription failure: reporting it as
+              // one produced a misleading "转写失败" notice plus an error timeline
+              // entry right after the user pressed stop. The turn's own abort path
+              // already reports the interruption.
+              if (isCloudAsrCancelledError(error) || runController.signal.aborted) {
+                throw error;
+              }
+              if (isPartialMediaTranscriptionError(error)) {
+                const transcriptBlock = formatBridgePartialMediaTranscript(
+                  media.attachment.fileName ?? path.basename(media.localPath),
+                  error.transcript,
+                  error.failedChunkNumbers,
+                  error.totalChunks,
+                );
+                requestText = requestText.trim()
+                  ? `${requestText.trim()}\n${transcriptBlock}`
+                  : transcriptBlock;
+                await appendCoreTimelineEvent(input.stateDir, normalized, {
+                  type: "file.accepted",
+                  outcome: "partial",
+                  detail: "media transcription incomplete; partial transcript preserved",
+                  metadata: {
+                    fileName: media.attachment.fileName,
+                    kind: media.attachment.kind,
+                    failedChunkNumbers: error.failedChunkNumbers,
+                    totalChunks: error.totalChunks,
+                    phase: "prepare",
+                  },
+                });
+                continue;
+              }
+              if (isCloudAsrRequiredError(error)) {
+                const marker = "[Bridge cloud-only transcription did not produce usable text. Do not automatically re-upload, retry transcription, or switch to local. Explain the result to the user; wait for an explicit retry request.]";
+                requestText = requestText.trim() ? `${requestText.trim()}\n${marker}` : marker;
+              }
+              // A video always has a usable fallback: extracted frames for a
+              // short clip, or the original local path for a long/unprobeable
+              // one. Silent clips and ASR outages must not prevent the model from
+              // seeing the visual content.
+              if (isVideo) {
+                await appendCoreTimelineEvent(input.stateDir, normalized, {
+                  type: "file.accepted",
+                  outcome: "accepted",
+                  detail: "video audio transcription failed; visual input passed through",
+                  metadata: {
+                    fileName: media.attachment.fileName,
+                    kind: media.attachment.kind,
+                    phase: "prepare",
+                  },
+                });
+                continue;
+              }
+              // A PROMOTED file (a recording sent as a document) still has the
+              // file itself to work with, so a failed transcription must NOT end
+              // the turn with "转写失败" — before this promotion existed the file
+              // simply reached the engine. Log it and fall through; the engine
+              // gets the path and can handle it. A genuine voice/video MESSAGE
+              // has nothing else, so it keeps the failure reply.
+              if (media.attachment.kind === "file") {
+                const fileName = (media.attachment.fileName ?? path.basename(media.localPath))
+                  .replace(/[\r\n\t]+/g, " ")
+                  .slice(0, 240);
+                if (!isCloudAsrRequiredError(error)) {
+                  const marker = `[Bridge media transcription unavailable for ${fileName}; inspect or transcribe the attached file if needed.]`;
+                  requestText = requestText.trim() ? `${requestText.trim()}\n${marker}` : marker;
+                }
+                await appendCoreTimelineEvent(input.stateDir, normalized, {
+                  type: "file.accepted",
+                  outcome: "accepted",
+                  detail: "promoted media transcription failed; file passed through",
+                  metadata: {
+                    fileName: media.attachment.fileName,
+                    kind: media.attachment.kind,
+                    phase: "prepare",
+                  },
+                });
+                continue;
+              }
+              await input.channel.send(normalized.chatId, {
+                text: renderCoreAudioTranscriptionFailure(locale, isCloudAsrRequiredError(error) ? error.reason : false),
+              }, {
+                replyTo: normalized.messageId,
+                replyInThread: Boolean(normalized.threadId),
+              });
               await appendCoreTimelineEvent(input.stateDir, normalized, {
-                type: "file.accepted",
-                outcome: "accepted",
-                detail: "promoted media transcription failed; file passed through",
+                type: "turn.completed",
+                outcome: "error",
+                detail: "lark media transcription failed",
                 metadata: {
-                  fileName: media.attachment.fileName,
-                  kind: media.attachment.kind,
                   phase: "prepare",
+                  kind: media.attachment.kind,
                 },
               });
-              continue;
+              return true;
             }
-            await input.channel.send(normalized.chatId, {
-              text: renderCoreAudioTranscriptionFailure(locale, isCloudAsrRequiredError(error) ? error.reason : false),
-            }, {
-              replyTo: normalized.messageId,
-              replyInThread: Boolean(normalized.threadId),
-            });
-            await appendCoreTimelineEvent(input.stateDir, normalized, {
-              type: "turn.completed",
-              outcome: "error",
-              detail: "lark media transcription failed",
-              metadata: {
-                phase: "prepare",
-                kind: media.attachment.kind,
-              },
-            });
-            return true;
           }
+        } finally {
+          if (activeRun) activeRun.preparingMedia = false;
         }
       }
       // A PROMOTED audio file (an .m4a sent as a document, not as a Feishu
@@ -1966,6 +1974,7 @@ async function runNormalizedCoreMessage(
       ])];
       // A discussion turn always reaches the engine: an archive summary card or
       // an "archive continue" match would replace the speaker's answer.
+      runController.signal.throwIfAborted();
       const workflowResult = normalized.groupDiscussion ? null : await prepareCoreFileWorkflow({
         stateDir: input.stateDir,
         normalized: { ...normalized, text: requestText },
@@ -2066,7 +2075,27 @@ async function runNormalizedCoreMessage(
       }
       requestOutputDir = path.join(workspaceArtifactRoot(input.stateDir, "output"), safeSegment(normalized.messageId));
       await mkdir(requestOutputDir, { recursive: true });
+      runController.signal.throwIfAborted();
     } catch (error) {
+      if (isCloudAsrCancelledError(error) || runController.signal.aborted) {
+        await appendCoreTimelineEvent(input.stateDir, normalized, {
+          type: "turn.completed",
+          outcome: "interrupted",
+          detail: redactCoreErrorDetail(error),
+          metadata: {
+            phase: "prepare",
+          },
+        });
+        if (!activeRun?.hasRunCard) {
+          await input.channel.send(normalized.chatId, {
+            text: locale === "en" ? "Stopped." : "已停止。",
+          }, {
+            replyTo: normalized.messageId,
+            replyInThread: Boolean(normalized.threadId),
+          });
+        }
+        return true;
+      }
       await appendCoreTimelineEvent(input.stateDir, normalized, {
         type: "turn.completed",
         outcome: "error",
@@ -2121,6 +2150,7 @@ async function runNormalizedCoreMessage(
     // until every requested upload has a definite platform acknowledgement.
     let answerVisibleToUser = false;
     try {
+      runController.signal.throwIfAborted();
       // If a "queued" card was already shown for this conversation, take it over
       // as the run card so it transitions in place instead of being orphaned: a
       // CardKit-managed queue card is updated by card_id (seamless, survives the
@@ -2464,7 +2494,7 @@ async function runNormalizedCoreMessage(
           conversationKey: normalized.conversationKey,
           workspaceOverride,
         };
-        if (cfg.engine === "codex") {
+        if (cfg.engine === "codex" || cfg.engine === "omp") {
           await withCoreGoalCommandLock(input.runtime, normalized.conversationKey, async () => {
             if (input.runtime.activeRuns.get(normalized.conversationKey)?.goalWatch) return;
             // A failed compatibility/status read must not turn every ordinary
@@ -3088,21 +3118,27 @@ async function runNormalizedCoreMessage(
           ? "Stopping this turn does not clear a native goal. Use /goal to check it or /goal clear to remove it."
           : "停止本轮不会清除原生目标。可用 /goal 查询，或用 /goal clear 清除。"
         : "";
+      const swarmStopNote = cfg.engine === "antigravity" && /^\/swarm(?:\s|$)/i.test(normalized.text.trim())
+        ? locale === "en"
+          ? "Stopped the active swarm and ended all running workers."
+          : "已停止当前 Swarm，并结束所有运行中的 worker。"
+        : "";
+      const stopNote = [goalStopNote, swarmStopNote].filter(Boolean).join("\n\n");
       let engineFailureOutcome: "error" | "partial" = "error";
       if (terminal.kind === "interrupted") {
-        const text = goalStopNote ? [runCard?.resolveFinalText("") ?? "", goalStopNote].filter((part) => part.trim()).join("\n\n") : undefined;
+        const text = stopNote ? [runCard?.resolveFinalText("") ?? "", stopNote].filter((part) => part.trim()).join("\n\n") : undefined;
         await runCard?.interrupt(text);
       } else if (terminal.kind === "idle_timeout") {
         await runCard?.idleTimeout(terminal.minutes);
       } else {
         engineFailureOutcome = await runCard?.fail(renderCoreUserFacingError(error, "engine", locale)) ?? "error";
       }
-      // The run card already surfaces the terminal state; only send a separate
-      // message when no card is present (fallback) so we don't duplicate it.
-      if (!runCard) {
+      // The run card (or active transcription card) already surfaces the terminal state;
+      // only send a separate message when no card is present (fallback) so we don't duplicate it.
+      if (!runCard && !(terminal.kind === "interrupted" && activeRun?.hasRunCard)) {
         await input.channel.send(normalized.chatId, {
           text: terminal.kind === "interrupted"
-            ? (goalStopNote || (locale === "en" ? "Stopped." : "已停止。"))
+            ? (stopNote || (locale === "en" ? "Stopped." : "已停止。"))
             : terminal.kind === "idle_timeout"
               ? (locale === "en"
                 ? `No response for ${terminal.minutes} minute(s); the task was auto-stopped. Restart the instance if it keeps happening.`
@@ -4118,8 +4154,23 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
-function isTranscribableCoreMedia(downloaded: DownloadedCoreAttachment): boolean {
-  if (downloaded.attachment.kind === "audio" || downloaded.attachment.kind === "video") {
+function isTranscribableCoreAttachment(
+  attachment: CoreNormalizedAttachment,
+  fallbackPath?: string,
+  profile = channelProfile(),
+): boolean {
+  if (profile === "gateway") {
+    if (isVideoCoreAttachment(attachment, fallbackPath, profile)) {
+      return true;
+    }
+    if (attachment.recording !== undefined) {
+      return attachment.kind === "audio" && attachment.recording;
+    }
+    return attachment.kind === "audio"
+      && !!attachment.fileName
+      && isGeneratedVoiceFilename(attachment.fileName);
+  }
+  if (attachment.kind === "audio" || attachment.kind === "video") {
     return true;
   }
   // A recording FORWARDED from another app (WeChat, a recorder, a meeting
@@ -4127,18 +4178,33 @@ function isTranscribableCoreMedia(downloaded: DownloadedCoreAttachment): boolean
   // used to skip transcription entirely — so a 24-minute .m4a never reached the
   // long-audio cloud route and the engine transcribed it locally by hand.
   // Decide by container instead. Images and documents are unaffected.
-  if (downloaded.attachment.kind !== "file") {
+  if (attachment.kind !== "file") {
     return false;
   }
-  return hasTranscribableMediaExtension(downloaded.attachment.fileName ?? downloaded.localPath);
+  return hasTranscribableMediaExtension(attachment.fileName ?? fallbackPath ?? "");
+}
+
+function isTranscribableCoreMedia(downloaded: DownloadedCoreAttachment): boolean {
+  return isTranscribableCoreAttachment(downloaded.attachment, downloaded.localPath);
+}
+
+function isVideoCoreAttachment(
+  attachment: CoreNormalizedAttachment,
+  fallbackPath?: string,
+  profile = channelProfile(),
+): boolean {
+  if (attachment.kind === "video") {
+    return true;
+  }
+  if (attachment.kind !== "file") {
+    return false;
+  }
+  if (profile === "gateway" && attachment.mime && /^audio\//i.test(attachment.mime)) {
+    return false;
+  }
+  return hasTranscribableVideoExtension(attachment.fileName ?? fallbackPath ?? "");
 }
 
 function isVideoCoreMedia(downloaded: DownloadedCoreAttachment): boolean {
-  if (downloaded.attachment.kind === "video") {
-    return true;
-  }
-  if (downloaded.attachment.kind !== "file") {
-    return false;
-  }
-  return hasTranscribableVideoExtension(downloaded.attachment.fileName ?? downloaded.localPath);
+  return isVideoCoreAttachment(downloaded.attachment, downloaded.localPath);
 }

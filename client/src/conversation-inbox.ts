@@ -21,6 +21,8 @@ export type InboxHost = {
   viewingHistory?: boolean;
 };
 
+export const isTicketConversation = (chat: Conversation): boolean => chat.hidden === true && !!chat.ticket;
+
 export function retainsOfflineNavigation(connection: HubConnection): boolean {
   return connection.state.status !== 'online' && !connection.isClosed && !connection.isReadOnly
     && (connection.state.navigationGraceUntil ?? 0) > Date.now();
@@ -36,7 +38,7 @@ export function navigationItems(host: Pick<InboxHost, 'connection' | 'bots' | 'c
   const connected = new Set(bots.map(bot => bot.id));
   return {
     bots,
-    conversations: conversations.filter(chat => retained?.has(chat.id) || chat.type !== 'direct' || !!chat.parentId || !chat.botIds.length || chat.botIds.some(id => connected.has(id))),
+    conversations: conversations.filter(chat => retained?.has(chat.id) || isTicketConversation(chat) || chat.type !== 'direct' || !!chat.parentId || !chat.botIds.length || chat.botIds.some(id => connected.has(id))),
   };
 }
 
@@ -59,7 +61,7 @@ export function buildBotRows(hosts: Pick<InboxHost, 'id' | 'bots' | 'conversatio
     const names = new Map(host.bots.map(bot => [bot.id, bot.name]));
     for (const chat of listedConversations(host.conversations)) {
       const id = chat.botIds[0];
-      if (!id || chat.type !== 'direct' || chat.archived || chat.parentId && archived.has(chat.parentId)) continue;
+      if (!id || isTicketConversation(chat) || chat.type !== 'direct' || chat.archived || chat.parentId && archived.has(chat.parentId)) continue;
       times.set(id, Math.max(times.get(id) ?? 0, host.activity[chat.id]?.at ?? 0, chat.createdAt));
     }
     return [...new Set([...names.keys(), ...times.keys()])].map(id => ({

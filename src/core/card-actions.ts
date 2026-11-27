@@ -87,11 +87,12 @@ type AskUserQuestionCardQuestion = {
 };
 
 function isAskUserQuestionRequest(request: EngineApprovalRequest): boolean {
-  return (request.engine === "claude" || request.engine === "kimi" || request.engine === "deepseek" || request.engine === "codex" || request.engine === "pi")
+  return (request.engine === "claude" || request.engine === "kimi" || request.engine === "deepseek" || request.engine === "codex" || request.engine === "pi" || request.engine === "antigravity" || request.engine === "omp")
     && request.toolName === "AskUserQuestion";
 }
 
 function renderApprovalEngineLabel(engine: EngineApprovalRequest["engine"] | undefined): string {
+  if (engine === "omp") return "oh-my-pi";
   if (engine === "pi") return "Pi";
   if (engine === "deepseek") {
     return "DeepSeek Harness";
@@ -180,6 +181,7 @@ export async function requestCoreApproval(input: {
       ...(input.replyInThread ? { replyInThread: true } : {}),
       ...(isAskUserQuestionRequest(input.request) ? { askUserQuestionInput: input.request.toolInput } : {}),
       approvalEngine: input.request.engine,
+      ...(input.request.workerName ? { approvalWorkerName: input.request.workerName } : {}),
       approvalToolName: input.request.toolName,
       approvalToolInput: input.request.toolInput,
       approvalScopes: input.request.approvalScopes,
@@ -214,6 +216,7 @@ export async function requestCoreApproval(input: {
         requestId,
         toolInput: input.request.toolInput,
         engine: input.request.engine,
+        ...(input.request.workerName ? { workerName: input.request.workerName } : {}),
         replyInThread: input.replyInThread,
         locale: input.locale,
       });
@@ -245,6 +248,7 @@ export async function requestCoreApproval(input: {
             input.locale ?? "zh",
             0,
             input.request.engine,
+            input.request.workerName,
           ),
           options: coreReplyOptions(input.replyTo, input.replyInThread),
           locale: input.locale ?? "zh",
@@ -260,6 +264,7 @@ export async function requestCoreApproval(input: {
       requestId,
       toolName: input.request.toolName,
       toolInput: input.request.toolInput,
+      ...(input.request.workerName ? { workerName: input.request.workerName } : {}),
       approvalScopes: input.request.approvalScopes,
       replyInThread: input.replyInThread,
       locale: input.locale,
@@ -302,15 +307,18 @@ function renderCoreApprovalFallbackText(requestId: string, request: EngineApprov
   const toolInput = typeof request.toolInput === "string" ? request.toolInput : JSON.stringify(request.toolInput, null, 2);
   const choices = (["once", "session", "deny"] as const).filter((choice) => approvalScope(request.approvalScopes, choice)).map((choice) =>
     `${choice === "once" ? "/approve" : choice === "session" ? "/approve-session" : "/deny"} ${requestId} (${approvalScopeLabel(request.approvalScopes, choice, locale)})`).join(locale === "en" ? ", " : "、");
+  const workerTag = request.workerName?.trim()
+    ? (locale === "en" ? ` (from @${request.workerName.trim()})` : `（来自 @${request.workerName.trim()}）`)
+    : "";
   if (locale === "en") {
     return [
-      `Approval required: ${request.toolName}`,
+      `Approval required${workerTag}: ${request.toolName}`,
       toolInput,
       `Reply with ${choices}.`,
     ].join("\n\n");
   }
   return [
-    `需要审批：${request.toolName}`,
+    `需要审批${workerTag}：${request.toolName}`,
     toolInput,
     `请回复 ${choices}。`,
   ].join("\n\n");
@@ -372,6 +380,7 @@ function renderCoreAskUserQuestionCard(input: {
   requestId: string;
   toolInput: unknown;
   engine?: EngineApprovalRequest["engine"];
+  workerName?: string;
   replyInThread?: boolean;
   locale?: Locale;
   /**
@@ -500,9 +509,12 @@ function renderCoreAskUserQuestionCard(input: {
     })],
   });
 
-  const title = questions.length > 1
+  const worker = input.workerName?.trim();
+  const baseTitle = questions.length > 1
     ? (locale === "en" ? `${questions.length} questions` : `${questions.length} 个问题`)
     : (questions[0]?.header || (locale === "en" ? "Question" : "请选择"));
+  const title = worker && !baseTitle.toLowerCase().includes(worker.toLowerCase()) ? `@${worker} · ${baseTitle}` : baseTitle;
+  const actor = worker ? `${renderApprovalEngineLabel(input.engine)} (@${worker})` : renderApprovalEngineLabel(input.engine);
 
   return {
     schema: "2.0",
@@ -510,8 +522,8 @@ function renderCoreAskUserQuestionCard(input: {
       update_multi: true,
       summary: {
         content: locale === "en"
-          ? `${renderApprovalEngineLabel(input.engine)} is asking a question`
-          : `${renderApprovalEngineLabel(input.engine)} 请求选择`,
+          ? `${actor} is asking a question`
+          : `${actor} 请求选择`,
       },
     },
     header: {
@@ -668,12 +680,13 @@ function renderCoreAskUserQuestionFallbackText(
   locale: Locale,
   questionIndex = 0,
   engine?: EngineApprovalRequest["engine"],
+  workerName?: string,
 ): string {
   const questions = normalizeAskUserQuestions(toolInput);
   const question = questions[questionIndex] ?? questions[0];
+  const actor = workerName?.trim() ? `${renderApprovalEngineLabel(engine)} (@${workerName.trim()})` : renderApprovalEngineLabel(engine);
   if (!question) {
-    const engineName = renderApprovalEngineLabel(engine);
-    return locale === "en" ? `${engineName} is asking a question.` : `${engineName} 需要你选择。`;
+    return locale === "en" ? `${actor} is asking a question.` : `${actor} 需要你选择。`;
   }
   const options = question.options
     .map((option, index) => {
@@ -681,7 +694,10 @@ function renderCoreAskUserQuestionFallbackText(
       return `${optionMarker(index)}. ${option.label}${description}`;
     })
     .join("\n");
-  return [`**${question.header}**`, question.question, options].filter(Boolean).join("\n");
+  const header = workerName?.trim() && !question.header.toLowerCase().includes(workerName.trim().toLowerCase())
+    ? `@${workerName.trim()} · ${question.header}`
+    : question.header;
+  return [`**${header}**`, question.question, options].filter(Boolean).join("\n");
 }
 
 function normalizeAskUserQuestions(toolInput: unknown): AskUserQuestionCardQuestion[] {
@@ -826,13 +842,21 @@ export function renderCoreDroppedBurstNotice(count: number, locale: Locale): str
 
 /** Shared by /stop, the run card and Gateway's composer stop control.
  * Call only after surface authorization. Queued turns are intentionally kept. */
-export async function stopCoreConversation(runtime: CoreServiceRuntime, conversationKey: string, stateDir?: string) {
+export async function stopCoreConversation(
+  runtime: CoreServiceRuntime,
+  conversationKey: string,
+  stateDir?: string,
+  bridge?: Pick<CoreBridgeLike, "stopBackgroundWork">,
+  locale?: Locale,
+) {
   const active = runtime.activeRuns.get(conversationKey);
+  const concurrent = [...(runtime.concurrentRuns.get(conversationKey) ?? [])];
+  const hasForegroundRun = Boolean(active) || concurrent.length > 0;
   const reason = channelProfile() === "gateway" ? APP_USER_STOP_REASON : undefined;
   // Let a goal route stop to its live ordinary turns before they are aborted;
   // otherwise it mistakes this same stop request for a second goal-level stop.
   active?.abortController.abort(reason);
-  for (const run of runtime.concurrentRuns.get(conversationKey) ?? []) run.abortController.abort(reason);
+  for (const run of concurrent) run.abortController.abort(reason);
   // A goal's own question closes with the goal's signal. When this stop was
   // routed to an attached ordinary turn, the surviving pursuit keeps it.
   const survivingGoal = active?.abortController instanceof CoreGoalRunController && !active.abortController.signal.aborted
@@ -840,13 +864,38 @@ export async function stopCoreConversation(runtime: CoreServiceRuntime, conversa
   const cancelledQuestions = [...runtime.pendingApprovals.values()].filter(p => p.asyncQuestion && p.conversationKey === conversationKey
     && (!survivingGoal || p.abortSignal !== survivingGoal));
   for (const pending of cancelledQuestions) pending.abortHandler?.();
+  // When an active foreground turn (or surviving goal) already owns this stop,
+  // its abort handler manages cancellation cleanly (preserving session/cancel
+  // grace for ordinary ACP turns while still stopping active swarms). Only stop
+  // post-turn background swarms here when no foreground run owns the stop.
+  const background: { stopped: boolean; summary?: string } = !hasForegroundRun && !survivingGoal && bridge?.stopBackgroundWork
+    ? await bridge.stopBackgroundWork({
+      chatId: stableCoreNumericId(conversationKey),
+      conversationKey,
+      scope: "swarm",
+      ...(locale ? { locale } : {}),
+    }).catch(() => ({ stopped: false }))
+    : { stopped: false };
+  if (background.stopped) {
+    for (const pending of [...runtime.pendingApprovals.values()]) {
+      if (pending.conversationKey === conversationKey && !pending.cancelled) {
+        pending.abortHandler?.();
+      }
+    }
+  }
   const droppedBurst = dropPendingCoreAttachmentBurst(runtime, conversationKey);
   if (droppedBurst && stateDir) {
     await Promise.allSettled(droppedBurst.members.map((member) => appendCoreTimelineEvent(stateDir, member, {
       type: "command.handled", outcome: "noop", detail: "batch-cancelled",
     })));
   }
-  return { active, droppedBurst, cancelledQuestions: cancelledQuestions.length };
+  return {
+    active,
+    droppedBurst,
+    cancelledQuestions: cancelledQuestions.length,
+    backgroundStopped: background.stopped,
+    backgroundSummary: background.summary,
+  };
 }
 
 /** Stops only the run executing one queued input, never another turn of the
@@ -866,11 +915,15 @@ export function stopCoreRunForMessage(runtime: CoreServiceRuntime, conversationK
 }
 
 export function renderCoreConversationStop(result: Awaited<ReturnType<typeof stopCoreConversation>>, locale: Locale): string | undefined {
-  const { active, droppedBurst } = result;
-  const notice = droppedBurst ? renderCoreDroppedBurstNotice(droppedBurst.members.length, locale) : "";
+  const { active, droppedBurst, backgroundStopped, backgroundSummary } = result;
+  const notice = [
+    backgroundStopped && !active?.hasRunCard ? backgroundSummary : "",
+    droppedBurst ? renderCoreDroppedBurstNotice(droppedBurst.members.length, locale) : "",
+  ].filter(Boolean).join("\n");
   // A live run card supplies its own acknowledgment. A dropped burst has no card.
   if (active?.hasRunCard) return notice || undefined;
-  return [renderCoreStopResult(Boolean(active) || Boolean(droppedBurst) || result.cancelledQuestions > 0, locale), notice].filter(Boolean).join("\n");
+  if (backgroundStopped && backgroundSummary) return [backgroundSummary, droppedBurst ? renderCoreDroppedBurstNotice(droppedBurst.members.length, locale) : ""].filter(Boolean).join("\n");
+  return [renderCoreStopResult(Boolean(active) || Boolean(droppedBurst) || result.cancelledQuestions > 0 || backgroundStopped, locale), notice].filter(Boolean).join("\n");
 }
 
 export function isCoreApprovalTextCommand(text: string): boolean {
@@ -952,6 +1005,7 @@ export async function handleCoreApprovalTextCommand(input: {
       requestId: pending.requestId,
       toolName: pending.approvalToolName ?? "",
       toolInput: pending.approvalToolInput,
+      ...(pending.approvalWorkerName ? { workerName: pending.approvalWorkerName } : {}),
       approvalScopes: pending.approvalScopes,
       replyInThread: pending.replyInThread,
       locale,
@@ -1088,7 +1142,7 @@ export async function handleCoreCardAction(input: {
       });
       return true;
     }
-    const stopped = await stopCoreConversation(input.runtime, value.conversationKey, input.stateDir);
+    const stopped = await stopCoreConversation(input.runtime, value.conversationKey, input.stateDir, input.bridge, locale);
     const text = renderCoreConversationStop(stopped, locale);
     if (text) {
       await input.channel.send(input.event.chatId, { text }, {
@@ -1262,17 +1316,19 @@ export async function handleCoreCardAction(input: {
       );
       return true;
     }
-    const kind = cfg.engine === "pi" ? "pi" : cfg.engine === "antigravity"
+    const kind = cfg.engine === "omp" ? "omp" : cfg.engine === "pi" ? "pi" : cfg.engine === "antigravity"
       ? "antigravity"
       : cfg.engine === "kimi"
         ? "kimi"
         : cfg.engine === "deepseek"
           ? "deepseek"
           : "claude";
+    const conversationWorkspace = await input.channel.conversationWorkspace?.(input.event.chatId);
+    const effectiveWorkspace = conversationWorkspace ?? resolveInstanceWorkspacePath(cfg);
     const sessions = kind === "antigravity"
       ? await scanRecentAntigravityConversations(24)
-      : (kind === "kimi" || kind === "deepseek" || kind === "pi") && input.bridge?.listExternalSessions
-        ? (await input.bridge.listExternalSessions({ limit: 20 })).map((session) => {
+      : (kind === "kimi" || kind === "deepseek" || kind === "pi" || kind === "omp") && input.bridge?.listExternalSessions
+        ? (await input.bridge.listExternalSessions({ ...(effectiveWorkspace ? { cwd: effectiveWorkspace } : {}), limit: 20 })).map((session) => {
             const modifiedAt = new Date(session.updatedAt ?? 0);
             return {
               sessionId: session.sessionId,
@@ -1308,7 +1364,7 @@ export async function handleCoreCardAction(input: {
     value.cctb_lark === "resume" &&
     typeof value.conversationKey === "string" &&
     typeof value.sessionId === "string" &&
-    (value.engine === "claude" || value.engine === "antigravity" || value.engine === "kimi" || value.engine === "deepseek" || value.engine === "pi")
+    (value.engine === "claude" || value.engine === "antigravity" || value.engine === "kimi" || value.engine === "deepseek" || value.engine === "pi" || value.engine === "omp")
   ) {
     if (!input.stateDir) {
       return false;
@@ -1333,8 +1389,8 @@ export async function handleCoreCardAction(input: {
       return true;
     }
     let resumeValue = value;
-    if (value.engine === "kimi" || value.engine === "deepseek" || value.engine === "pi") {
-      const engineName = value.engine === "pi" ? "Pi" : value.engine === "deepseek" ? "DeepSeek Harness" : "Kimi";
+    if (value.engine === "kimi" || value.engine === "deepseek" || value.engine === "pi" || value.engine === "omp") {
+      const engineName = value.engine === "omp" ? "oh-my-pi" : value.engine === "pi" ? "Pi" : value.engine === "deepseek" ? "DeepSeek Harness" : "Kimi";
       const validateHarnessSession = input.bridge?.validateCodexThread?.bind(input.bridge);
       if (!validateHarnessSession) {
         await input.channel.send(
@@ -1345,7 +1401,10 @@ export async function handleCoreCardAction(input: {
         return true;
       }
       try {
-        const validated = await validateHarnessSession(value.sessionId);
+        const conversationWorkspace = (await input.channel.conversationWorkspace?.(input.event.chatId)) ?? resolveInstanceWorkspacePath(currentConfig);
+        const validated = conversationWorkspace
+          ? await validateHarnessSession(value.sessionId, { workspaceOverride: conversationWorkspace })
+          : await validateHarnessSession(value.sessionId);
         if (!validated?.cwd) {
           throw new Error(`${engineName} session workspace is unavailable`);
         }
@@ -1479,6 +1538,7 @@ export async function handleCoreCardAction(input: {
         requestId: pending.requestId,
         toolInput: pending.askUserQuestionInput,
         engine: pending.approvalEngine,
+        ...(pending.approvalWorkerName ? { workerName: pending.approvalWorkerName } : {}),
         ...(pending.replyInThread ?? replyInThread ? { replyInThread: true } : {}),
         locale,
         selections: formValue,
@@ -1708,7 +1768,7 @@ export async function handleCoreCardAction(input: {
         ...root,
         questions: Array.isArray(root.questions) ? root.questions : questions,
         answers,
-        ...(pending.approvalEngine === "pi" ? { selections: askFormPiSelections(questions, formValue) } : {}),
+        ...(pending.approvalEngine === "pi" || pending.approvalEngine === "omp" ? { selections: askFormPiSelections(questions, formValue) } : {}),
       },
       ...(onAnswerProgress ? { onAnswerProgress } : {}),
     };
@@ -1861,6 +1921,7 @@ export async function handleCoreCardAction(input: {
         requestId: value.requestId,
         toolName: pending.approvalToolName ?? "",
         toolInput: pending.approvalToolInput,
+        ...(pending.approvalWorkerName ? { workerName: pending.approvalWorkerName } : {}),
         approvalScopes: pending.approvalScopes,
         replyInThread: pending.replyInThread ?? replyInThread,
         locale,
@@ -2543,7 +2604,9 @@ async function runCoreCardChoice(input: {
     // Card-driven turns must see the CONVERSATION's resumed workspace, not the
     // raw instance config — see applyConversationResumeScope.
     await applyConversationResumeScope(input.stateDir, input.conversationKey, cfg);
-    const workspaceOverride = resolveInstanceWorkspacePath(cfg);
+    const workspaceOverride = cfg.resume?.workspacePath
+      ?? (await input.channel.conversationWorkspace?.(input.chatId))
+      ?? resolveInstanceWorkspacePath(cfg);
     // Enforce the spend budget before running the engine (parity with the
     // message-turn and bus entry points).
     const budgetExhausted = await checkBudgetAvailability(input.stateDir, cfg.budgetUsd, locale);
@@ -2817,7 +2880,9 @@ async function runCoreArchiveContinueCardAction(input: {
     // Card-driven turns must see the CONVERSATION's resumed workspace, not the
     // raw instance config — see applyConversationResumeScope.
     await applyConversationResumeScope(input.stateDir, input.conversationKey, cfg);
-    const workspaceOverride = resolveInstanceWorkspacePath(cfg);
+    const workspaceOverride = cfg.resume?.workspacePath
+      ?? (await input.channel.conversationWorkspace?.(input.chatId))
+      ?? resolveInstanceWorkspacePath(cfg);
     // Enforce the spend budget before running the engine (parity with the
     // message-turn and bus entry points).
     const budgetExhausted = await checkBudgetAvailability(input.stateDir, cfg.budgetUsd, locale);
@@ -3346,7 +3411,9 @@ async function applyCoreResumeCardActionUnlocked(
       ? "kimi"
       : value.engine === "deepseek"
         ? "deepseek"
-        : value.engine === "pi" ? "pi" : "claude";
+        : value.engine === "pi"
+          ? "pi"
+          : value.engine === "omp" ? "omp" : "claude";
   const sessionId = String(value.sessionId);
   const sessionStore = new SessionStore(path.join(stateDir, "session.json"));
   const cfg = await loadInstanceConfig(stateDir);
@@ -3354,7 +3421,7 @@ async function applyCoreResumeCardActionUnlocked(
     return renderCoreResumeEngineChanged(locale);
   }
   let workspacePath: string | null = null;
-  if (engine === "claude" || engine === "kimi" || engine === "deepseek" || engine === "pi") {
+  if (engine === "claude" || engine === "kimi" || engine === "deepseek" || engine === "pi" || engine === "omp") {
     const candidate = typeof value.workspacePath === "string" && value.workspacePath.trim()
       ? value.workspacePath
       : null;
@@ -3378,7 +3445,7 @@ async function applyCoreResumeCardActionUnlocked(
 
   const existing = await sessionStore.findByConversationKeySafe(conversationKey);
   const currentResume = resolveConversationResume(existing.record, cfg.resume);
-  const nextResume: ResumeState | null = (engine === "claude" || engine === "kimi" || engine === "deepseek" || engine === "pi") && workspacePath
+  const nextResume: ResumeState | null = (engine === "claude" || engine === "kimi" || engine === "deepseek" || engine === "pi" || engine === "omp") && workspacePath
     ? {
       sessionId,
       dirName: typeof value.dirName === "string" ? value.dirName : sessionId,
@@ -3398,7 +3465,7 @@ async function applyCoreResumeCardActionUnlocked(
     }),
   });
 
-  if ((engine === "claude" || engine === "kimi" || engine === "deepseek" || engine === "pi") && workspacePath) {
+  if ((engine === "claude" || engine === "kimi" || engine === "deepseek" || engine === "pi" || engine === "omp") && workspacePath) {
     await updateInstanceConfig(stateDir, (config) => {
       delete config.resume;
     });
@@ -3412,6 +3479,11 @@ async function applyCoreResumeCardActionUnlocked(
       return locale === "en"
         ? `Attached Pi session: ${sessionId}\nWorkspace: ${workspacePath}\n\nSend a message to continue. Use /detach when done.`
         : `已绑定 Pi session：${sessionId}\n工作区：${workspacePath}\n\n发送消息继续对话，完成后发 /detach 断开。`;
+    }
+    if (engine === "omp") {
+      return locale === "en"
+        ? `Attached omp session: ${sessionId}\nWorkspace: ${workspacePath}\n\nSend a message to continue. Use /detach when done.`
+        : `已绑定 omp session：${sessionId}\n工作区：${workspacePath}\n\n发送消息继续对话，完成后发 /detach 断开。`;
     }
     if (engine === "deepseek") {
       return locale === "en"
