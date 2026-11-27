@@ -39,7 +39,7 @@ test("empty Workbench opens shared designs in Chinese and English without creati
   const chinese=await openList(other);await expect(chinese).toBeInViewport();await expect(chinese).toContainText("这个对话里暂时没有共享给你的设计。");expect(await localDesignCount(other)).toBe(0);await chinese.getByRole("button",{name:"关闭",exact:true}).click();await expect(chinese).toHaveCount(0);
   await openSettings(other,"general");await other.locator("#language").selectOption("en");await closeSettings(other,true);
   const english=await openList(other,true);await expect(english).toBeInViewport();await expect(english).toContainText("Nothing in this conversation is shared with you yet.");await english.getByRole("button",{name:"Close",exact:true}).click();
-  await connect(page,f.hub,f.conversation.title);await panel(page).getByRole("button",{name:"新建内容",exact:true}).click();await panel(page).getByRole("menu").getByRole("button",{name:"PPT",exact:true}).click();
+  await connect(page,f.hub,f.conversation.title);await panel(page).getByRole("button",{name:"新建内容",exact:true}).click();await panel(page).getByRole("menu").getByRole("button",{name:"演示文稿",exact:true}).click();
   await expect(page.frameLocator(".workbench-design-frame:visible").getByRole("button",{name:"Comments",exact:true})).toBeVisible({timeout:45000});
   // Fixture-only access to the retained sharing component; the product entry is hidden.
   await expect(panel(page).getByRole("button",{name:"共享",exact:true})).toHaveCount(0);

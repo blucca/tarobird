@@ -43,7 +43,7 @@ test("PPT renders a real deck, Bot edits persist, and canvas creation is rejecte
     const publish = await f.command({requestId:"slides-write",operation:"design.publish",target,expectedRevision:read.revision,payload:{files:{"project/slides/cover.html":{content:(read.result as {content:string}).content.replace("Slide acceptance","Bot edited slide"),contentType:"text/html"}}}});
     expect(publish).toMatchObject({status:"applied",saved:true});
     await expect(editor.getByText("Bot edited slide",{exact:true}).first()).toBeVisible({timeout:20000});
-    await page.screenshot({path:info.outputPath("baoyu-ppt.png")});
+    await page.screenshot({path:info.outputPath("presentation.png")});
     const guest = page.frames().find(frame => frame.parentFrame() === page.mainFrame())!;
     expect(await guest.evaluate(() => {try{return parent.document.title}catch{return "isolated"}})).toBe("isolated");
     expect(await guest.evaluate(async () => {try{await fetch("https://example.com");return "connected"}catch{return "blocked"}})).toBe("blocked");
@@ -94,7 +94,7 @@ test('PPT manual edit survives immediate close, exports PPTX, and renders local 
     const {default:AdmZip}=await import('adm-zip');const zip=new AdmZip(bytes);
     expect(zip.getEntries().map(item=>item.entryName)).toContain('ppt/slides/slide1.xml');
     expect(zip.readAsText('ppt/slides/slide1.xml')).toContain('Human PPT edit');
-    await page.screenshot({path:info.outputPath('baoyu-ppt-manual.png')});
+    await page.screenshot({path:info.outputPath('presentation-manual.png')});
   }catch(error){console.log('PPT_EDITOR_STATE',await page.frameLocator('.workbench-design-frame').locator('body').ariaSnapshot().catch(()=>''));throw error;}
   finally{await f.close();}
 });

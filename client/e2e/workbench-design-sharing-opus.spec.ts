@@ -25,7 +25,7 @@ async function connect(page: Page, hub: HubServer, title: string, userId = "owne
 }
 async function newDesign(page: Page) {
   await panel(page).getByRole("button", { name: "新建内容", exact: true }).click();
-  await panel(page).getByRole("menu").getByRole("button", { name: "PPT", exact: true }).click();
+  await panel(page).getByRole("menu").getByRole("button", { name: "演示文稿", exact: true }).click();
   // The product hides this entry. Reveal it only in this legacy collaboration
   // fixture so the retained sharing component/protocol still has coverage.
   await panel(page).locator(".workbench-design-sharing-entry").evaluate(node => node.removeAttribute("hidden"));
@@ -53,7 +53,7 @@ test("opus: owner shares a Baoyu PPT from one device and edits it from another; 
   try {
     // Device A: create a PPT, give it a recognisable title, share it (explicit click).
     await connect(page, hub, conversation.title); await newDesign(page);
-    await editHeading(page, await waitHeading(page, "PPT"), "Shared from A");
+    await editHeading(page, await waitHeading(page, "演示文稿"), "Shared from A");
     await waitHeading(page, "Shared from A");
     await panel(page).getByRole("button", { name: /^共享/ }).click();
     const dialog = page.getByRole("dialog", { name: "共享与协作", exact: true });
@@ -64,10 +64,10 @@ test("opus: owner shares a Baoyu PPT from one device and edits it from another; 
     await dialog.getByRole("button", { name: "关闭", exact: true }).click();
 
     // Device B (the owner's other device): find it under "Shared with me" and open it.
-    await connect(other, hub, conversation.title); await newDesign(other); await waitHeading(other, "PPT");
+    await connect(other, hub, conversation.title); await newDesign(other); await waitHeading(other, "演示文稿");
     await panel(other).getByRole("button", { name: /^共享/ }).click();
     const otherDialog = other.getByRole("dialog", { name: "共享与协作", exact: true });
-    const item = otherDialog.locator(".design-sharing-list li").filter({ hasText: "PPT" });
+    const item = otherDialog.locator(".design-sharing-list li").filter({ hasText: "演示文稿" });
     await expect(item).toContainText("所有者", { timeout: 15000 }); await expect(item).toContainText("源设备在线");
     await item.getByRole("button", { name: "打开", exact: true }).click();
     const viewer = other.getByRole("region", { name: /^共享的设计：/ });
@@ -103,7 +103,7 @@ test("opus: owner shares a Baoyu PPT from one device and edits it from another; 
     await expect.poll(() => sourceContains("Left from B"), { timeout: 30000 }).toBe(1);
     // Reopen from "Shared with me" for the stop-sharing check below.
     await panel(other).getByRole("button", { name: /^共享/ }).click();
-    await otherDialog.locator(".design-sharing-list li").filter({ hasText: "PPT" }).getByRole("button", { name: "打开", exact: true }).click();
+    await otherDialog.locator(".design-sharing-list li").filter({ hasText: "演示文稿" }).getByRole("button", { name: "打开", exact: true }).click();
     await expect(viewer).toBeVisible(); await waitHeading(other, "Left from B");
 
     // A stops sharing: B's copy ends, and A's document keeps the shared edit.
@@ -130,7 +130,7 @@ test("opus: the owner grants a real conversation member view-only access from th
   const broker = (hub as unknown as { workbench: WorkbenchBroker }).workbench, actor = { userId: "owner", conversationId: conversation.id, validate: async () => undefined };
   try {
     await connect(page, hub, conversation.title); await newDesign(page);
-    await editHeading(page, await waitHeading(page, "PPT"), "Owner only text"); await waitHeading(page, "Owner only text");
+    await editHeading(page, await waitHeading(page, "演示文稿"), "Owner only text"); await waitHeading(page, "Owner only text");
     await panel(page).getByRole("button", { name: /^共享/ }).click();
     const dialog = page.getByRole("dialog", { name: "共享与协作", exact: true });
     await dialog.getByRole("button", { name: "开始共享", exact: true }).click();
@@ -139,9 +139,9 @@ test("opus: the owner grants a real conversation member view-only access from th
     await picker.selectOption("viewer");
     await expect(picker).toHaveValue("viewer");
 
-    await connect(guest, hub, conversation.title, "guest"); await newDesign(guest); await waitHeading(guest, "PPT");
+    await connect(guest, hub, conversation.title, "guest"); await newDesign(guest); await waitHeading(guest, "演示文稿");
     await panel(guest).getByRole("button", { name: /^共享/ }).click();
-    const item = guest.getByRole("dialog", { name: "共享与协作", exact: true }).locator(".design-sharing-list li").filter({ hasText: "PPT" });
+    const item = guest.getByRole("dialog", { name: "共享与协作", exact: true }).locator(".design-sharing-list li").filter({ hasText: "演示文稿" });
     await expect(item).toContainText("仅查看", { timeout: 15000 });
     await item.getByRole("button", { name: "打开", exact: true }).click();
     const viewer = guest.getByRole("region", { name: /^共享的设计：/ });
@@ -174,7 +174,7 @@ test("owner deletes a shared PPT offline, then ends its orphan share from the em
   const conversation = await hub.store.createConversation("owner", ["bot"], "Orphan share recovery", "new");
   const records = async () => (await hub.store.db.serial(() => hub.store.db.all<{ value: string }>("SELECT value FROM meta WHERE key LIKE 'workbench-design-share:%'"))).map(row => JSON.parse(row.value));
   try {
-    await connect(page, hub, conversation.title); await newDesign(page); await waitHeading(page, "PPT");
+    await connect(page, hub, conversation.title); await newDesign(page); await waitHeading(page, "演示文稿");
     await panel(page).getByRole("button", { name: /^共享/ }).click();
     const dialog = page.getByRole("dialog", { name: "共享与协作", exact: true });
     await dialog.getByRole("button", { name: "开始共享", exact: true }).click();
@@ -182,7 +182,7 @@ test("owner deletes a shared PPT offline, then ends its orphan share from the em
     await page.context().setOffline(true);
     await expect(dialog.getByText("当前未连接主机，无法共享或加入。", { exact: true })).toBeVisible({ timeout: 15000 });
     await dialog.getByRole("button", { name: "关闭", exact: true }).click();
-    await panel(page).getByRole("tab", { name: "PPT", exact: true }).click({ button: "right" });
+    await panel(page).getByRole("tab", { name: "演示文稿", exact: true }).click({ button: "right" });
     await page.getByRole("button", { name: "关闭标签", exact: true }).click();
     await expect(panel(page).getByRole("tab")).toHaveCount(0);
     await panel(page).getByRole("button", { name: "全部标签和已关闭内容", exact: true }).click();
@@ -193,7 +193,7 @@ test("owner deletes a shared PPT offline, then ends its orphan share from the em
     await panel(page).getByRole("button", { name: "新建内容", exact: true }).click();
     await panel(page).getByRole("button", { name: "共享给我的项目", exact: true }).click();
     const shared = page.getByRole("region", { name: "共享给我的项目", exact: true });
-    const row = shared.locator(".design-sharing-list li").filter({ hasText: "PPT" });
+    const row = shared.locator(".design-sharing-list li").filter({ hasText: "演示文稿" });
     await expect(row).toContainText("源设备离线", { timeout: 15000 });
     await expect(row.getByRole("button", { name: "打开", exact: true })).toHaveCount(0);
     await row.getByRole("button", { name: "结束共享：PPT", exact: true }).click();
