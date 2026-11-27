@@ -807,3 +807,19 @@ it.runIf(process.platform !== "win32")("serves a warm catalog while discovery re
   expect(settings.environment().DSH_EXECUTABLE).toBe(newDsh);
   expect(readEngineDiscoveryCache(root).paths.deepseek).toBe(newDsh);
 });
+
+it.runIf(process.platform !== "win32")("never spawns the login shell for a bare environment without HOME", async () => {
+  const calls: Array<{ file: string; args: string[] }> = [];
+  const runner: CommandRunner = async (file, args) => { calls.push({ file, args }); return { stdout: "", stderr: "" }; };
+  const isShellProbe = (args: string[]) => args.some(arg => arg === "-ilc" || arg === "-ic");
+
+  const probe = await probeLoginShellEnvironment({ env: { PATH: "/usr/bin:/bin" }, commands: ["codex"], shell: "/bin/sh", runner });
+  expect(probe).toEqual({ ok: false, status: "skipped", pathDirs: [], resolvedCommands: {} });
+  const discovery = await runEnvironmentDiscovery({ baseEnv: { PATH: "/usr/bin:/bin" }, commands: ["codex", "agy"], forceRefresh: true, runner });
+  expect(discovery.shell.status).toBe("skipped");
+  expect(calls.filter(call => isShellProbe(call.args))).toEqual([]);
+
+  // With HOME present the probe still runs (unchanged behaviour).
+  await probeLoginShellEnvironment({ env: { HOME: os.homedir(), PATH: "/usr/bin:/bin" }, commands: ["codex"], shell: "/bin/sh", runner });
+  expect(calls.filter(call => isShellProbe(call.args))).toHaveLength(1);
+});

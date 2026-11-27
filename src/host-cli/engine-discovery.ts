@@ -367,6 +367,9 @@ export async function probeLoginShellEnvironment(options: {
   if (platform === "win32") return { ok: false, status: "skipped", pathDirs: [], resolvedCommands: {} };
 
   const env = options.env ?? process.env;
+  // A bare environment (no HOME) has no profile to source, and an explicitly
+  // supplied one must not be widened by the real user's login shell.
+  if (!env.HOME?.trim()) return { ok: false, status: "skipped", pathDirs: [], resolvedCommands: {} };
   if (env[SHELL_ENV_PROBE_FLAG] === "0" || env[SHELL_ENV_PROBE_FLAG] === "1") {
     return { ok: false, status: "skipped", pathDirs: [], resolvedCommands: {} };
   }
