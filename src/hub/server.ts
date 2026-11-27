@@ -1751,7 +1751,10 @@ export class HubServer {
             // Executable paths are private host diagnostics, never audit payloads.
             await this.store.db.run("INSERT INTO audit_log(at,actor,kind,detail_json) VALUES(?,?,?,?)", [Date.now(), session.deviceId, "engines.settings-updated", JSON.stringify({ engine: command.engine, manual: command.path !== null, requestId: command.requestId })]);
           }));
-        } else view = this.engineSettings.status(idSchema.optional().parse(url.searchParams.get("requestId") ?? undefined));
+        } else {
+          await this.engineSettings.refresh();
+          view = this.engineSettings.status(idSchema.optional().parse(url.searchParams.get("requestId") ?? undefined));
+        }
         // Existing clients validate a closed five-engine enum. Keep their
         // complete settings page usable until they opt into Pi support.
         await reply(200, url.searchParams.get("includePi") === "1" ? view : { ...view, engines: view.engines.filter(engine => engine.id !== "pi") }); return;
@@ -2233,7 +2236,8 @@ export class HubServer {
           // `refresh=<engine>` is the owner's "Refresh models": a new read of that engine, past the short retry
           // window that keeps an unanswered read from starting the CLI on every look.
           const refresh = createBotSchema.shape.engine.optional().parse(url.searchParams.get("refresh") ?? undefined);
-          const catalog = await this.botManager.catalog(z.string().max(4096).optional().parse(url.searchParams.get("workspace") ?? undefined), refresh);
+          const redetect = url.searchParams.get("redetect") === "1";
+          const catalog = await this.botManager.catalog(z.string().max(4096).optional().parse(url.searchParams.get("workspace") ?? undefined), refresh, { forceRefresh: redetect });
           // Existing clients do not understand Pi's provider/effort settings.
           // New App and CLI catalog readers opt in, just as engine settings do.
           await reply(200, url.searchParams.get("includePi") === "1" ? catalog : { ...catalog, engines: catalog.engines.filter(engine => engine.id !== "pi") });
