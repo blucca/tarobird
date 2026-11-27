@@ -1660,6 +1660,30 @@
           "fingerprint": "94424f22c21cb2aa20f3ce0a90556555901c009da066016d24a48fc869a4a2b6"
         }
       ]
+    },
+    {
+      "path": "client/vendor/workbench-slides/editor/assets/index-DaF3puIc.js",
+      "sha256": "2c4af5c5e5d54b58c191bef23b6c5f97f6c0dc2336cff8b759994efa6c6b0968",
+      "reviewer": "antigravity",
+      "note": "Reviewed Lucide SVG path coordinates bundled in Apache-2.0 @open-artifact/slides-editor v0.14.6; dotted numeric graphics syntax is not an IP address, no private data.",
+      "findings": [
+        {
+          "kind": "non-example-public-ip",
+          "fingerprint": "336f8bdbd0706531cd5101c4d599b46522be75cf6d81edddb9e8b20b1d878f51"
+        }
+      ]
+    },
+    {
+      "path": "client/vendor/workbench-slides/THIRD-PARTY-NOTICES.txt",
+      "sha256": "daddb046ce595b986fd7b32b1c1e23c13d71c672c7bf395b06cfa2f346d472c4",
+      "reviewer": "fable",
+      "note": "Reviewed the one match: the author's contact address inside the copyright line of the clsx MIT licence, reproduced verbatim from that package's own license file as the licence requires. A public licence attribution; no owner, user or deployment data.",
+      "findings": [
+        {
+          "kind": "personal-email",
+          "fingerprint": "bdf9ce3b6fad26286e88dc74fe508107913344140b3282382d6ee4c290e7175c"
+        }
+      ]
     }
   ]
 }

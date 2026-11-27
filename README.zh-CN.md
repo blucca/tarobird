@@ -137,15 +137,7 @@ TaroBird 是一款自托管的 AI 智能体工作空间。它把电脑或服务�
 
 <a id="workbench"></a>
 <h3 align="center">工作台 · 把资料和创作放在对话旁</h3>
-<p align="center">网页浏览、画布、白板、Markdown 笔记与 PPT，在同一个工作台切换。<br>每段对话保留自己的工作台，可放在侧边，也可展开到主区。</p>
-
-<h3 align="center">画布 · 从想法到可修改的作品</h3>
-<p align="center">和 Bot 一起制作页面、海报或视觉草稿。<br>双击文字继续编辑，边看效果边完善。</p>
-
-<p align="center">
-  <a href="assets/product/workbench-canvas-zh.png"><img src="assets/product/canvas-demo-zh.gif" width="100%" alt="画布演示：打开一张暖色工作室发布页，双击标题并修改文字，查看更新后的完整画布"></a>
-</p>
-<p align="center"><sub>真实界面录制，使用演示内容 · <a href="assets/product/workbench-canvas-zh.png">查看原图</a> · <a href="docs/client/workbench-design.md">画布说明</a></sub></p>
+<p align="center">网页浏览、白板、Markdown 笔记与演示文稿，在同一个工作台切换。<br>每段对话保留自己的工作台，可放在侧边，也可展开到主区。</p>
 
 <a id="workbench-browser"></a>
 <h3 align="center">浏览器 · 在 App 内打开网页</h3>
@@ -344,9 +336,9 @@ flowchart TB
 感谢 [LINUX DO](https://linux.do/) 社区对 TaroBird 的支持。
 
 工作台使用 [Excalidraw](https://github.com/excalidraw/excalidraw) 提供白板、
-[Vditor](https://github.com/Vanessa219/vditor) 提供 Markdown 笔记，并集成
-[宝玉 Jim Liu 的 baoyu-design](https://github.com/JimLiu/baoyu-design) 提供画布、幻灯片编辑器及相应适配技能。
-感谢这些项目的作者与贡献者。Excalidraw 和 Vditor 使用 MIT；baoyu-design 使用[分范围许可声明](client/vendor/baoyu-design/NOTICE.md)，重建编辑器不在其 MIT 授权内。我们保留原始版权、授权范围及依赖许可说明，
+[Vditor](https://github.com/Vanessa219/vditor) 提供 Markdown 笔记，并使用
+[Open Artifact](https://github.com/JimLiu/open-artifact)（`@open-artifact/slides-editor`，Apache-2.0）作为演示文稿编辑器核心。
+感谢这些项目的作者与贡献者。Excalidraw 和 Vditor 使用 MIT；Open Artifact 使用 Apache-2.0（`client/vendor/workbench-slides/` 保留完整 LICENSE 与 NOTICE）。我们保留原始版权、授权范围及依赖许可说明，
 详见[第三方许可](LICENSING.md)和[设计功能说明](docs/client/workbench-design.md)。
 
 ## 许可证

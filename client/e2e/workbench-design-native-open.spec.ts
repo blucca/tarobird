@@ -62,8 +62,8 @@ for (const retireDuringSend of [false, true]) test(retireDuringSend
           sourceId = channel!.currentMessageId();
           inTurn = AsyncResource.bind((request: WorkbenchRequest) => channel!.workbench(request));
           input.nativeInput!.onProgress({ state: "received" });
-          if (retireDuringSend) await expect(inTurn({ requestId: "native-open", operation: "design.open", payload: {} })).rejects.toThrow("workbench_open_target_unavailable");
-          else receipt = await inTurn({ requestId: "native-open", operation: "design.open", payload: {} });
+          if (retireDuringSend) await expect(inTurn({ requestId: "native-open", operation: "design.open", payload: { format: "slides" } })).rejects.toThrow("workbench_open_target_unavailable");
+          else receipt = await inTurn({ requestId: "native-open", operation: "design.open", payload: { format: "slides" } });
           const text = retireDuringSend ? "普通聊天继续；原页面已关闭，本轮未打开设计。" : "设计页已打开。";
           await input.onEngineEvent?.({ type: "assistant_text", text, delta: true });
           ordinaryContinued = true;
@@ -116,7 +116,7 @@ for (const retireDuringSend of [false, true]) test(retireDuringSend
     await expect.poll(() => (channel as unknown as { processing: Set<string> }).processing.has(sourceId!)).toBe(false);
     // A callback can retain AsyncLocalStorage after the run has returned. The
     // Host must still refuse it; persisted native input is not a lasting grant.
-    await expect(inTurn!({ requestId: "after-native-end", operation: "design.open", payload: {} }))
+    await expect(inTurn!({ requestId: "after-native-end", operation: "design.open", payload: { format: "slides" } }))
       .rejects.toThrow(/workbench_(turn_ended|user_turn_required|context_unavailable)/);
   } finally {
     releaseCapture(); release(); broker.validateContext = validateContext;

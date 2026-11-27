@@ -190,28 +190,27 @@
       "location": "client/licenses/vditor/, vditor/dist/js/lute/lute.min.js"
     },
     {
-      "id": "baoyu-design",
-      "name": "baoyu-design",
+      "id": "open-artifact-slides-editor",
+      "name": "Open Artifact slides editor",
       "category": "vendored",
-      "repository": "https://github.com/JimLiu/baoyu-design",
-      "version": "2.15.2 (016a68e1b1ac1c7c291b2cb88d66ff087e50b017)",
-      "license": "Mixed (MIT / upstream notices)",
-      "licenseFile": "client/vendor/baoyu-design/LICENSE",
-      "noticeFile": "client/vendor/baoyu-design/NOTICE.md",
-      "usage": "Vendored design canvas editor, references and runtime notices",
-      "location": "client/vendor/baoyu-design/, skills/baoyu-design/"
+      "repository": "https://github.com/JimLiu/open-artifact",
+      "version": "0.14.6 (132c038529e4527d1bc30561a855ffd958aa7302)",
+      "license": "Apache-2.0",
+      "licenseFile": "client/vendor/workbench-slides/LICENSE",
+      "noticeFile": "client/vendor/workbench-slides/NOTICE",
+      "usage": "Workbench presentation editor core (@open-artifact/slides-editor), vendored as a built bundle with the modifications recorded in UPSTREAM.json",
+      "location": "client/vendor/workbench-slides/"
     },
     {
-      "id": "baoyu-slides",
-      "name": "baoyu-slides",
+      "id": "open-artifact-slides-editor-bundled",
+      "name": "Components bundled in the Open Artifact slides editor",
       "category": "vendored",
-      "repository": "https://github.com/JimLiu/baoyu-design",
-      "version": "2.15.2 (016a68e1b1ac1c7c291b2cb88d66ff087e50b017)",
-      "license": "Mixed (MIT / upstream notices)",
-      "licenseFile": "client/vendor/baoyu-slides/LICENSE",
-      "noticeFile": "client/vendor/baoyu-slides/NOTICE.md",
-      "usage": "Vendored slides editor, compiler and runtime notices",
-      "location": "client/vendor/baoyu-slides/, skills/baoyu-ppt/"
+      "repository": "https://github.com/JimLiu/open-artifact",
+      "version": "0.14.6 (132c038529e4527d1bc30561a855ffd958aa7302)",
+      "license": "Various (MIT, ISC, OFL-1.1, MIT OR Apache-2.0; notices incomplete)",
+      "licenseFile": "client/vendor/workbench-slides/THIRD-PARTY-NOTICES.txt",
+      "usage": "Third-party code and fonts compiled into the editor bundle: React, Floating UI, zustand, clsx, Lucide, PostCSS, Nano ID, picocolors, Inter, miniz_oxide, crc32fast, smallvec; the file also lists the components whose notices are still to be added",
+      "location": "client/vendor/workbench-slides/editor/"
     },
     {
       "id": "deepseek-harness-plugin",
